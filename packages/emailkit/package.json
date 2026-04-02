@@ -1,0 +1,66 @@
+{
+  "name": "emailkit",
+  "version": "0.2.0",
+  "description": "Unified email API for multiple providers.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://github.com/paukraft/emailkit#readme",
+  "bugs": {
+    "url": "https://github.com/paukraft/emailkit/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paukraft/emailkit.git"
+  },
+  "author": "paukraft",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./nextjs": {
+      "types": "./dist/nextjs.d.ts",
+      "import": "./dist/nextjs.js",
+      "default": "./dist/nextjs.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "email",
+    "sdk",
+    "emailkit",
+    "mailgun",
+    "resend",
+    "aiinbx",
+    "webhooks",
+    "nextjs"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown && tsdown --watch src --ignore-watch '**/.turbo/**' --ignore-watch '.turbo/**' --ignore-watch '**/dist/**' --ignore-watch 'dist/**' --ignore-watch '**/node_modules/**' --ignore-watch 'node_modules/**'",
+    "prepublishOnly": "npm run build",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "svix": "^1.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.1",
+    "bumpp": "^10.3.1",
+    "tsdown": "^0.15.9",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.1"
+  }
+}
