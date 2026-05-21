@@ -221,6 +221,14 @@ export const RESEND_CAPABILITIES = {
  */
 export type ResendCapabilities = typeof RESEND_CAPABILITIES;
 
+const RESEND_VERIFY_POLL_INTERVAL_MS = 1000;
+const RESEND_VERIFY_TIMEOUT_MS = 10000;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 /**
  * Map Resend domain status to standardized DomainStatus
  */
@@ -234,7 +242,11 @@ const mapDomainStatus = (status: string | undefined): DomainStatus => {
     case "pending_verification":
       return "pending";
     case "pending":
+    case "partially_verified":
+    case "temporary_failure":
       return "pending";
+    case "failed":
+    case "partially_failed":
     case "unverified":
       return "unverified";
     default:
@@ -1240,6 +1252,13 @@ export const ResendDriver = (
       },
 
       verify: async (idOrName: string): Promise<DomainVerification> => {
+        let previousDomain: Domain | null = null;
+        try {
+          previousDomain = await getDomainDetails(idOrName);
+        } catch {
+          previousDomain = null;
+        }
+
         const res = await fetch(
           `${baseUrl}/domains/${encodeURIComponent(idOrName)}/verify`,
           {
@@ -1268,14 +1287,35 @@ export const ResendDriver = (
           );
         }
 
-        // After verification, fetch the domain to get updated records
-        const domain = await getDomainDetails(idOrName);
+        // Resend verification is asynchronous and marks the domain as pending
+        // regardless of the previous status while the re-check is running.
+        // Poll briefly so verify() returns a settled state when available.
+        const deadline = Date.now() + RESEND_VERIFY_TIMEOUT_MS;
+        let domain: Domain | null = null;
+
+        while (true) {
+          domain = await getDomainDetails(idOrName);
+          if (domain.status !== "pending" || Date.now() >= deadline) break;
+          await sleep(RESEND_VERIFY_POLL_INTERVAL_MS);
+        }
+
+        // If Resend is still pending after the polling window, prefer the last
+        // known verified snapshot over a transient downgrade caused by reverify.
+        if (
+          domain.status === "pending" &&
+          previousDomain?.status === "verified"
+        ) {
+          domain = previousDomain;
+        }
 
         const verification: DomainVerification = {
           status: domain.status,
           records: domain.verification?.records || [],
           checkedAt: new Date(),
-          raw: body,
+          raw: {
+            verify: body,
+            domain: domain.raw,
+          },
         };
 
         return verification;

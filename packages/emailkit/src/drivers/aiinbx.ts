@@ -239,7 +239,7 @@ export const AIINBX_CAPABILITIES = {
   sendIdempotency: false,
   tenantRouting: false,
   domains: true, // AIInbx supports domain management API
-  domainIdentifier: 'domainId' as const, // AIInbx requires domainId for API calls
+  domainIdentifier: "domainId" as const, // AIInbx requires domainId for API calls
 } as const satisfies DriverCapabilities;
 
 /**
@@ -252,7 +252,7 @@ export type AIInbxCapabilities = typeof AIINBX_CAPABILITIES;
  * AIInbx provides signed S3 URLs that are publicly accessible
  */
 const retrieveAIInbxAttachments = async (
-  attachmentMetadata: Attachment[]
+  attachmentMetadata: Attachment[],
 ): Promise<Attachment[]> => {
   const attachments: Attachment[] = [];
 
@@ -275,7 +275,7 @@ const retrieveAIInbxAttachments = async (
       } catch (error) {
         console.error(
           `Failed to retrieve AIInbx attachment ${attachmentMeta.filename}:`,
-          error
+          error,
         );
         attachments.push(attachmentMeta);
       }
@@ -295,7 +295,7 @@ const transformInboundEmail = async (
   email: AIInbxEmail,
   timestamp: number,
   rawPayload: AIInbxWebhookEvent,
-  autoFetchAttachments: boolean
+  autoFetchAttachments: boolean,
 ): Promise<InboundEmailEvent> => {
   const parseEmailAddressList = (addresses: string[]): EmailAddress[] => {
     return addresses.map((addr) => parseEmailAddress(addr));
@@ -303,7 +303,7 @@ const transformInboundEmail = async (
 
   const from = parseEmailAddress(
     email.fromAddress,
-    email.fromName || undefined
+    email.fromName || undefined,
   );
   const to = parseEmailAddressList(email.toAddresses);
   const cc =
@@ -372,7 +372,7 @@ const transformOutboundEvent = (
   eventType: string,
   data: unknown,
   timestamp: number,
-  rawPayload: AIInbxWebhookEvent
+  rawPayload: AIInbxWebhookEvent,
 ): OutboundEmailEvent => {
   const baseEvent: OutboundEmailEvent = {
     schemaVersion: "1",
@@ -498,7 +498,7 @@ const transformOutboundEvent = (
 };
 
 export const AIInbxDriver = (
-  config: AIInbxDriverConfig
+  config: AIInbxDriverConfig,
 ): EmailDriver<AIInbxDriverConfig, typeof AIINBX_CAPABILITIES> & {
   domains: Partial<DriverDomainsAPI>;
 } => {
@@ -506,7 +506,7 @@ export const AIInbxDriver = (
   const baseUrl = `${apiBase}/api/v1`;
 
   const mapDomainStatus = (
-    status: "VERIFIED" | "PENDING_VERIFICATION" | "NOT_REGISTERED" | string
+    status: "VERIFIED" | "PENDING_VERIFICATION" | "NOT_REGISTERED" | string,
   ): Domain["status"] => {
     switch (status) {
       case "VERIFIED":
@@ -533,6 +533,16 @@ export const AIInbxDriver = (
     return r as DomainDNSRecord;
   };
 
+  const extractDnsRecords = (value: any): DomainDNSRecord[] | undefined => {
+    const rawRecords = Array.isArray(value?.dnsRecords)
+      ? value.dnsRecords
+      : Array.isArray(value?.records)
+        ? value.records
+        : undefined;
+
+    return rawRecords?.map(mapDnsRecord);
+  };
+
   const authHeader = { Authorization: `Bearer ${config.apiKey}` } as const;
 
   return {
@@ -547,7 +557,7 @@ export const AIInbxDriver = (
 
     sendEmail: async (
       message: EmailMessage<typeof AIINBX_CAPABILITIES>,
-      options?: { signal?: AbortSignal }
+      options?: { signal?: AbortSignal },
     ): Promise<SendEmailResult> => {
       // AIInbx API requires html, but we'll provide text as fallback if html is missing
       const html = message.html || message.text || "";
@@ -555,7 +565,7 @@ export const AIInbxDriver = (
         throw new EmailKitError(
           "Either html or text must be provided",
           "aiinbx",
-          "MISSING_REQUIRED_FIELD"
+          "MISSING_REQUIRED_FIELD",
         );
       }
 
@@ -646,14 +656,14 @@ export const AIInbxDriver = (
                   "aiinbx",
                   "ATTACHMENT_FETCH_FAILED",
                   undefined,
-                  error
+                  error,
                 );
               }
             } else {
               throw new EmailKitError(
                 `Attachment ${att.filename} must have either content or url`,
                 "aiinbx",
-                "INVALID_ATTACHMENT"
+                "INVALID_ATTACHMENT",
               );
             }
 
@@ -679,7 +689,7 @@ export const AIInbxDriver = (
             }
 
             return attachment;
-          })
+          }),
         );
       }
 
@@ -687,12 +697,12 @@ export const AIInbxDriver = (
       // Note: Some headers like In-Reply-To and References are handled above
       if (message.headers) {
         const unsupportedHeaders = Object.keys(message.headers).filter(
-          (key) => !["In-Reply-To", "References"].includes(key)
+          (key) => !["In-Reply-To", "References"].includes(key),
         );
         if (unsupportedHeaders.length > 0) {
           // Log warning but don't fail - just skip unsupported headers
           console.warn(
-            `AIInbx API does not support custom headers: ${unsupportedHeaders.join(", ")}`
+            `AIInbx API does not support custom headers: ${unsupportedHeaders.join(", ")}`,
           );
         }
       }
@@ -702,7 +712,7 @@ export const AIInbxDriver = (
       if ("track" in message && message.track !== undefined) {
         if (message.track.opens === false || message.track.clicks === false) {
           console.warn(
-            "AIInbx API does not support disabling tracking in the send endpoint. Tracking is enabled by default."
+            "AIInbx API does not support disabling tracking in the send endpoint. Tracking is enabled by default.",
           );
         }
       }
@@ -750,7 +760,7 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -765,7 +775,7 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -780,7 +790,7 @@ export const AIInbxDriver = (
           "aiinbx",
           undefined,
           undefined,
-          error
+          error,
         );
       }
     },
@@ -798,7 +808,7 @@ export const AIInbxDriver = (
           data.email,
           payload.timestamp,
           payload, // Pass full webhook payload
-          config.autoFetchInboundAttachments ?? true
+          config.autoFetchInboundAttachments ?? true,
         );
         return { type: "inbound", data: inboundEvent };
       }
@@ -818,7 +828,7 @@ export const AIInbxDriver = (
           eventType,
           payload.data,
           payload.timestamp,
-          payload // Pass full webhook payload
+          payload, // Pass full webhook payload
         );
 
         // Map to specific event type
@@ -889,7 +899,7 @@ export const AIInbxDriver = (
 
             return timingSafeEqual(
               Buffer.from(receivedSignature, "utf8"),
-              Buffer.from(expectedSignature, "utf8")
+              Buffer.from(expectedSignature, "utf8"),
             );
           } catch {
             return false;
@@ -899,7 +909,7 @@ export const AIInbxDriver = (
 
     webhookResponse: async (
       request: WebhookRequest,
-      handled: boolean
+      handled: boolean,
     ): Promise<WebhookResponse> => {
       return {
         status: 200,
@@ -925,15 +935,13 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
         const domains = ((body as any)?.domains || []) as any[];
         return domains.map((d) => {
           const status = mapDomainStatus(d.status);
-          const records = Array.isArray(d.dnsRecords)
-            ? d.dnsRecords.map(mapDnsRecord)
-            : undefined;
+          const records = extractDnsRecords(d);
           const domain: Domain = {
             id: d.id,
             name: d.domain,
@@ -969,7 +977,7 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
         const domainId = (body as any)?.domainId as string;
@@ -989,18 +997,21 @@ export const AIInbxDriver = (
       get: async (idOrName: string): Promise<Domain> => {
         const resolveId = async (): Promise<string> => {
           if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, { headers: authHeader });
+            const resList = await fetch(`${baseUrl}/domains`, {
+              headers: authHeader,
+            });
             const bodyList = await resList.json();
             const domains = ((bodyList as any)?.domains || []) as any[];
             const match = domains.find(
-              (d: any) => String(d.domain).toLowerCase() === idOrName.toLowerCase()
+              (d: any) =>
+                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
             );
             if (!match) {
               throw new EmailKitError(
                 `Domain not found: ${idOrName}`,
                 "aiinbx",
                 "NOT_FOUND",
-                404
+                404,
               );
             }
             return match.id as string;
@@ -1023,14 +1034,12 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
         const d = body as any;
         const status = mapDomainStatus(d.status);
-        const records = Array.isArray(d.dnsRecords)
-          ? d.dnsRecords.map(mapDnsRecord)
-          : undefined;
+        const records = extractDnsRecords(d);
         const domain: Domain = {
           id: d.id,
           name: d.domain,
@@ -1048,18 +1057,21 @@ export const AIInbxDriver = (
       verify: async (idOrName: string): Promise<DomainVerification> => {
         const resolveId = async (): Promise<string> => {
           if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, { headers: authHeader });
+            const resList = await fetch(`${baseUrl}/domains`, {
+              headers: authHeader,
+            });
             const bodyList = await resList.json();
             const domains = ((bodyList as any)?.domains || []) as any[];
             const match = domains.find(
-              (d: any) => String(d.domain).toLowerCase() === idOrName.toLowerCase()
+              (d: any) =>
+                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
             );
             if (!match) {
               throw new EmailKitError(
                 `Domain not found: ${idOrName}`,
                 "aiinbx",
                 "NOT_FOUND",
-                404
+                404,
               );
             }
             return match.id as string;
@@ -1086,14 +1098,12 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
-        const domainObj = (body as any)?.domain as any;
+        const domainObj = ((body as any)?.domain ?? body) as any;
         const status = mapDomainStatus(domainObj?.status);
-        const recs = Array.isArray(domainObj?.dnsRecords)
-          ? domainObj.dnsRecords.map(mapDnsRecord)
-          : [];
+        const recs = extractDnsRecords(domainObj) ?? [];
         const verification: DomainVerification = {
           status,
           records: recs,
@@ -1106,18 +1116,21 @@ export const AIInbxDriver = (
       delete: async (idOrName: string): Promise<{ deleted: boolean }> => {
         const resolveId = async (): Promise<string> => {
           if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, { headers: authHeader });
+            const resList = await fetch(`${baseUrl}/domains`, {
+              headers: authHeader,
+            });
             const bodyList = await resList.json();
             const domains = ((bodyList as any)?.domains || []) as any[];
             const match = domains.find(
-              (d: any) => String(d.domain).toLowerCase() === idOrName.toLowerCase()
+              (d: any) =>
+                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
             );
             if (!match) {
               throw new EmailKitError(
                 `Domain not found: ${idOrName}`,
                 "aiinbx",
                 "NOT_FOUND",
-                404
+                404,
               );
             }
             return match.id as string;
@@ -1140,7 +1153,7 @@ export const AIInbxDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
         const success = Boolean((body as any)?.success === true || res.ok);

@@ -10,6 +10,7 @@ export interface SandboxProviderCapabilities {
   trackClicks: boolean;
   sendIdempotency: boolean;
   tenantRouting: boolean;
+  domains: boolean;
 }
 
 export interface SandboxProviderInfo {

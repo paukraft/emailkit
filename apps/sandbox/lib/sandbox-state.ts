@@ -18,6 +18,7 @@ const MAX_STRING = 500;
 
 type Store = {
   traces: SandboxTrace[];
+  listeners: Set<() => void>;
 };
 
 type SandboxTraceContext = {
@@ -84,11 +85,26 @@ const sanitize = (value: unknown, depth = 0): unknown => {
 };
 
 const getStore = (): Store => {
-  if (!globalThis.__emailkitSandboxStore) {
-    globalThis.__emailkitSandboxStore = { traces: [] };
+  const s = globalThis.__emailkitSandboxStore;
+  if (!s || !(s.listeners instanceof Set)) {
+    globalThis.__emailkitSandboxStore = {
+      traces: s?.traces ?? [],
+      listeners: new Set(),
+    };
   }
 
-  return globalThis.__emailkitSandboxStore;
+  return globalThis.__emailkitSandboxStore!;
+};
+
+const notifySandboxListeners = (): void => {
+  const listeners = Array.from(getStore().listeners);
+  listeners.forEach((listener) => {
+    try {
+      listener();
+    } catch {
+      getStore().listeners.delete(listener);
+    }
+  });
 };
 
 const extractString = (...values: unknown[]): string | undefined => {
@@ -278,14 +294,26 @@ export const recordSandboxEvent = ({
     event,
     correlation,
   });
+  notifySandboxListeners();
   return event;
 };
 
 export const clearSandboxEvents = (): void => {
   getStore().traces = [];
+  notifySandboxListeners();
 };
 
 export const getSandboxTraces = (): SandboxTrace[] => getStore().traces;
+
+export const subscribeToSandboxUpdates = (
+  listener: () => void,
+): (() => void) => {
+  const store = getStore();
+  store.listeners.add(listener);
+  return () => {
+    store.listeners.delete(listener);
+  };
+};
 
 export const buildSandboxSnapshot = (
   providers: SandboxSnapshot["providers"],

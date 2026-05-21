@@ -1,9 +1,6 @@
-import { SandboxClient } from "./sandbox-client";
-import { getSandboxProviders } from "@/lib/sandbox-providers";
-import { buildSandboxSnapshot } from "@/lib/sandbox-state";
-
-export const dynamic = "force-dynamic";
+import { redirect } from "next/navigation";
+import { SANDBOX_PROVIDERS } from "@/lib/sandbox-types";
 
 export default function Page() {
-  return <SandboxClient initialSnapshot={buildSandboxSnapshot(getSandboxProviders())} />;
+  redirect(`/${SANDBOX_PROVIDERS[0]}`);
 }

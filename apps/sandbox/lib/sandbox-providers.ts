@@ -6,7 +6,11 @@ import {
   MailgunDriver,
   RESEND_CAPABILITIES,
   ResendDriver,
+  type CreateDomainInput,
+  type Domain,
+  type DomainVerification,
   type DriverCapabilities,
+  type ListDomainsOptions,
   type WebhookRequest,
   type WebhookResponse,
 } from "emailkit";
@@ -19,10 +23,19 @@ import type {
   SandboxSendPayload,
 } from "./sandbox-types";
 
+export type SandboxDomainsFacade = {
+  list: (opts?: ListDomainsOptions) => Promise<Domain[]>;
+  create: (input: CreateDomainInput) => Promise<Domain>;
+  get: (identifier: { domain?: string; domainId?: string }) => Promise<Domain>;
+  verify: (identifier: { domain?: string; domainId?: string }) => Promise<DomainVerification>;
+  delete: (identifier: { domain?: string; domainId?: string }) => Promise<{ deleted: boolean }>;
+};
+
 type SandboxProviderRuntime = {
   info: SandboxProviderInfo;
   send: (payload: SandboxSendPayload) => Promise<unknown>;
   handleWebhook: (request: WebhookRequest) => Promise<WebhookResponse>;
+  domains: SandboxDomainsFacade | null;
 };
 
 const DEFAULT_FROM = process.env.FROM_EMAIL_ADDRESS ?? "";
@@ -36,6 +49,7 @@ const toSandboxCapabilities = (caps: DriverCapabilities): SandboxProviderCapabil
   trackClicks: caps.trackClicks ?? false,
   sendIdempotency: caps.sendIdempotency ?? false,
   tenantRouting: caps.tenantRouting ?? false,
+  domains: caps.domains ?? false,
 });
 
 const providerMeta: Record<
@@ -191,14 +205,21 @@ const createProviderRuntime = (id: SandboxProviderId): SandboxProviderRuntime =>
         headers: {},
         body: { error: `${info.label} is not configured`, missingRequiredEnv: info.missingRequiredEnv },
       }),
+      domains: null,
     };
   }
 
   const client = createDriver(id);
+  const domains: SandboxDomainsFacade | null =
+    info.capabilities.domains && "domains" in client
+      ? (client as unknown as { domains: SandboxDomainsFacade }).domains
+      : null;
+
   return {
     info,
     send: async (payload) => client.sendEmail(buildMessage(payload) as never),
     handleWebhook: client.webhookRoute(),
+    domains,
   };
 };
 
