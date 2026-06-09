@@ -10,14 +10,19 @@
  * import type { EmailDriver, EmailDriverConfig } from '@/lib/mr-email'
  * import type { InboundEmailEvent, OutboundEmailEvent } from '@/lib/mr-email/types'
  *
- * interface MyProviderConfig extends EmailDriverConfig {
+ * interface MyProviderConfig<TId extends string = 'my-provider'> extends EmailDriverConfig {
+ *   id?: TId
  *   apiKey: string
  *   webhookSecret?: string
  * }
  *
- * export const MyProviderDriver = (config: MyProviderConfig): EmailDriver<MyProviderConfig> => {
+ * export const MyProviderDriver = <const TId extends string = 'my-provider'>(
+ *   config: MyProviderConfig<TId>
+ * ): EmailDriver<MyProviderConfig<TId>, DriverCapabilities, TId> => {
  *   return {
+ *     id: (config.id || 'my-provider') as TId,
  *     name: 'my-provider',
+ *     capabilities: {},
  *
  *     async sendEmail(message) {
  *       // Transform EmailMessage to provider format and send
@@ -81,8 +86,34 @@
 import type {
   DriverCapabilities,
   EmailMessage,
+  DriverPublicRoutes,
+  Mailbox,
+  MailboxIdentity,
+  MailboxConnectionResult,
+  MailboxDeleteResult,
+  ConnectMailboxInput,
+  CreateMailboxInput,
+  ListMailboxesOptions,
+  AccountWebhookDeleteInput,
+  AccountWebhookDeleteResult,
+  AccountWebhookRefreshInput,
+  AccountWebhookRefreshResult,
+  AccountWebhookSetupInput,
+  AccountWebhookSetupResult,
+  DomainWebhookDeleteInput,
+  DomainWebhookDeleteResult,
+  DomainWebhookRefreshInput,
+  DomainWebhookRefreshResult,
+  DomainWebhookSetupInput,
+  DomainWebhookSetupResult,
+  MailboxWebhookDeleteInput,
+  MailboxWebhookDeleteResult,
+  MailboxWebhookRefreshInput,
+  MailboxWebhookRefreshResult,
+  MailboxWebhookSetupInput,
+  MailboxWebhookSetupResult,
   SendEmailResult,
-  WebhookEvent,
+  WebhookEventResult,
   WebhookRequest,
   WebhookResponse,
 } from "./types";
@@ -126,6 +157,7 @@ export type ProviderFetchSearchParams =
  */
 export interface ProviderFetchInit extends RequestInit {
   searchParams?: ProviderFetchSearchParams;
+  provider?: Record<string, unknown>;
 }
 
 /**
@@ -136,17 +168,50 @@ export type ProviderFetch = (
   init?: ProviderFetchInit,
 ) => Promise<Response>;
 
+export interface DriverAuthUpdate {
+  auth: unknown;
+  mailbox?: MailboxIdentity | Mailbox;
+  context?: unknown;
+  raw?: unknown;
+  previousAuth?: unknown;
+}
+
+export interface EmailDriverOperationOptions<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> {
+  secret?: string;
+  mailbox?: MailboxIdentity | Mailbox;
+  auth?: unknown;
+  context?: unknown;
+  publicRoutes?: DriverPublicRoutes<TCapabilities>;
+  onAuthUpdated?: (event: DriverAuthUpdate) => Promise<void>;
+}
+
+export interface SendEmailOptions<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> extends EmailDriverOperationOptions<TCapabilities> {
+  signal?: AbortSignal;
+}
+
+export type DriverCallbackResult = WebhookResponse | MailboxConnectionResult;
+
 /**
  * Base driver interface that all email providers must implement
  */
 export interface EmailDriver<
   TConfig extends EmailDriverConfig = EmailDriverConfig,
   TCapabilities extends DriverCapabilities = DriverCapabilities,
+  TId extends string = string,
 > {
   /**
-   * Driver name/identifier
+   * Required literal driver identifier used for typed EmailKit facades.
    */
-  name: string;
+  id: TId;
+
+  /**
+   * Legacy internal/provider label. New public routing should use `id`.
+   */
+  name?: string;
 
   /**
    * Capabilities this driver supports
@@ -159,7 +224,7 @@ export interface EmailDriver<
    */
   sendEmail: (
     message: EmailMessage<TCapabilities>,
-    options?: { signal?: AbortSignal }
+    options?: SendEmailOptions<TCapabilities>,
   ) => Promise<SendEmailResult>;
 
   /**
@@ -176,7 +241,7 @@ export interface EmailDriver<
    * @param request - The webhook request containing provider-specific payload
    * @returns Event type and normalized data matching the SDK's event types
    */
-  handleWebhook: (request: WebhookRequest) => Promise<WebhookEvent>;
+  handleWebhook: (request: WebhookRequest) => Promise<WebhookEventResult>;
 
   /**
    * Verify webhook signature/authenticity
@@ -188,7 +253,7 @@ export interface EmailDriver<
    */
   webhookResponse?: (
     request: WebhookRequest,
-    handled: boolean
+    handled: boolean,
   ) => Promise<WebhookResponse>;
 
   /**
@@ -196,6 +261,26 @@ export interface EmailDriver<
    * Implement methods your provider supports; unsupported methods can be omitted.
    */
   domains?: Partial<DriverDomainsAPI>;
+
+  /**
+   * Optional mailbox management/auth API.
+   * Implement methods your provider supports; unsupported methods can be omitted.
+   */
+  mailboxes?: Partial<DriverMailboxesAPI<TCapabilities>>;
+
+  /**
+   * Optional webhook management API grouped by normalized scope.
+   * Implement methods your provider supports; unsupported methods can be omitted.
+   */
+  webhooks?: Partial<DriverWebhooksAPI<TCapabilities>>;
+
+  /**
+   * Optional OAuth/callback handler for GET requests routed through `handler()`.
+   */
+  handleCallback?: (
+    request: WebhookRequest,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<DriverCallbackResult>;
 
   /**
    * Optional provider-aware fetch helper.
@@ -208,15 +293,26 @@ export interface EmailDriver<
  * Type helper to extract driver config type
  */
 export type DriverConfig<TDriver extends EmailDriver> =
-  TDriver extends EmailDriver<infer TConfig, any> ? TConfig : never;
+  TDriver extends EmailDriver<infer TConfig, any, any> ? TConfig : never;
 
 /**
  * Type helper to extract driver capabilities type
  */
 export type DriverCapabilitiesType<TDriver extends EmailDriver> =
-  TDriver extends EmailDriver<any, infer TCapabilities>
+  TDriver extends {
+    capabilities: infer TCapabilities extends DriverCapabilities;
+  }
     ? TCapabilities
     : DriverCapabilities;
+
+/**
+ * Type helper to extract driver id.
+ */
+export type DriverId<TDriver extends EmailDriver> = TDriver extends {
+  id: infer TId extends string;
+}
+  ? TId
+  : string;
 
 /**
  * Standardized domain management operations a driver may implement
@@ -234,4 +330,102 @@ export interface DriverDomainsAPI {
   verify: (idOrName: string) => Promise<DomainVerification>;
   /** Delete a domain */
   delete: (idOrName: string) => Promise<DomainDeleteResult>;
+}
+
+/**
+ * Standardized mailbox operations a driver may implement.
+ */
+export interface DriverMailboxesAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> {
+  connect: (
+    input: ConnectMailboxInput<TCapabilities>,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<MailboxConnectionResult>;
+  create: (
+    input: CreateMailboxInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<Mailbox>;
+  list: (
+    opts?: ListMailboxesOptions,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<Mailbox[]>;
+  get: (
+    idOrEmail: string,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<Mailbox>;
+  delete: (
+    idOrEmail: string,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<MailboxDeleteResult>;
+}
+
+export interface DriverWebhookScopeAPI<
+  TCapabilities extends DriverCapabilities,
+  TSetupInput,
+  TRefreshInput,
+  TDeleteInput,
+  TSetupResult,
+  TRefreshResult,
+  TDeleteResult,
+> {
+  setup: (
+    input: TSetupInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<TSetupResult>;
+  refresh: (
+    input: TRefreshInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<TRefreshResult>;
+  delete: (
+    input: TDeleteInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => Promise<TDeleteResult>;
+}
+
+export type DriverAccountWebhooksAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> = DriverWebhookScopeAPI<
+  TCapabilities,
+  AccountWebhookSetupInput,
+  AccountWebhookRefreshInput,
+  AccountWebhookDeleteInput,
+  AccountWebhookSetupResult,
+  AccountWebhookRefreshResult,
+  AccountWebhookDeleteResult
+>;
+
+export type DriverMailboxWebhooksAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> = DriverWebhookScopeAPI<
+  TCapabilities,
+  MailboxWebhookSetupInput,
+  MailboxWebhookRefreshInput,
+  MailboxWebhookDeleteInput,
+  MailboxWebhookSetupResult,
+  MailboxWebhookRefreshResult,
+  MailboxWebhookDeleteResult
+>;
+
+export type DriverDomainWebhooksAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> = DriverWebhookScopeAPI<
+  TCapabilities,
+  DomainWebhookSetupInput,
+  DomainWebhookRefreshInput,
+  DomainWebhookDeleteInput,
+  DomainWebhookSetupResult,
+  DomainWebhookRefreshResult,
+  DomainWebhookDeleteResult
+>;
+
+/**
+ * Standardized webhook management operations a driver may implement.
+ */
+export interface DriverWebhooksAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> {
+  account: Partial<DriverAccountWebhooksAPI<TCapabilities>>;
+  mailbox: Partial<DriverMailboxWebhooksAPI<TCapabilities>>;
+  domain: Partial<DriverDomainWebhooksAPI<TCapabilities>>;
 }

@@ -7,7 +7,13 @@
  */
 
 import { createHmac, timingSafeEqual } from "crypto";
-import type { EmailDriver, EmailDriverConfig } from "../driver";
+import type {
+  EmailDriver,
+  EmailDriverConfig,
+  ProviderFetch,
+  ProviderFetchInit,
+  SendEmailOptions,
+} from "../driver";
 import type { DriverDomainsAPI } from "../driver";
 import type {
   Attachment,
@@ -37,7 +43,12 @@ import { createProviderFetch } from "../utils/provider-fetch";
 /**
  * AIInbx-specific configuration
  */
-export interface AIInbxDriverConfig extends EmailDriverConfig {
+export interface AIInbxDriverConfig<TId extends string = "aiinbx">
+  extends EmailDriverConfig {
+  /**
+   * EmailKit driver id. Override when configuring multiple AIInbx drivers.
+   */
+  id?: TId;
   apiKey: string;
   /**
    * Optional API base URL (defaults to https://api.aiinbx.com)
@@ -131,7 +142,8 @@ interface AIInbxWebhookEvent {
     | "outbound.email.complained"
     | "outbound.email.rejected"
     | "outbound.email.opened"
-    | "outbound.email.clicked";
+    | "outbound.email.clicked"
+    | "outbound.email.link_clicked";
   data: unknown;
   attempt: number;
   timestamp: number;
@@ -152,29 +164,29 @@ interface InboundEmailReceivedData {
  * Outbound delivered event data
  */
 interface OutboundDeliveredData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   deliveredAt: string;
   recipients: string[];
-  remoteMtaIp: string;
-  smtpResponse: string;
-  processingTimeMs: number;
+  remoteMtaIp?: string;
+  smtpResponse?: string;
+  processingTimeMs?: number;
 }
 
 /**
  * Outbound bounced event data
  */
 interface OutboundBouncedData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   bouncedAt: string;
   bounceType: "Permanent" | "Transient" | "Undetermined";
-  bounceSubType: string;
+  bounceSubType?: string;
   recipients: Array<{
     emailAddress: string;
-    action: string;
-    status: string;
-    diagnosticCode: string;
+    action?: string;
+    status?: string;
+    diagnosticCode?: string;
   }>;
 }
 
@@ -182,70 +194,143 @@ interface OutboundBouncedData {
  * Outbound complained event data
  */
 interface OutboundComplainedData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   complainedAt: string;
-  complaintFeedbackType: string;
+  complaintFeedbackType?: string;
   recipients: string[];
-  userAgent: string;
-  feedbackId: string;
+  userAgent?: string;
+  feedbackId?: string;
 }
 
 /**
  * Outbound rejected event data
  */
 interface OutboundRejectedData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   rejectedAt: string;
-  reason: string;
+  reason?: string;
 }
 
 /**
  * Outbound opened event data
  */
 interface OutboundOpenedData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   openedAt: string;
-  ipAddress: string;
-  userAgent: string;
+  ipAddress?: string;
+  userAgent?: string;
 }
 
 /**
  * Outbound clicked event data
  */
 interface OutboundClickedData {
-  emailId: string;
+  emailId?: string;
   messageId: string;
   clickedAt: string;
   link: string;
-  linkDomain: string;
-  ipAddress: string;
-  userAgent: string;
+  linkDomain?: string;
+  ipAddress?: string;
+  userAgent?: string;
 }
 
 /**
  * AIInbx driver capabilities
  */
 export const AIINBX_CAPABILITIES = {
+  cc: true,
+  bcc: true,
+  replyTo: true,
+  replyHeaders: true,
+  replyThreadId: true,
+  attachments: true,
+  customHeaders: false,
+  tags: false,
+  metadata: false,
   templates: false,
   personalizations: false,
   scheduling: false,
   unsubscribe: false,
-  trackOpens: true, // AIInbx supports open tracking via webhooks
-  trackClicks: true, // AIInbx supports click tracking via webhooks
+  sendTracking: {
+    opens: true,
+    clicks: true,
+  },
+  eventTracking: {
+    opens: true,
+    clicks: true,
+  },
   sandbox: false,
   sendIdempotency: false,
   tenantRouting: false,
-  domains: true, // AIInbx supports domain management API
-  domainIdentifier: "domainId" as const, // AIInbx requires domainId for API calls
+  providerFetch: true,
+  domains: {
+    list: true,
+    create: true,
+    get: true,
+    verify: true,
+    delete: true,
+    identifier: "domainId" as const,
+  },
 } as const satisfies DriverCapabilities;
 
 /**
  * Type helper for AIInbx capabilities
  */
 export type AIInbxCapabilities = typeof AIINBX_CAPABILITIES;
+
+const escapeHtmlText = (value: string): string =>
+  value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/\r\n|\r|\n/g, "<br />");
+
+const normalizeBase = (base: string): string => base.replace(/\/+$/, "");
+
+const isExternalAbsoluteUrl = (
+  value: string | URL,
+  authenticatedBaseUrl: string,
+): boolean => {
+  const rawUrl = value instanceof URL ? value.toString() : value;
+  if (!/^https?:\/\//i.test(rawUrl)) return false;
+
+  const normalizedUrl = normalizeBase(rawUrl);
+  return (
+    normalizedUrl !== authenticatedBaseUrl &&
+    !normalizedUrl.startsWith(`${authenticatedBaseUrl}/`)
+  );
+};
+
+const createAIInbxProviderFetch = (
+  apiBase: string,
+  apiKey: string,
+): ProviderFetch => {
+  const authenticatedFetch = createProviderFetch({
+    baseUrl: apiBase,
+    defaultHeaders: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+  });
+  const authenticatedBaseUrl = normalizeBase(apiBase);
+
+  return async (path: string | URL, init?: ProviderFetchInit) => {
+    if (isExternalAbsoluteUrl(path, authenticatedBaseUrl)) {
+      const {
+        searchParams: _ignoredSearchParams,
+        provider: _ignoredProvider,
+        ...fetchInit
+      } = init ?? {};
+      return fetch(path, fetchInit);
+    }
+
+    return authenticatedFetch(path, init);
+  };
+};
 
 /**
  * Retrieve attachment content from AIInbx signed URLs
@@ -374,6 +459,19 @@ const transformOutboundEvent = (
   timestamp: number,
   rawPayload: AIInbxWebhookEvent,
 ): OutboundEmailEvent => {
+  const parseEventDate = (value: unknown): Date => {
+    if (typeof value === "string") {
+      const date = new Date(value);
+      if (!Number.isNaN(date.getTime())) {
+        return date;
+      }
+    }
+    return new Date(timestamp * 1000);
+  };
+
+  const providerId = (value: { emailId?: string; messageId: string }): string =>
+    value.emailId || value.messageId;
+
   const baseEvent: OutboundEmailEvent = {
     schemaVersion: "1",
     messageId: "",
@@ -388,6 +486,7 @@ const transformOutboundEvent = (
     "outbound.email.delivered": "delivered",
     "outbound.email.opened": "opened",
     "outbound.email.clicked": "clicked",
+    "outbound.email.link_clicked": "clicked",
     "outbound.email.bounced": "bounced",
     "outbound.email.complained": "complained",
     "outbound.email.rejected": "rejected",
@@ -400,12 +499,13 @@ const transformOutboundEvent = (
     case "outbound.email.delivered": {
       const d = data as OutboundDeliveredData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = d.recipients[0] || "";
       baseEvent.recipientDomain = d.recipients[0]?.split("@")[1];
+      baseEvent.timestamp = parseEventDate(d.deliveredAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:delivered:${timestamp}`,
+        eventId: `${providerId(d)}:delivered:${timestamp}`,
         responseTime: d.processingTimeMs,
       } as OutboundEmailEvent & { responseTime?: number };
     }
@@ -413,11 +513,12 @@ const transformOutboundEvent = (
     case "outbound.email.bounced": {
       const d = data as OutboundBouncedData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = d.recipients[0]?.emailAddress || "";
+      baseEvent.timestamp = parseEventDate(d.bouncedAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:bounced:${timestamp}`,
+        eventId: `${providerId(d)}:bounced:${timestamp}`,
         severity: d.bounceType === "Permanent" ? "permanent" : "temporary",
         reason: d.bounceSubType,
         code: d.recipients[0]?.status,
@@ -433,11 +534,12 @@ const transformOutboundEvent = (
     case "outbound.email.complained": {
       const d = data as OutboundComplainedData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = d.recipients[0] || "";
+      baseEvent.timestamp = parseEventDate(d.complainedAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:complained:${timestamp}`,
+        eventId: `${providerId(d)}:complained:${timestamp}`,
         feedbackType: d.complaintFeedbackType,
         feedback: d.feedbackId,
       } as OutboundEmailEvent & {
@@ -449,11 +551,12 @@ const transformOutboundEvent = (
     case "outbound.email.rejected": {
       const d = data as OutboundRejectedData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = ""; // Not provided in rejected event
+      baseEvent.timestamp = parseEventDate(d.rejectedAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:rejected:${timestamp}`,
+        eventId: `${providerId(d)}:rejected:${timestamp}`,
         reason: d.reason,
       } as OutboundEmailEvent & { reason?: string };
     }
@@ -461,11 +564,12 @@ const transformOutboundEvent = (
     case "outbound.email.opened": {
       const d = data as OutboundOpenedData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = ""; // Not provided directly
+      baseEvent.timestamp = parseEventDate(d.openedAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:opened:${timestamp}`,
+        eventId: `${providerId(d)}:opened:${timestamp}`,
         ip: d.ipAddress,
         userAgent: d.userAgent,
       } as OutboundEmailEvent & {
@@ -477,11 +581,31 @@ const transformOutboundEvent = (
     case "outbound.email.clicked": {
       const d = data as OutboundClickedData;
       baseEvent.messageId = d.messageId;
-      baseEvent.providerId = d.emailId;
+      baseEvent.providerId = providerId(d);
       baseEvent.recipient = ""; // Not provided directly
+      baseEvent.timestamp = parseEventDate(d.clickedAt);
       return {
         ...baseEvent,
-        eventId: `${d.emailId}:clicked:${timestamp}`,
+        eventId: `${providerId(d)}:clicked:${timestamp}`,
+        url: d.link,
+        ip: d.ipAddress,
+        userAgent: d.userAgent,
+      } as OutboundEmailEvent & {
+        url?: string;
+        ip?: string;
+        userAgent?: string;
+      };
+    }
+
+    case "outbound.email.link_clicked": {
+      const d = data as OutboundClickedData;
+      baseEvent.messageId = d.messageId;
+      baseEvent.providerId = providerId(d);
+      baseEvent.recipient = ""; // Not provided directly
+      baseEvent.timestamp = parseEventDate(d.clickedAt);
+      return {
+        ...baseEvent,
+        eventId: `${providerId(d)}:clicked:${timestamp}`,
         url: d.link,
         ip: d.ipAddress,
         userAgent: d.userAgent,
@@ -497,11 +621,12 @@ const transformOutboundEvent = (
   }
 };
 
-export const AIInbxDriver = (
-  config: AIInbxDriverConfig,
-): EmailDriver<AIInbxDriverConfig, typeof AIINBX_CAPABILITIES> & {
+export const AIInbxDriver = <const TId extends string = "aiinbx">(
+  config: AIInbxDriverConfig<TId>,
+): EmailDriver<AIInbxDriverConfig<TId>, typeof AIINBX_CAPABILITIES, TId> & {
   domains: Partial<DriverDomainsAPI>;
 } => {
+  const driverId = (config.id || "aiinbx") as TId;
   const apiBase = config.apiBase || "https://api.aiinbx.com";
   const baseUrl = `${apiBase}/api/v1`;
 
@@ -527,7 +652,11 @@ export const AIInbxDriver = (
       value: rec.value,
     };
     if (typeof rec.priority === "number") r.priority = rec.priority;
-    if (typeof rec.isVerified === "boolean") r.verified = rec.isVerified;
+    if (typeof rec.isVerified === "boolean") {
+      r.verified = rec.isVerified;
+    } else if (typeof rec.verificationStatus === "string") {
+      r.verified = rec.verificationStatus === "verified";
+    }
     if (typeof rec.lastCheckedAt === "string")
       r.lastCheckedAt = new Date(rec.lastCheckedAt);
     return r as DomainDNSRecord;
@@ -545,22 +674,84 @@ export const AIInbxDriver = (
 
   const authHeader = { Authorization: `Bearer ${config.apiKey}` } as const;
 
+  const normalizeDomain = (d: any): Domain => {
+    const status = mapDomainStatus(d.status);
+    const records = extractDnsRecords(d);
+    return {
+      id: d.id,
+      domain: d.domain,
+      status,
+      createdAt: d.createdAt ? new Date(d.createdAt) : undefined,
+      updatedAt: d.updatedAt ? new Date(d.updatedAt) : undefined,
+      verification: records
+        ? { status, records, checkedAt: undefined }
+        : undefined,
+      raw: d,
+    };
+  };
+
+  const listDomainPayloads = async (): Promise<any[]> => {
+    const res = await fetch(`${baseUrl}/domains`, { headers: authHeader });
+    const contentType = res.headers.get("content-type") || "";
+    const body = contentType.includes("application/json")
+      ? await res.json()
+      : await res.text();
+    if (!res.ok) {
+      throw new EmailKitError(
+        typeof (body as any)?.message === "string"
+          ? (body as any).message
+          : `HTTP ${res.status}: Failed to list domains`,
+        "aiinbx",
+        undefined,
+        res.status,
+        undefined,
+        body,
+      );
+    }
+    return ((body as any)?.domains || []) as any[];
+  };
+
+  const resolveDomainId = async (idOrName: string): Promise<string> => {
+    if (!idOrName.includes(".")) return idOrName;
+
+    const domains = await listDomainPayloads();
+    const match = domains.find(
+      (d) => String(d.domain).toLowerCase() === idOrName.toLowerCase(),
+    );
+    if (!match?.id) {
+      throw new EmailKitError(
+        `Domain not found: ${idOrName}`,
+        "aiinbx",
+        "NOT_FOUND",
+        404,
+      );
+    }
+    return String(match.id);
+  };
+
   return {
+    id: driverId,
     name: "aiinbx",
     capabilities: AIINBX_CAPABILITIES,
-    providerFetch: createProviderFetch({
-      baseUrl: apiBase,
-      defaultHeaders: {
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-    }),
+    providerFetch: createAIInbxProviderFetch(apiBase, config.apiKey),
 
     sendEmail: async (
       message: EmailMessage<typeof AIINBX_CAPABILITIES>,
-      options?: { signal?: AbortSignal },
+      options?: SendEmailOptions,
     ): Promise<SendEmailResult> => {
-      // AIInbx API requires html, but we'll provide text as fallback if html is missing
-      const html = message.html || message.text || "";
+      const messageHeaders = (message as { headers?: Record<string, string> })
+        .headers;
+      if (messageHeaders && Object.keys(messageHeaders).length > 0) {
+        throw new EmailKitError(
+          "AIInbx does not support message.headers. Use message.reply.addresses, message.reply.messageId, message.reply.references, or message.reply.threadId for reply behavior.",
+          "aiinbx",
+          "UNSUPPORTED_FEATURE",
+        );
+      }
+
+      // AIInbx API requires html, so text-only sends are converted safely.
+      const html =
+        message.html || (message.text ? escapeHtmlText(message.text) : "");
       if (!html) {
         throw new EmailKitError(
           "Either html or text must be provided",
@@ -584,7 +775,7 @@ export const AIInbxDriver = (
       }
 
       // Optional text (if both provided)
-      if (message.text && message.html) {
+      if (message.text) {
         requestBody.text = message.text;
       }
 
@@ -601,6 +792,19 @@ export const AIInbxDriver = (
       }
       const reply = resolveMessageReplyContext(message);
       if (hasReplyData(reply)) {
+        if (
+          reply.isReply &&
+          !reply.messageId &&
+          (!reply.references || reply.references.length === 0) &&
+          !reply.threadId
+        ) {
+          throw new EmailKitError(
+            "AIInbx cannot infer a reply from reply.isReply alone. Provide message.reply.messageId, message.reply.references, or message.reply.threadId.",
+            "aiinbx",
+            "INVALID_REPLY_CONTEXT",
+          );
+        }
+
         const replyAddresses = replyAddressesAsArray(reply);
         if (replyAddresses.length === 1) {
           requestBody.reply_to = replyAddresses[0].email;
@@ -615,18 +819,6 @@ export const AIInbxDriver = (
         }
         if (reply.threadId) {
           requestBody.threadId = reply.threadId;
-        }
-      }
-
-      const headerInReplyTo = message.headers?.["In-Reply-To"];
-      if (headerInReplyTo && !requestBody.in_reply_to) {
-        requestBody.in_reply_to = headerInReplyTo;
-      }
-      const headerReferences = message.headers?.["References"];
-      if (headerReferences && !requestBody.references) {
-        const headerRefs = headerReferences.split(/\s+/).filter(Boolean);
-        if (headerRefs.length > 0) {
-          requestBody.references = headerRefs;
         }
       }
 
@@ -693,27 +885,13 @@ export const AIInbxDriver = (
         );
       }
 
-      // Custom headers - AIInbx doesn't support custom headers in send endpoint
-      // Note: Some headers like In-Reply-To and References are handled above
-      if (message.headers) {
-        const unsupportedHeaders = Object.keys(message.headers).filter(
-          (key) => !["In-Reply-To", "References"].includes(key),
-        );
-        if (unsupportedHeaders.length > 0) {
-          // Log warning but don't fail - just skip unsupported headers
-          console.warn(
-            `AIInbx API does not support custom headers: ${unsupportedHeaders.join(", ")}`,
-          );
-        }
-      }
-
-      // Tracking configuration - AIInbx doesn't have explicit tracking controls in send endpoint
-      // Tracking is likely enabled by default via webhooks
+      // Tracking configuration - AIInbx exposes per-send overrides.
       if ("track" in message && message.track !== undefined) {
-        if (message.track.opens === false || message.track.clicks === false) {
-          console.warn(
-            "AIInbx API does not support disabling tracking in the send endpoint. Tracking is enabled by default.",
-          );
+        if (typeof message.track.opens === "boolean") {
+          requestBody.track_opens = message.track.opens;
+        }
+        if (typeof message.track.clicks === "boolean") {
+          requestBody.track_clicks = message.track.clicks;
         }
       }
 
@@ -739,6 +917,14 @@ export const AIInbxDriver = (
             typeof body === "object" && body !== null
               ? (body as Record<string, unknown>)
               : undefined;
+          const providerCode =
+            typeof bodyObj?.code === "string" ||
+            typeof bodyObj?.code === "number"
+              ? bodyObj.code
+              : typeof bodyObj?.error === "string" ||
+                  typeof bodyObj?.error === "number"
+                ? bodyObj.error
+                : undefined;
           let errorMessage =
             (bodyObj?.message as string | undefined) ||
             (typeof body === "string" ? body : "Failed to send email");
@@ -757,7 +943,7 @@ export const AIInbxDriver = (
           throw new EmailKitError(
             errorMessage,
             "aiinbx",
-            undefined,
+            providerCode,
             res.status,
             undefined,
             body,
@@ -766,7 +952,7 @@ export const AIInbxDriver = (
 
         const emailId = (body as any)?.emailId;
         const messageId = (body as any)?.messageId;
-        // const threadId = (body as any)?.threadId; // unused
+        const threadId = (body as any)?.threadId;
 
         if (!emailId || !messageId) {
           throw new EmailKitError(
@@ -781,16 +967,25 @@ export const AIInbxDriver = (
 
         return {
           messageId,
-          provider: "aiinbx",
+          provider: driverId,
+          ...(threadId ? { threadId } : {}),
           providerId: emailId,
         };
       } catch (error) {
+        if (error instanceof EmailKitError) {
+          throw error;
+        }
+        const raw =
+          typeof error === "object" && error !== null && "raw" in error
+            ? (error as { raw?: unknown }).raw
+            : undefined;
         throw new EmailKitError(
           `Failed to send email: ${error instanceof Error ? error.message : String(error)}`,
           "aiinbx",
           undefined,
           undefined,
           error,
+          raw,
         );
       }
     },
@@ -821,6 +1016,7 @@ export const AIInbxDriver = (
         "outbound.email.rejected",
         "outbound.email.opened",
         "outbound.email.clicked",
+        "outbound.email.link_clicked",
       ] as const;
 
       if (outboundEventTypes.includes(eventType as any)) {
@@ -833,7 +1029,7 @@ export const AIInbxDriver = (
 
         // Map to specific event type
         const eventTypeMap: Record<
-          typeof eventType,
+          (typeof outboundEventTypes)[number],
           | "delivered"
           | "opened"
           | "clicked"
@@ -844,6 +1040,7 @@ export const AIInbxDriver = (
           "outbound.email.delivered": "delivered",
           "outbound.email.opened": "opened",
           "outbound.email.clicked": "clicked",
+          "outbound.email.link_clicked": "clicked",
           "outbound.email.bounced": "bounced",
           "outbound.email.complained": "complained",
           "outbound.email.rejected": "rejected",
@@ -920,41 +1117,7 @@ export const AIInbxDriver = (
     // Domains API (partial)
     domains: {
       list: async (): Promise<Domain[]> => {
-        const url = `${baseUrl}/domains`;
-        const res = await fetch(url, { headers: authHeader });
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to list domains`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
-        const domains = ((body as any)?.domains || []) as any[];
-        return domains.map((d) => {
-          const status = mapDomainStatus(d.status);
-          const records = extractDnsRecords(d);
-          const domain: Domain = {
-            id: d.id,
-            name: d.domain,
-            status,
-            createdAt: d.createdAt ? new Date(d.createdAt) : undefined,
-            updatedAt: d.updatedAt ? new Date(d.updatedAt) : undefined,
-            verification: records
-              ? { status, records, checkedAt: undefined }
-              : undefined,
-            raw: d,
-          };
-          return domain;
-        });
+        return (await listDomainPayloads()).map(normalizeDomain);
       },
 
       create: async (input): Promise<Domain> => {
@@ -962,7 +1125,7 @@ export const AIInbxDriver = (
         const res = await fetch(url, {
           method: "POST",
           headers: { ...authHeader, "Content-Type": "application/json" },
-          body: JSON.stringify({ domain: input.name }),
+          body: JSON.stringify({ domain: input.domain }),
         });
         const contentType = res.headers.get("content-type") || "";
         const body = contentType.includes("application/json")
@@ -986,7 +1149,7 @@ export const AIInbxDriver = (
         const status: Domain["status"] = "pending";
         const domain: Domain = {
           id: domainId,
-          name: input.name,
+          domain: input.domain,
           status,
           verification: { status, records },
           raw: body,
@@ -995,30 +1158,7 @@ export const AIInbxDriver = (
       },
 
       get: async (idOrName: string): Promise<Domain> => {
-        const resolveId = async (): Promise<string> => {
-          if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, {
-              headers: authHeader,
-            });
-            const bodyList = await resList.json();
-            const domains = ((bodyList as any)?.domains || []) as any[];
-            const match = domains.find(
-              (d: any) =>
-                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
-            );
-            if (!match) {
-              throw new EmailKitError(
-                `Domain not found: ${idOrName}`,
-                "aiinbx",
-                "NOT_FOUND",
-                404,
-              );
-            }
-            return match.id as string;
-          }
-          return idOrName;
-        };
-        const id = await resolveId();
+        const id = await resolveDomainId(idOrName);
         const url = `${baseUrl}/domains/${id}`;
         const res = await fetch(url, { headers: authHeader });
         const contentType = res.headers.get("content-type") || "";
@@ -1037,48 +1177,11 @@ export const AIInbxDriver = (
             body,
           );
         }
-        const d = body as any;
-        const status = mapDomainStatus(d.status);
-        const records = extractDnsRecords(d);
-        const domain: Domain = {
-          id: d.id,
-          name: d.domain,
-          status,
-          createdAt: d.createdAt ? new Date(d.createdAt) : undefined,
-          updatedAt: d.updatedAt ? new Date(d.updatedAt) : undefined,
-          verification: records
-            ? { status, records, checkedAt: undefined }
-            : undefined,
-          raw: d,
-        };
-        return domain;
+        return normalizeDomain(body);
       },
 
       verify: async (idOrName: string): Promise<DomainVerification> => {
-        const resolveId = async (): Promise<string> => {
-          if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, {
-              headers: authHeader,
-            });
-            const bodyList = await resList.json();
-            const domains = ((bodyList as any)?.domains || []) as any[];
-            const match = domains.find(
-              (d: any) =>
-                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
-            );
-            if (!match) {
-              throw new EmailKitError(
-                `Domain not found: ${idOrName}`,
-                "aiinbx",
-                "NOT_FOUND",
-                404,
-              );
-            }
-            return match.id as string;
-          }
-          return idOrName;
-        };
-        const id = await resolveId();
+        const id = await resolveDomainId(idOrName);
         const url = `${baseUrl}/domains/${id}/verify`;
         const res = await fetch(url, {
           method: "POST",
@@ -1114,30 +1217,7 @@ export const AIInbxDriver = (
       },
 
       delete: async (idOrName: string): Promise<{ deleted: boolean }> => {
-        const resolveId = async (): Promise<string> => {
-          if (idOrName.includes(".")) {
-            const resList = await fetch(`${baseUrl}/domains`, {
-              headers: authHeader,
-            });
-            const bodyList = await resList.json();
-            const domains = ((bodyList as any)?.domains || []) as any[];
-            const match = domains.find(
-              (d: any) =>
-                String(d.domain).toLowerCase() === idOrName.toLowerCase(),
-            );
-            if (!match) {
-              throw new EmailKitError(
-                `Domain not found: ${idOrName}`,
-                "aiinbx",
-                "NOT_FOUND",
-                404,
-              );
-            }
-            return match.id as string;
-          }
-          return idOrName;
-        };
-        const id = await resolveId();
+        const id = await resolveDomainId(idOrName);
         const url = `${baseUrl}/domains/${id}`;
         const res = await fetch(url, { method: "DELETE", headers: authHeader });
         const contentType = res.headers.get("content-type") || "";

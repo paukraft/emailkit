@@ -1,30 +1,37 @@
-import type { Metadata } from "next";
-import { JetBrains_Mono, Manrope } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google"
 
-import "./globals.css";
+import "./globals.css"
+import { ThemeProvider } from "@/components/theme-provider"
+import { Toaster } from "@/components/ui/sonner"
+import { TooltipProvider } from "@/components/ui/tooltip"
 
-const sans = Manrope({
+const fontSans = Geist({
   subsets: ["latin"],
   variable: "--font-sans",
-});
+})
 
-const mono = JetBrains_Mono({
+const fontMono = Geist_Mono({
   subsets: ["latin"],
   variable: "--font-mono",
-});
-
-export const metadata: Metadata = {
-  title: "EmailKit Sandbox",
-};
+})
 
 export default function RootLayout({
   children,
 }: Readonly<{
-  children: React.ReactNode;
+  children: React.ReactNode
 }>) {
   return (
-    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
-      <body>{children}</body>
+    <html
+      lang="en"
+      suppressHydrationWarning
+      className={`${fontSans.variable} ${fontMono.variable} font-sans antialiased`}
+    >
+      <body>
+        <ThemeProvider>
+          <TooltipProvider>{children}</TooltipProvider>
+          <Toaster richColors />
+        </ThemeProvider>
+      </body>
     </html>
-  );
+  )
 }

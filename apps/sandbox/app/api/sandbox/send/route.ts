@@ -1,123 +1,63 @@
-import { NextResponse } from "next/server";
+import { jsonError, jsonOk, sendSandboxEmail } from "@/app/sandbox/actions"
+import { getSandboxSnapshot } from "@/app/sandbox/store"
+import type { SendSandboxEmailInput } from "@/app/sandbox/types"
 
-import {
-  getSandboxProviderRuntime,
-  getSandboxProviders,
-} from "@/lib/sandbox-providers";
-import {
-  buildSandboxSnapshot,
-  recordSandboxEvent,
-  runSandboxTrace,
-} from "@/lib/sandbox-state";
-import {
-  SANDBOX_PROVIDERS,
-  type SandboxProviderId,
-  type SandboxSendPayload,
-} from "@/lib/sandbox-types";
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+const cleanString = (value: unknown) =>
+  typeof value === "string" && value.trim() ? value.trim() : undefined
 
-const isProvider = (value: unknown): value is SandboxProviderId =>
-  SANDBOX_PROVIDERS.includes(value as SandboxProviderId);
+const cleanStringArray = (value: unknown) =>
+  Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "")
+    : undefined
 
-const parsePayload = (body: unknown): SandboxSendPayload => {
-  if (!body || typeof body !== "object")
-    throw new Error("Request body must be an object.");
+const cleanRecord = <T extends Record<string, unknown>>(value: unknown) =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as T) : undefined
 
-  const b = body as Record<string, unknown>;
-
-  if (!isProvider(b.provider)) throw new Error("Unknown provider.");
-
-  const str = (key: string) => String(b[key] ?? "").trim() || undefined;
-  const fromEmail = str("fromEmail");
-  const toEmail = str("toEmail");
-  const subject = str("subject");
-
-  if (!fromEmail || !toEmail || !subject)
-    throw new Error("fromEmail, toEmail, and subject are required.");
+const parseSendInput = (body: unknown): SendSandboxEmailInput => {
+  if (!body || typeof body !== "object") throw new Error("Request body must be an object.")
+  const record = body as Record<string, unknown>
+  const emailDriver = cleanString(record.emailDriver)
+  const fromEmail = cleanString(record.fromEmail)
+  const toEmail = cleanString(record.toEmail)
+  const subject = cleanString(record.subject)
+  if (!emailDriver || !fromEmail || !toEmail || !subject) {
+    throw new Error("emailDriver, fromEmail, toEmail, and subject are required.")
+  }
 
   return {
-    provider: b.provider,
+    emailDriver,
     fromEmail,
-    fromName: str("fromName"),
     toEmail,
-    ccEmail: str("ccEmail"),
-    bccEmail: str("bccEmail"),
     subject,
-    text: str("text"),
-    html: str("html"),
-    replyToEmail: str("replyToEmail"),
-    inReplyToMessageId: str("inReplyToMessageId"),
-    trackOpens: typeof b.trackOpens === "boolean" ? b.trackOpens : undefined,
-    trackClicks: typeof b.trackClicks === "boolean" ? b.trackClicks : undefined,
-    sendAt: str("sendAt"),
-    unsubscribeGlobal: b.unsubscribeGlobal === true ? true : undefined,
-    tags: Array.isArray(b.tags)
-      ? b.tags.filter(
-          (t): t is string => typeof t === "string" && t.trim() !== "",
-        )
-      : undefined,
-    metadata:
-      b.metadata && typeof b.metadata === "object" && !Array.isArray(b.metadata)
-        ? (b.metadata as Record<string, string>)
-        : undefined,
-    headers:
-      b.headers && typeof b.headers === "object" && !Array.isArray(b.headers)
-        ? (b.headers as Record<string, string>)
-        : undefined,
-    templateId: str("templateId"),
-    templateData:
-      b.templateData && typeof b.templateData === "object"
-        ? (b.templateData as Record<string, unknown>)
-        : undefined,
-    idempotencyKey: str("idempotencyKey"),
-    tenantId: str("tenantId"),
-  };
-};
+    fromName: cleanString(record.fromName),
+    ccEmail: cleanString(record.ccEmail),
+    bccEmail: cleanString(record.bccEmail),
+    replyToEmail: cleanString(record.replyToEmail),
+    inReplyToMessageId: cleanString(record.inReplyToMessageId),
+    text: cleanString(record.text),
+    html: cleanString(record.html),
+    sendAt: cleanString(record.sendAt),
+    templateId: cleanString(record.templateId),
+    templateData: cleanRecord(record.templateData),
+    track: cleanRecord(record.track),
+    unsubscribe: cleanRecord(record.unsubscribe),
+    idempotencyKey: cleanString(record.idempotencyKey),
+    tenantId: cleanString(record.tenantId),
+    tags: cleanStringArray(record.tags),
+    metadata: cleanRecord<Record<string, string>>(record.metadata),
+    headers: cleanRecord<Record<string, string>>(record.headers),
+    provider: cleanRecord(record.provider),
+  }
+}
 
 export async function POST(request: Request) {
-  let provider: SandboxProviderId = "mailgun";
-  let result: unknown;
-
   try {
-    const payload = parsePayload(await request.json());
-    provider = payload.provider;
-    await runSandboxTrace(provider, async () => {
-      const providerRuntime = getSandboxProviderRuntime(provider);
-      result = await providerRuntime.send(payload);
-
-      recordSandboxEvent({
-        provider,
-        category: "send",
-        kind: "send-email",
-        summary: `Sent "${payload.subject}" via ${providerRuntime.info.label}`,
-        details: {
-          to: payload.toEmail,
-          from: payload.fromEmail,
-          subject: payload.subject,
-          result,
-        },
-      });
-    });
-
-    return NextResponse.json({
-      ok: true,
-      result,
-      snapshot: buildSandboxSnapshot(getSandboxProviders()),
-    });
+    const result = await sendSandboxEmail(parseSendInput(await request.json()))
+    return jsonOk({ result, snapshot: getSandboxSnapshot() })
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Unknown send error";
-
-    recordSandboxEvent({
-      provider,
-      category: "send",
-      kind: "send-email-error",
-      summary: "Send failed",
-      details: { error: message },
-    });
-
-    return NextResponse.json({ ok: false, error: message }, { status: 400 });
+    return jsonError(error)
   }
 }

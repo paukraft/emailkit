@@ -1,10 +1,18 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
 
 @theme inline {
-  --font-sans: "Manrope Variable", sans-serif;
-  --font-mono: "JetBrains Mono", monospace;
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --duration-press: 120ms;
+  --duration-tooltip: 160ms;
+  --duration-popover: 180ms;
+  --duration-modal: 220ms;
+  --duration-section: 220ms;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
@@ -32,6 +40,29 @@
 }
 
 :root {
+  --radius: 0.625rem;
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.94 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.94 0 0);
+  --muted-foreground: oklch(0.45 0 0);
+  --accent: oklch(0.94 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.58 0.19 24);
+  --border: oklch(0 0 0 / 10%);
+  --input: oklch(0 0 0 / 14%);
+  --ring: oklch(0.556 0 0);
+  --success: oklch(0.6 0.14 150);
+}
+
+.dark {
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -51,7 +82,6 @@
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
   --success: oklch(0.68 0.16 150);
-  --radius: 0.625rem;
 }
 
 @layer base {
@@ -62,7 +92,7 @@
 
   html,
   body {
-    @apply h-full bg-background text-foreground overflow-hidden font-sans antialiased;
+    @apply h-full overflow-hidden bg-background font-sans text-foreground antialiased;
     margin: 0;
   }
 
@@ -73,7 +103,7 @@
 
 .scrollbar-thin {
   scrollbar-width: thin;
-  scrollbar-color: oklch(1 0 0 / 10%) transparent;
+  scrollbar-color: oklch(0 0 0 / 18%) transparent;
 }
 
 .scrollbar-thin::-webkit-scrollbar {
@@ -85,6 +115,49 @@
 }
 
 .scrollbar-thin::-webkit-scrollbar-thumb {
-  background: oklch(1 0 0 / 12%);
+  background: oklch(0 0 0 / 18%);
   border-radius: 3px;
+}
+
+.dark .scrollbar-thin {
+  scrollbar-color: oklch(1 0 0 / 12%) transparent;
+}
+
+.dark .scrollbar-thin::-webkit-scrollbar-thumb {
+  background: oklch(1 0 0 / 12%);
+}
+
+.trace-empty > * {
+  opacity: 0;
+  transform: translateY(2px);
+  animation: trace-empty-in 320ms var(--ease-out) forwards;
+}
+
+.trace-empty > *:nth-child(1) { animation-delay: 40ms; }
+.trace-empty > *:nth-child(2) { animation-delay: 90ms; }
+.trace-empty > *:nth-child(3) { animation-delay: 140ms; }
+.trace-empty > *:nth-child(4) { animation-delay: 190ms; }
+.trace-empty > *:nth-child(5) { animation-delay: 240ms; }
+
+.trace-empty-label {
+  opacity: 0;
+  animation: trace-empty-in 320ms var(--ease-out) 320ms forwards;
+}
+
+@keyframes trace-empty-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

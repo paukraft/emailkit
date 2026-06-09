@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model ConnectedMailbox {
+  id                String   @id @default(cuid())
+  emailDriver       String
+  email             String
+  providerMailboxId String?
+  displayName       String?
+  status            String   @default("unknown")
+  auth              Json?
+  raw               Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  webhooks          Webhook[]
+
+  @@unique([emailDriver, email])
+  @@index([email])
+  @@index([emailDriver])
+  @@index([emailDriver, status])
+  @@index([providerMailboxId])
+}
+
+model Webhook {
+  id           String   @id @default(cuid())
+  emailDriver  String
+  scope        String
+  providerId   String?
+  url          String
+  events       Json?
+  status       String   @default("active")
+  expiresAt    DateTime?
+  renewAfter   DateTime?
+  mailboxId    String?
+  mailboxEmail String?
+  domain       String?
+  raw          Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  mailbox      ConnectedMailbox? @relation(fields: [mailboxId], references: [id], onDelete: Cascade)
+
+  @@unique([emailDriver, scope, providerId])
+  @@index([emailDriver, scope])
+  @@index([expiresAt])
+  @@index([mailboxId])
+  @@index([domain])
+}

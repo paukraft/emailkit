@@ -1,4 +1,4 @@
-import type { BaseEmailMessage, EmailAddress, ReplyContext } from "../types";
+import type { EmailAddress, ReplyContext } from "../types";
 
 const isReplyContext = (value: unknown): value is ReplyContext => {
   if (!value || typeof value !== "object") return false;
@@ -20,7 +20,7 @@ const normalizeEmailAddress = (address: EmailAddress): EmailAddress => {
 };
 
 const normalizeAddresses = (
-  addresses?: EmailAddress | EmailAddress[] | null
+  addresses?: EmailAddress | EmailAddress[] | null,
 ): EmailAddress[] => {
   if (!addresses) return [];
   const list = Array.isArray(addresses) ? addresses : [addresses];
@@ -42,7 +42,7 @@ const normalizeAddresses = (
 };
 
 const normalizeReferences = (
-  references?: string[] | string | null
+  references?: string[] | string | null,
 ): string[] | undefined => {
   if (!references) return undefined;
   const refs = Array.isArray(references)
@@ -107,7 +107,7 @@ export const hasReplyData = (reply: ReplyContext): boolean => {
       reply.messageId ||
       (reply.references && reply.references.length > 0) ||
       reply.threadId ||
-      reply.isReply
+      reply.isReply,
   );
 };
 
@@ -125,14 +125,14 @@ export const normalizeReplyInput = (input: ReplyInput): ReplyContext => {
   return {};
 };
 
-export const resolveMessageReplyContext = (
-  message: Pick<BaseEmailMessage, "reply">
-): ReplyContext => {
-  return normalizeReplyInput(message.reply);
+export const resolveMessageReplyContext = (message: {
+  reply?: ReplyContext | Pick<ReplyContext, "addresses">;
+}): ReplyContext => {
+  return normalizeReplyInput(message.reply as ReplyContext | undefined);
 };
 
 export const replyAddressesAsArray = (
-  reply?: ReplyContext | null
+  reply?: ReplyContext | null,
 ): EmailAddress[] => {
   if (!reply?.addresses) return [];
   return reply.addresses;

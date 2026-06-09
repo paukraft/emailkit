@@ -1,199 +1,185 @@
-import { type Dispatch, type SetStateAction, useDeferredValue, useEffect, useMemo, useState } from "react";
+"use client"
+
+import { AlertOctagon, CircleDot, Search, Tag, X } from "lucide-react"
+import { useDeferredValue, useEffect, useMemo, useState } from "react"
+
+import { Button } from "@/components/ui/button"
 import {
-  RiSearchLine,
-  RiCloseLine,
-  RiRobotLine,
-  RiLinkM,
-} from "@remixicon/react";
-import { cn } from "@/lib/cn";
-import { Button } from "@/components/ui/button";
-import { Toggle } from "@/components/ui/toggle";
-import { EventIcon } from "./event-icon";
-import { FilterSelect } from "./form-primitives";
-import type { SandboxProviderId, SandboxTrace } from "@/lib/sandbox-types";
+  Filters,
+  type AppliedFilter,
+  type FilterFieldDef,
+} from "@/components/ui/filters"
+import { cn } from "@/lib/utils"
 import {
-  type TraceFilters,
-  DEFAULT_TRACE_FILTERS,
+  dotColor,
   eventLabel,
-  eventIconKey,
-  kindColor,
-  kindDotColor,
-  getBotDetection,
-  matchesTraceQuery,
-  hasTraceError,
-  getRecencyCutoff,
   extractFrom,
-} from "@/lib/trace-helpers";
+  hasError,
+  kindColor,
+  matchesQuery,
+  STATUS_STYLE,
+  traceDuration,
+} from "../sandbox/trace-helpers"
+import { TimeAgo } from "./time-ago"
+import type { SandboxEventCategory, SandboxTrace } from "../sandbox/types"
+
+const CATEGORY_OPTIONS: { value: SandboxEventCategory; label: string }[] = [
+  { value: "send", label: "Send" },
+  { value: "hook", label: "Hook" },
+  { value: "webhook", label: "Webhook" },
+  { value: "domain", label: "Domain" },
+  { value: "mailbox", label: "Mailbox" },
+  { value: "tool", label: "Tool" },
+  { value: "system", label: "System" },
+]
+
+const STATUS_OPTIONS = [
+  { value: "delivered", label: "Delivered" },
+  { value: "opened", label: "Opened" },
+  { value: "clicked", label: "Clicked" },
+  { value: "bounced", label: "Bounced" },
+  { value: "rejected", label: "Rejected" },
+  { value: "complained", label: "Complained" },
+]
+
+const FILTER_FIELDS: FilterFieldDef[] = [
+  {
+    id: "category",
+    label: "Category",
+    icon: <Tag />,
+    options: CATEGORY_OPTIONS,
+  },
+  {
+    id: "status",
+    label: "Status",
+    icon: <CircleDot />,
+    options: STATUS_OPTIONS,
+  },
+  {
+    id: "errors",
+    label: "Errors",
+    icon: <AlertOctagon />,
+    options: [
+      { value: "errored", label: "Errored only" },
+      { value: "clean", label: "Clean only" },
+    ],
+  },
+]
+
+type FilterState = {
+  query: string
+  applied: AppliedFilter[]
+}
+
+const DEFAULT_FILTERS: FilterState = { query: "", applied: [] }
+
+const matchesApplied = (trace: SandboxTrace, applied: AppliedFilter[]) => {
+  for (const filter of applied) {
+    if (filter.values.length === 0) continue
+    const matched = matchesField(trace, filter)
+    if (filter.operator === "include" ? !matched : matched) return false
+  }
+  return true
+}
+
+const matchesField = (trace: SandboxTrace, filter: AppliedFilter) => {
+  if (filter.field === "category") {
+    return trace.events.some((event) => filter.values.includes(event.category))
+  }
+  if (filter.field === "status") {
+    return trace.events.some((event) => {
+      const kind = event.kind.toLowerCase()
+      return filter.values.some((value) => kind.includes(value))
+    })
+  }
+  if (filter.field === "errors") {
+    const errored = hasError(trace)
+    return filter.values.some((value) =>
+      value === "errored" ? errored : !errored,
+    )
+  }
+  return true
+}
 
 export function TraceList({
   traces,
-  selectedProvider,
+  selectedDriver,
   selectedTraceId,
   onSelectTrace,
 }: {
-  traces: SandboxTrace[];
-  selectedProvider: SandboxProviderId;
-  selectedTraceId: string | null;
-  onSelectTrace: Dispatch<SetStateAction<string | null>>;
+  traces: SandboxTrace[]
+  selectedDriver: string
+  selectedTraceId: string | null
+  onSelectTrace: (id: string | null) => void
 }) {
-  const [traceFilters, setTraceFilters] = useState<TraceFilters>(DEFAULT_TRACE_FILTERS);
-  const deferredQuery = useDeferredValue(traceFilters.query);
+  const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTERS)
+  const deferredQuery = useDeferredValue(filters.query)
 
-  const providerTraces = useMemo(
-    () => traces.filter((t) => t.provider === selectedProvider),
-    [selectedProvider, traces],
-  );
+  const driverTraces = useMemo(
+    () => traces.filter((trace) => trace.driver === selectedDriver),
+    [selectedDriver, traces],
+  )
 
-  const traceFilterOptions = useMemo(() => {
-    const eventKinds = new Set<string>();
-    const statuses = new Set<string>();
-    providerTraces.forEach((t) => {
-      if (t.correlation.status) statuses.add(t.correlation.status);
-      t.events.forEach((e) => eventKinds.add(e.kind));
-    });
-    return {
-      eventKinds: Array.from(eventKinds).sort(),
-      statuses: Array.from(statuses).sort(),
-    };
-  }, [providerTraces]);
-
-  const filteredTraces = useMemo(() => {
-    const query = deferredQuery.trim().toLowerCase();
-    const recencyCutoff = getRecencyCutoff(traceFilters.recency);
-    return providerTraces.filter((trace) => {
-      if (traceFilters.category !== "all" && !trace.events.some((e) => e.category === traceFilters.category))
-        return false;
-      if (traceFilters.kind !== "all" && !trace.events.some((e) => e.kind === traceFilters.kind))
-        return false;
-      if (traceFilters.status !== "all" && trace.correlation.status !== traceFilters.status)
-        return false;
-      if (traceFilters.errorsOnly && !hasTraceError(trace)) return false;
-      if (recencyCutoff !== null && new Date(trace.updatedAt).getTime() < recencyCutoff)
-        return false;
-      return matchesTraceQuery(trace, query);
-    });
-  }, [deferredQuery, providerTraces, traceFilters]);
+  const filtered = useMemo(
+    () =>
+      driverTraces.filter((trace) => {
+        if (!matchesApplied(trace, filters.applied)) return false
+        return matchesQuery(trace, deferredQuery.trim())
+      }),
+    [deferredQuery, driverTraces, filters.applied],
+  )
 
   useEffect(() => {
-    if (!filteredTraces.length) return onSelectTrace(null);
-    onSelectTrace((c) =>
-      c && filteredTraces.some((t) => t.id === c) ? c : (filteredTraces[0]?.id ?? null),
-    );
-  }, [filteredTraces, onSelectTrace]);
+    if (filtered.length === 0) {
+      onSelectTrace(null)
+      return
+    }
+    if (!selectedTraceId || !filtered.some((trace) => trace.id === selectedTraceId)) {
+      onSelectTrace(filtered[0].id)
+    }
+  }, [filtered, onSelectTrace, selectedTraceId])
 
-  const setFilter = <K extends keyof TraceFilters>(key: K, value: TraceFilters[K]) =>
-    setTraceFilters((c) => ({ ...c, [key]: value }));
-
-  const hasActiveFilters =
-    traceFilters.query.trim().length > 0 ||
-    traceFilters.category !== "all" ||
-    traceFilters.kind !== "all" ||
-    traceFilters.status !== "all" ||
-    traceFilters.recency !== "all" ||
-    traceFilters.errorsOnly;
+  const hasActive = filters.query.trim() || filters.applied.length > 0
 
   return (
-    <div className="flex flex-1 flex-col min-w-0">
-      {/* Search + filters */}
+    <div className="flex min-w-0 flex-1 flex-col">
       <div className="flex flex-col border-b">
         <div className="flex h-9 items-center gap-2 px-3">
-          <RiSearchLine className="size-3 shrink-0 text-muted-foreground/50" />
+          <Search className="size-3 shrink-0 text-muted-foreground/50" />
           <input
-            value={traceFilters.query}
-            onChange={(e) => setFilter("query", e.target.value)}
+            value={filters.query}
+            onChange={(event) => setFilters((current) => ({ ...current, query: event.target.value }))}
             placeholder="Search traces…"
             className="flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground/40"
           />
           <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-            {filteredTraces.length}
-            {hasActiveFilters && (
-              <span className="text-muted-foreground/40">/{providerTraces.length}</span>
-            )}
+            {filtered.length}
+            {hasActive && <span className="text-muted-foreground/40">/{driverTraces.length}</span>}
           </span>
-          {hasActiveFilters && (
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={() => setTraceFilters(DEFAULT_TRACE_FILTERS)}
-            >
-              <RiCloseLine className="size-3.5" />
+          {hasActive && (
+            <Button variant="ghost" size="icon-xs" onClick={() => setFilters(DEFAULT_FILTERS)}>
+              <X className="size-3.5" />
             </Button>
           )}
         </div>
 
-        <div className="flex items-center gap-1.5 overflow-x-auto px-3 pb-2 scrollbar-thin">
-          <FilterSelect
-            value={traceFilters.category}
-            onValueChange={(v) => setFilter("category", v as TraceFilters["category"])}
-            options={[
-              { value: "all", label: "Category" },
-              { value: "send", label: "Send" },
-              { value: "hook", label: "Hook" },
-              { value: "webhook", label: "Webhook" },
-              { value: "system", label: "System" },
-            ]}
+        <div className="flex flex-wrap items-center gap-1.5 px-3 pb-2">
+          <Filters
+            fields={FILTER_FIELDS}
+            value={filters.applied}
+            onChange={(next) => setFilters((current) => ({ ...current, applied: next }))}
           />
-          {traceFilterOptions.eventKinds.length > 0 && (
-            <FilterSelect
-              value={traceFilters.kind}
-              onValueChange={(v) => setFilter("kind", v)}
-              options={[
-                { value: "all", label: "Kind" },
-                ...traceFilterOptions.eventKinds.map((k) => ({ value: k, label: k })),
-              ]}
-            />
-          )}
-          {traceFilterOptions.statuses.length > 0 && (
-            <FilterSelect
-              value={traceFilters.status}
-              onValueChange={(v) => setFilter("status", v)}
-              options={[
-                { value: "all", label: "Status" },
-                ...traceFilterOptions.statuses.map((s) => ({ value: s, label: s })),
-              ]}
-            />
-          )}
-          <FilterSelect
-            value={traceFilters.recency}
-            onValueChange={(v) => setFilter("recency", v as TraceFilters["recency"])}
-            options={[
-              { value: "all", label: "Time" },
-              { value: "15m", label: "15m" },
-              { value: "1h", label: "1h" },
-              { value: "24h", label: "24h" },
-              { value: "7d", label: "7d" },
-            ]}
-          />
-          <Toggle
-            size="sm"
-            pressed={traceFilters.errorsOnly}
-            onPressedChange={(v) => setFilter("errorsOnly", v)}
-            className={cn(
-              "h-5 rounded-full px-2 text-[10px]",
-              traceFilters.errorsOnly && "bg-destructive/10 text-destructive hover:bg-destructive/15 hover:text-destructive",
-            )}
-          >
-            Errors
-          </Toggle>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto scrollbar-thin">
-        {providerTraces.length === 0 ? (
-          <div className="flex h-full items-center justify-center p-6">
-            <p className="max-w-[240px] text-center text-xs leading-relaxed text-muted-foreground">
-              No traces yet. Send a test email or point a provider webhook at the sandbox routes.
-            </p>
-          </div>
-        ) : filteredTraces.length === 0 ? (
-          <div className="flex h-full items-center justify-center p-6">
-            <p className="max-w-[240px] text-center text-xs leading-relaxed text-muted-foreground">
-              No traces match filters.
-            </p>
-          </div>
+        {driverTraces.length === 0 ? (
+          <Empty message="No traces yet. Send a test email or point a provider webhook at the sandbox routes." />
+        ) : filtered.length === 0 ? (
+          <Empty message="No traces match filters." />
         ) : (
           <div className="flex flex-col">
-            {filteredTraces.map((trace) => (
+            {filtered.map((trace) => (
               <TraceRow
                 key={trace.id}
                 trace={trace}
@@ -205,7 +191,15 @@ export function TraceList({
         )}
       </div>
     </div>
-  );
+  )
+}
+
+function Empty({ message }: { message: string }) {
+  return (
+    <div className="flex h-full items-center justify-center p-6">
+      <p className="max-w-[240px] text-center text-xs leading-relaxed text-muted-foreground">{message}</p>
+    </div>
+  )
 }
 
 function TraceRow({
@@ -213,101 +207,102 @@ function TraceRow({
   selected,
   onSelect,
 }: {
-  trace: SandboxTrace;
-  selected: boolean;
-  onSelect: () => void;
+  trace: SandboxTrace
+  selected: boolean
+  onSelect: () => void
 }) {
-  const leadEvent =
-    trace.events.find((e) => e.category === "hook" || e.category === "send") ?? trace.events[0];
-  const leadKind = leadEvent?.kind ?? "";
-  const timeline = trace.events.slice(0, 6);
-  const hasBot = trace.events.some((e) => getBotDetection(e.details)?.isBot);
-  const { recipient, subject, status } = trace.correlation;
-  const from = extractFrom(leadEvent?.details);
-
-  const clickEvent = trace.events.find((e) => e.kind.includes("clicked"));
-  const clickUrl =
-    clickEvent?.details &&
-    typeof clickEvent.details === "object" &&
-    "url" in clickEvent.details &&
-    typeof (clickEvent.details as Record<string, unknown>).url === "string"
-      ? ((clickEvent.details as Record<string, unknown>).url as string)
-      : null;
+  const lead = trace.events.find((event) => event.category === "send" || event.category === "hook") ?? trace.events[0]
+  const from = extractFrom(lead)
+  const { recipient, subject, status } = trace.correlation
+  const errored = hasError(trace)
+  const leadKind = lead?.kind ?? trace.summary
 
   return (
     <button
       onClick={onSelect}
       className={cn(
-        "flex items-start gap-2.5 border-b px-3 py-2.5 text-left transition-colors",
-        selected ? "bg-secondary" : "hover:bg-secondary/50",
+        "group/row relative flex flex-col gap-1.5 border-b px-3 py-2.5 text-left transition-colors",
+        selected ? "bg-secondary/70" : "hover:bg-secondary/40",
       )}
     >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5 text-xs">
-          <span className={cn("inline-flex shrink-0 items-center gap-0.5 font-medium", kindColor(leadKind))}>
-            <EventIcon iconKey={eventIconKey(leadKind)} className="size-3.5" />
-            <span>{eventLabel(leadKind)}</span>
+      <span
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute inset-y-0 left-0 w-[2px] origin-center transition-transform duration-200 ease-[var(--ease-out)]",
+          selected ? "scale-y-100" : "scale-y-0",
+          errored ? "bg-destructive" : "bg-foreground",
+        )}
+      />
+
+      <div className="flex items-center gap-2 text-xs">
+        <span className={cn("inline-flex shrink-0 items-center gap-1 font-medium", kindColor(leadKind))}>
+          <span className={cn("size-1.5 rounded-full", dotColor(leadKind))} />
+          {eventLabel(leadKind)}
+        </span>
+        {status && (
+          <span
+            className={cn(
+              "shrink-0 rounded px-1 py-px font-mono text-[10px] uppercase tracking-wider",
+              STATUS_STYLE[status] ?? "bg-secondary text-muted-foreground",
+            )}
+          >
+            {status}
           </span>
-          {(from || recipient) && (
-            <span className="flex min-w-0 items-center gap-1 truncate font-mono text-muted-foreground">
-              {from && <span className="truncate">{from}</span>}
-              {from && recipient && <span className="shrink-0">&rarr;</span>}
-              {recipient && <span className="truncate">{recipient}</span>}
-            </span>
-          )}
-        </div>
-        {subject && (
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{subject}</p>
         )}
-        {clickUrl && (
-          <p className="mt-0.5 flex items-center gap-1 truncate font-mono text-[10px] text-blue-400">
-            <RiLinkM className="size-2.5 shrink-0" />
-            <span className="truncate">{clickUrl}</span>
-          </p>
-        )}
-        {!from && !recipient && !subject && (
-          <span className="block truncate text-xs font-medium">{trace.summary}</span>
-        )}
-        <div className="mt-1 flex items-center gap-1.5">
-          {status && (
-            <span
-              className={cn(
-                "rounded px-1 py-px font-mono text-[10px]",
-                status === "delivered"
-                  ? "bg-emerald-500/15 text-emerald-500"
-                  : status === "bounced" || status === "rejected"
-                    ? "bg-destructive/15 text-destructive"
-                    : status === "complained"
-                      ? "bg-orange-500/15 text-orange-500"
-                      : "bg-secondary text-muted-foreground",
-              )}
-            >
-              {status}
-            </span>
-          )}
-          {hasBot && (
-            <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-orange-500/15 px-1 py-px text-[10px] font-medium text-orange-500">
-              <RiRobotLine className="size-2.5" />
-              bot
-            </span>
-          )}
-          <div className="flex items-center gap-0.5">
-            {[...timeline].reverse().map((ev) => (
-              <span
-                key={ev.id}
-                className={cn("size-1.5 rounded-full", kindDotColor(ev.kind))}
-                title={ev.kind}
-              />
-            ))}
-          </div>
-          <span className="tabular-nums text-[10px] text-muted-foreground">
-            {trace.events.length} event{trace.events.length === 1 ? "" : "s"}
-          </span>
-        </div>
+        <div className="flex-1" />
+        <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/70">
+          <TimeAgo date={trace.updatedAt} />
+        </span>
       </div>
-      <time className="mt-0.5 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
-        {new Date(trace.updatedAt).toLocaleTimeString()}
-      </time>
+
+      {subject ? (
+        <p className="truncate text-[12px] leading-snug font-medium text-foreground">{subject}</p>
+      ) : (
+        <p className="truncate text-[12px] font-medium text-foreground">{trace.summary}</p>
+      )}
+
+      {(from || recipient) && (
+        <div className="flex min-w-0 items-center gap-1 truncate font-mono text-[10px] text-muted-foreground">
+          {from && <span className="truncate">{from}</span>}
+          {from && recipient && <span className="shrink-0 text-muted-foreground/40">→</span>}
+          {recipient && <span className="truncate">{recipient}</span>}
+        </div>
+      )}
+
+      <EventRibbon trace={trace} />
     </button>
-  );
+  )
 }
+
+function EventRibbon({ trace }: { trace: SandboxTrace }) {
+  const start = new Date(trace.startedAt).getTime()
+  const span = Math.max(1, traceDuration(trace))
+  const events = trace.events
+
+  return (
+    <div className="mt-0.5 flex items-center gap-2">
+      <div className="relative h-3 flex-1">
+        <span aria-hidden className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border" />
+        {events.map((event) => {
+          const offset = new Date(event.timestamp).getTime() - start
+          const pct = events.length === 1 ? 0 : Math.min(100, Math.max(0, (offset / span) * 100))
+          return (
+            <span
+              key={event.id}
+              className={cn(
+                "absolute top-1/2 size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-background",
+                dotColor(event.kind),
+              )}
+              style={{ left: `${pct}%` }}
+              title={eventLabel(event.kind)}
+            />
+          )
+        })}
+      </div>
+      <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/60">
+        {events.length}
+      </span>
+    </div>
+  )
+}
+

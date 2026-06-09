@@ -121,3 +121,126 @@ describe("ResendDriver domains.verify", () => {
     expect(verification.records[0]?.verified).toBe(true);
   });
 });
+
+describe("ResendDriver domains", () => {
+  it("normalizes provider name to public domain without name compatibility", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          object: "list",
+          has_more: false,
+          data: [verifiedDomainResponse],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = ResendDriver({ apiKey: "re_test" });
+    const domains = await driver.domains!.list();
+
+    expect(domains).toHaveLength(1);
+    expect(domains[0]).toMatchObject({
+      id: "dom_123",
+      domain: "example.com",
+      status: "verified",
+    });
+    expect(domains[0]).not.toHaveProperty("name");
+  });
+
+  it("creates domains from the EmailKit domain input field", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify(verifiedDomainResponse), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = ResendDriver({ apiKey: "re_test" });
+    const domain = await driver.domains!.create({
+      domain: "example.com",
+      region: "eu-west-1",
+      returnPathSubdomain: "bounce",
+      tracking: { opens: true, clicks: false },
+    });
+
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      name: "example.com",
+      region: "eu-west-1",
+      custom_return_path: "bounce",
+      open_tracking: true,
+      click_tracking: false,
+    });
+    expect(domain.domain).toBe("example.com");
+    expect(domain).not.toHaveProperty("name");
+  });
+
+  it("updates supported Resend domain settings and returns hydrated domain", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ object: "domain", id: "dom_123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(verifiedDomainResponse), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = ResendDriver({ apiKey: "re_test" });
+    const domain = await driver.domains!.update("dom_123", {
+      tracking: { opens: false, clicks: true },
+      provider: { tls: "enforced" },
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://api.resend.com/domains/dom_123",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({
+          open_tracking: false,
+          click_tracking: true,
+          tls: "enforced",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "https://api.resend.com/domains/dom_123",
+      expect.any(Object),
+    );
+    expect(domain.domain).toBe("example.com");
+  });
+
+  it("uses Resend delete response deleted flag", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ object: "domain", id: "dom_123", deleted: true }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = ResendDriver({ apiKey: "re_test" });
+    await expect(driver.domains!.delete("dom_123")).resolves.toEqual({
+      deleted: true,
+    });
+  });
+});

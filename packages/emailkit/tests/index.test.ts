@@ -4,7 +4,7 @@ import { EmailKit, VERSION } from "../src";
 
 describe("emailkit", () => {
   it("exports the package version", () => {
-    expect(VERSION).toBe("0.2.0");
+    expect(VERSION).toBe("2.0.0");
   });
 
   it("exports the EmailKit factory", () => {

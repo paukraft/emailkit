@@ -1,16 +1,13 @@
-import { NextResponse } from "next/server";
+import { clearSandbox, getSandboxSnapshot } from "@/app/sandbox/store"
 
-import { buildSandboxSnapshot, clearSandboxEvents } from "@/lib/sandbox-state";
-import { getSandboxProviders } from "@/lib/sandbox-providers";
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
-
-export async function GET() {
-  return NextResponse.json(buildSandboxSnapshot(getSandboxProviders()));
+export function GET() {
+  return Response.json(getSandboxSnapshot())
 }
 
-export async function DELETE() {
-  clearSandboxEvents();
-  return NextResponse.json(buildSandboxSnapshot(getSandboxProviders()));
+export function DELETE() {
+  clearSandbox()
+  return Response.json(getSandboxSnapshot())
 }

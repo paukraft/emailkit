@@ -1,6 +1,6 @@
 {
   "name": "emailkit",
-  "version": "0.2.0",
+  "version": "2.0.0",
   "description": "Unified email API for multiple providers.",
   "type": "module",
   "license": "MIT",
@@ -50,8 +50,8 @@
     "dev": "tsdown && tsdown --watch src --ignore-watch '**/.turbo/**' --ignore-watch '.turbo/**' --ignore-watch '**/dist/**' --ignore-watch 'dist/**' --ignore-watch '**/node_modules/**' --ignore-watch 'node_modules/**'",
     "prepublishOnly": "npm run build",
     "test": "vitest",
-    "typecheck": "tsc --noEmit",
-    "check-types": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.type-tests.json",
+    "check-types": "tsc --noEmit && tsc -p tsconfig.type-tests.json"
   },
   "dependencies": {
     "svix": "^1.20.0"

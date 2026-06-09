@@ -6,7 +6,11 @@
  */
 
 import { createHmac } from "crypto";
-import type { EmailDriver, EmailDriverConfig } from "../driver";
+import type {
+  EmailDriver,
+  EmailDriverConfig,
+  SendEmailOptions,
+} from "../driver";
 import type {
   Attachment,
   CreateDomainInput,
@@ -19,12 +23,29 @@ import type {
   DriverCapabilities,
   EmailAddress,
   EmailMessage,
+  EmailTag,
   InboundEmailEvent,
   ListDomainsOptions,
   OutboundEmailEvent,
   SendEmailResult,
   UpdateDomainInput,
   WebhookEvent,
+  WebhookEventSelection,
+  WebhookEventType,
+  WebhookInboundOptions,
+  Webhook,
+  AccountWebhookSetupInput,
+  AccountWebhookRefreshInput,
+  AccountWebhookDeleteInput,
+  AccountWebhookSetupResult,
+  AccountWebhookRefreshResult,
+  AccountWebhookDeleteResult,
+  DomainWebhookSetupInput,
+  DomainWebhookRefreshInput,
+  DomainWebhookDeleteInput,
+  DomainWebhookSetupResult,
+  DomainWebhookRefreshResult,
+  DomainWebhookDeleteResult,
   WebhookRequest,
   WebhookResponse,
 } from "../types";
@@ -65,7 +86,12 @@ export const MAILGUN_ENDPOINTS = {
 /**
  * Mailgun-specific configuration
  */
-export interface MailgunDriverConfig extends EmailDriverConfig {
+export interface MailgunDriverConfig<TId extends string = "mailgun">
+  extends EmailDriverConfig {
+  /**
+   * EmailKit driver id. Override when configuring multiple Mailgun drivers.
+   */
+  id?: TId;
   apiKey: string;
   region?: "us" | "eu"; // Defaults to 'us' if not specified
   webhookSigningKey?: string; // Optional webhook signing key (different from API key)
@@ -101,12 +127,127 @@ const formatEmailAddress = (address: EmailAddress): string => {
  * Format multiple email addresses for Mailgun API
  */
 const formatEmailAddresses = (
-  addresses: EmailAddress | EmailAddress[]
+  addresses: EmailAddress | EmailAddress[],
 ): string => {
   if (Array.isArray(addresses)) {
     return addresses.map(formatEmailAddress).join(", ");
   }
   return formatEmailAddress(addresses);
+};
+
+const formatMailgunDeliveryTime = (date: Date): string => {
+  const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+  const pad = (value: number) => String(value).padStart(2, "0");
+
+  return `${days[date.getUTCDay()]}, ${pad(date.getUTCDate())} ${
+    months[date.getUTCMonth()]
+  } ${date.getUTCFullYear()} ${pad(date.getUTCHours())}:${pad(
+    date.getUTCMinutes(),
+  )}:${pad(date.getUTCSeconds())} +0000`;
+};
+
+const formatMailgunTag = (tag: EmailTag): string => {
+  if (typeof tag === "string") return tag;
+  return `${tag.name}:${tag.value}`;
+};
+
+const resolveMailgunAttachmentContent = async (
+  attachment: Attachment,
+): Promise<string | Uint8Array> => {
+  if (attachment.content !== undefined) {
+    return typeof attachment.content === "string"
+      ? attachment.content
+      : attachment.content;
+  }
+
+  if (!attachment.url) {
+    throw new EmailKitError(
+      `Attachment ${attachment.filename} must have either content or url`,
+      "mailgun",
+      "INVALID_ATTACHMENT",
+    );
+  }
+
+  try {
+    const res = await fetch(attachment.url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return new Uint8Array(await res.arrayBuffer());
+  } catch (error) {
+    throw new EmailKitError(
+      `Failed to fetch attachment ${attachment.filename} from URL: ${attachment.url}`,
+      "mailgun",
+      "ATTACHMENT_FETCH_FAILED",
+      undefined,
+      error,
+    );
+  }
+};
+
+const firstString = (...values: unknown[]): string | undefined => {
+  for (const value of values) {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value)) {
+      const found = value.find(
+        (item): item is string => typeof item === "string",
+      );
+      if (found) return found;
+    }
+  }
+  return undefined;
+};
+
+const parseMailgunMessageHeaders = (
+  headers: unknown,
+): Record<string, string> => {
+  if (!headers) return {};
+
+  if (typeof headers === "string") {
+    try {
+      return parseMailgunMessageHeaders(JSON.parse(headers));
+    } catch {
+      return {};
+    }
+  }
+
+  if (Array.isArray(headers)) {
+    const parsed: Record<string, string> = {};
+    for (const header of headers) {
+      if (
+        Array.isArray(header) &&
+        typeof header[0] === "string" &&
+        typeof header[1] === "string"
+      ) {
+        parsed[header[0].toLowerCase()] = header[1];
+      }
+    }
+    return parsed;
+  }
+
+  if (typeof headers === "object") {
+    const parsed: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+      if (typeof value === "string") {
+        parsed[key.toLowerCase()] = value;
+      }
+    }
+    return parsed;
+  }
+
+  return {};
 };
 
 /**
@@ -120,6 +261,7 @@ interface MailgunWebhookPayload {
   };
   "event-data"?: {
     event?: string;
+    id?: string;
     timestamp?: number;
     message?: {
       headers?: {
@@ -130,9 +272,11 @@ interface MailgunWebhookPayload {
       };
       attachments?: Array<{
         filename?: string;
+        name?: string;
         size?: number;
         "content-type"?: string;
         "content-id"?: string;
+        url?: string;
       }>;
       storage?: {
         url?: string;
@@ -140,8 +284,15 @@ interface MailgunWebhookPayload {
       };
     };
     "user-variables"?: Record<string, string>;
+    domain?: {
+      name?: string;
+    };
     "recipient-domain"?: string;
     recipient?: string;
+    storage?: {
+      url?: string;
+      key?: string;
+    };
     severity?: "permanent" | "temporary";
     "delivery-status"?: {
       message?: string;
@@ -167,17 +318,22 @@ interface MailgunWebhookPayload {
       timezone?: string;
     };
   };
-  // For legacy webhook format (when message is stored)
+  // Mailgun stored-message webhook format.
   storage?: {
     url?: string;
     key?: string;
   };
   "message-url"?: string; // URL to retrieve stored message (for inbound emails)
   "attachment-count"?: string;
-  // Legacy webhook fields
+  // Mailgun flat webhook fields.
+  domain?: string;
+  from?: string;
+  sender?: string;
+  subject?: string;
   event?: string;
   timestamp?: string;
   "message-headers"?: string;
+  token?: string;
   recipient?: string;
   "Message-Id"?: string;
   From?: string;
@@ -193,6 +349,7 @@ interface MailgunWebhookPayload {
   "stripped-text"?: string;
   "stripped-html"?: string;
   "content-id-map"?: string | Record<string, string>; // Maps CID to attachment URL for inline attachments
+  "Content-id-map"?: string | Record<string, string>;
   attachments?: string | unknown[]; // JSON string or array of attachment objects
   // Dynamic attachment fields (attachment-1, attachment-2, etc.)
   [key: string]: unknown;
@@ -224,6 +381,172 @@ type MailgunStoredMessage = {
   [key: string]: unknown;
 };
 
+type MailgunStorageLocation = {
+  url?: string;
+  key?: string;
+};
+
+type MailgunAttachmentProviderMetadata = {
+  kind: "stored-inbound-attachment";
+  storageUrl?: string;
+  storageKey?: string;
+  attachmentUrl?: string;
+  filename?: string;
+  index?: number;
+  contentId?: string;
+};
+
+const MAILGUN_PROVIDER_METADATA_KEY = "mailgun";
+const MAILGUN_STORED_ATTACHMENT_URL_PREFIX =
+  "emailkit://mailgun/stored-attachment";
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+const cleanContentId = (value: string | undefined): string | undefined =>
+  value?.replace(/^<|>$/g, "");
+
+const mailgunAttachmentProviderMetadata = (
+  provider: Record<string, unknown> | undefined,
+): MailgunAttachmentProviderMetadata | undefined => {
+  const metadata = provider?.[MAILGUN_PROVIDER_METADATA_KEY];
+  if (!metadata || typeof metadata !== "object") return undefined;
+  const record = metadata as Partial<MailgunAttachmentProviderMetadata>;
+  return record.kind === "stored-inbound-attachment"
+    ? (record as MailgunAttachmentProviderMetadata)
+    : undefined;
+};
+
+const resolveMailgunStorageLocation = (
+  payload: MailgunWebhookPayload,
+): MailgunStorageLocation | undefined => {
+  const eventData = payload["event-data"];
+  const eventStorage = eventData?.storage;
+  const messageStorage =
+    eventData?.message &&
+    typeof eventData.message === "object" &&
+    "storage" in eventData.message
+      ? (eventData.message.storage as MailgunStorageLocation | undefined)
+      : undefined;
+  const topLevelStorage = payload.storage;
+  const messageUrl = payload["message-url"];
+
+  const url =
+    messageStorage?.url ||
+    eventStorage?.url ||
+    topLevelStorage?.url ||
+    (isNonEmptyString(messageUrl) ? messageUrl : undefined);
+  const key = messageStorage?.key || eventStorage?.key || topLevelStorage?.key;
+
+  if (!url && !key) return undefined;
+  return { url, key };
+};
+
+const mailgunDomainName = (
+  payload: MailgunWebhookPayload,
+): string | undefined => {
+  const domain = payload["event-data"]?.domain as
+    | { name?: unknown }
+    | undefined;
+  return firstString(domain?.name, payload.domain);
+};
+
+const mailgunRecipientDomain = (
+  payload: MailgunWebhookPayload,
+): string | undefined => {
+  const eventData = payload["event-data"];
+  const recipient = firstString(eventData?.recipient, payload.recipient);
+  return firstString(
+    eventData?.["recipient-domain"],
+    recipient?.split("@").pop(),
+  )?.toLowerCase();
+};
+
+const isInboundMailgunAcceptedEvent = (
+  payload: MailgunWebhookPayload,
+): boolean => {
+  const eventData = payload["event-data"];
+  const event = eventData?.event || payload.event;
+  if (event !== "accepted" || !resolveMailgunStorageLocation(payload)) {
+    return false;
+  }
+
+  const domain = mailgunDomainName(payload)?.toLowerCase();
+  const recipientDomain = mailgunRecipientDomain(payload);
+  return Boolean(domain && recipientDomain && domain === recipientDomain);
+};
+
+const isMailgunMessageStorageUrl = (
+  url: string | undefined,
+  storageUrl?: string,
+): boolean => {
+  if (!url) return false;
+  if (storageUrl && url === storageUrl) return true;
+  try {
+    const parsed = new URL(url);
+    return /\/messages\/[^/?#]+\/?$/i.test(parsed.pathname);
+  } catch {
+    return /\/messages\/[^/?#]+\/?$/i.test(url);
+  }
+};
+
+const isDirectMailgunAttachmentUrl = (
+  url: string | undefined,
+  storageUrl?: string,
+): url is string => {
+  if (!isNonEmptyString(url) || !/^https?:\/\//i.test(url)) return false;
+  return !isMailgunMessageStorageUrl(url, storageUrl);
+};
+
+const buildMailgunStoredAttachmentUrl = (
+  metadata: MailgunAttachmentProviderMetadata,
+): string => {
+  const messageId =
+    metadata.storageKey ||
+    (metadata.storageUrl
+      ? extractProviderIdFromUrl(metadata.storageUrl)
+      : "") ||
+    "message";
+  const selector =
+    metadata.index !== undefined
+      ? `index-${metadata.index}`
+      : `name-${encodeURIComponent(metadata.filename || "attachment")}`;
+  return `${MAILGUN_STORED_ATTACHMENT_URL_PREFIX}/${encodeURIComponent(
+    messageId,
+  )}/${selector}`;
+};
+
+const withMailgunStoredAttachmentMetadata = ({
+  attachment,
+  storage,
+  directUrl,
+  index,
+}: {
+  attachment: Attachment;
+  storage?: MailgunStorageLocation;
+  directUrl?: string;
+  index?: number;
+}): Attachment => {
+  const metadata: MailgunAttachmentProviderMetadata = {
+    kind: "stored-inbound-attachment",
+    storageUrl: storage?.url,
+    storageKey: storage?.key,
+    attachmentUrl: directUrl,
+    filename: attachment.filename,
+    index,
+    contentId: cleanContentId(attachment.contentId),
+  };
+
+  return {
+    ...attachment,
+    url: directUrl || buildMailgunStoredAttachmentUrl(metadata),
+    provider: {
+      ...attachment.provider,
+      [MAILGUN_PROVIDER_METADATA_KEY]: metadata,
+    },
+  };
+};
+
 const fetchMailgunStoredMessage = async ({
   storageUrl,
   apiKey,
@@ -249,7 +572,7 @@ const fetchMailgunStoredMessage = async ({
  * For inline attachments, Mailgun sends them as attachment-N fields
  */
 const parseInlineAttachments = (
-  payload: MailgunWebhookPayload
+  payload: MailgunWebhookPayload,
 ): Attachment[] => {
   const attachments: Attachment[] = [];
   const attachmentCount = payload["attachment-count"]
@@ -326,21 +649,24 @@ const extractProviderIdFromUrl = (url: string): string | undefined => {
  * Parse stored attachments from Mailgun webhook payload
  */
 const parseStoredAttachments = (
-  payload: MailgunWebhookPayload
+  payload: MailgunWebhookPayload,
 ): Attachment[] => {
   const attachments: Attachment[] = [];
   const eventData = payload["event-data"];
   const message = eventData?.message;
+  const storage = resolveMailgunStorageLocation(payload);
 
   // Parse content-id-map to identify inline attachments
   // Format: "{\"<cid>\":\"url\",...}"
   const contentIdMap: Record<string, string> = {};
-  if (payload["content-id-map"]) {
+  const contentIdMapPayload =
+    payload["content-id-map"] || payload["Content-id-map"];
+  if (contentIdMapPayload) {
     try {
       const mapData =
-        typeof payload["content-id-map"] === "string"
-          ? JSON.parse(payload["content-id-map"])
-          : payload["content-id-map"];
+        typeof contentIdMapPayload === "string"
+          ? JSON.parse(contentIdMapPayload)
+          : contentIdMapPayload;
       if (mapData && typeof mapData === "object") {
         // Create reverse map: URL -> CID (without angle brackets)
         for (const [cid, url] of Object.entries(mapData)) {
@@ -371,16 +697,29 @@ const parseStoredAttachments = (
 
   // New format: attachments in event-data.message.attachments
   if (message?.attachments && Array.isArray(message.attachments)) {
-    for (const attachment of message.attachments) {
-      if (attachment.filename) {
+    for (const [index, attachment] of message.attachments.entries()) {
+      const filename = attachment.filename || attachment.name;
+      const directUrl = isDirectMailgunAttachmentUrl(
+        attachment.url,
+        storage?.url,
+      )
+        ? attachment.url
+        : undefined;
+      if (filename) {
         attachments.push(
           enrichAttachment({
-            filename: attachment.filename,
-            url: "", // Will be populated when retrieving from stored message
-            contentType: attachment["content-type"],
-            size: attachment.size,
-            contentId: attachment["content-id"],
-          })
+            ...withMailgunStoredAttachmentMetadata({
+              attachment: {
+                filename,
+                contentType: attachment["content-type"],
+                size: attachment.size,
+                contentId: attachment["content-id"],
+              },
+              storage,
+              directUrl,
+              index,
+            }),
+          }),
         );
       }
     }
@@ -401,29 +740,43 @@ const parseStoredAttachments = (
       }
 
       if (Array.isArray(attachmentData)) {
-        for (const attachment of attachmentData) {
+        for (const [index, attachment] of attachmentData.entries()) {
           if (
             attachment &&
             typeof attachment === "object" &&
-            "name" in attachment
+            ("name" in attachment || "filename" in attachment)
           ) {
             const att = attachment as {
               name?: string;
+              filename?: string;
               "content-type"?: string;
               size?: number;
               url?: string;
               "content-id"?: string;
             };
 
-            if (att.name) {
+            const filename = att.name || att.filename;
+            const directUrl = isDirectMailgunAttachmentUrl(
+              att.url,
+              storage?.url,
+            )
+              ? att.url
+              : undefined;
+            if (filename) {
               attachments.push(
                 enrichAttachment({
-                  filename: att.name,
-                  url: att.url || "",
-                  contentType: att["content-type"],
-                  size: att.size,
-                  contentId: att["content-id"],
-                })
+                  ...withMailgunStoredAttachmentMetadata({
+                    attachment: {
+                      filename,
+                      contentType: att["content-type"],
+                      size: att.size,
+                      contentId: att["content-id"],
+                    },
+                    storage,
+                    directUrl,
+                    index,
+                  }),
+                }),
               );
             }
           }
@@ -440,7 +793,7 @@ const parseStoredAttachments = (
     ? parseInt(payload["attachment-count"] as string, 10)
     : 0;
 
-  if (attachmentCount > 0 && payload["storage"]?.url) {
+  if (attachmentCount > 0 && storage?.url) {
     // Attachments are stored, need to retrieve from storage URL
     // The attachment-X fields contain attachment info
     for (let i = 1; i <= attachmentCount; i++) {
@@ -456,11 +809,16 @@ const parseStoredAttachments = (
 
         attachments.push(
           enrichAttachment({
-            filename,
-            url: payload["storage"]?.url || "",
-            contentType,
-            size,
-          })
+            ...withMailgunStoredAttachmentMetadata({
+              attachment: {
+                filename,
+                contentType,
+                size,
+              },
+              storage,
+              index: i - 1,
+            }),
+          }),
         );
       }
     }
@@ -493,16 +851,24 @@ const transformMailgunEvent = async ({
         : null;
   const timestamp = timestampNum ? new Date(timestampNum * 1000) : new Date();
 
-  const messageHeadersFromEvent =
+  const messageHeadersFromEvent = parseMailgunMessageHeaders(
     eventData.message &&
-    typeof eventData.message === "object" &&
-    "headers" in eventData.message
-      ? (eventData.message.headers as Record<string, string>)
-      : ({} as Record<string, string>);
-  const messageHeaders = messageHeadersFromEvent;
+      typeof eventData.message === "object" &&
+      "headers" in eventData.message
+      ? eventData.message.headers
+      : undefined,
+  );
+  const messageHeadersFromPayload = parseMailgunMessageHeaders(
+    payload["message-headers"],
+  );
+  const messageHeaders = {
+    ...messageHeadersFromPayload,
+    ...messageHeadersFromEvent,
+  };
   const messageId =
     messageHeaders["message-id"] ||
     payload["Message-Id"] ||
+    (payload["message-id"] as string | undefined) ||
     `${Date.now()}@mailgun`;
 
   // Parse from/to addresses (may not be available for all event types)
@@ -516,9 +882,18 @@ const transformMailgunEvent = async ({
   };
 
   const fromStr =
-    messageHeaders.from || payload.From || messageHeadersFromEvent.from || "";
+    messageHeaders.from ||
+    payload.From ||
+    payload.from ||
+    payload.sender ||
+    messageHeadersFromEvent.from ||
+    "";
   const toStr =
-    messageHeaders.to || payload.To || messageHeadersFromEvent.to || "";
+    messageHeaders.to ||
+    payload.To ||
+    payload.recipient ||
+    messageHeadersFromEvent.to ||
+    "";
   const ccStr =
     messageHeaders.cc || payload.Cc || messageHeadersFromEvent.cc || "";
   const bccStr =
@@ -544,6 +919,7 @@ const transformMailgunEvent = async ({
   const subject =
     messageHeaders.subject ||
     payload.Subject ||
+    payload.subject ||
     messageHeadersFromEvent.subject ||
     "";
 
@@ -555,35 +931,25 @@ const transformMailgunEvent = async ({
     // Route-forwarded inbound emails have these fields
     (payload["body-plain"] !== undefined ||
       payload["body-html"] !== undefined ||
-      payload["From"] !== undefined) &&
+      payload["From"] !== undefined ||
+      payload.from !== undefined ||
+      payload.sender !== undefined) &&
     // But NOT an event field (that's for outbound webhooks)
     payload.event === undefined &&
     payload["event-data"] === undefined;
 
+  const storageLocation = resolveMailgunStorageLocation(payload);
   const isStoredMessage =
-    (payload["storage"] as { url?: string } | undefined) !== undefined ||
-    (payload["message-url"] as string | undefined) !== undefined ||
-    (eventData.message &&
-      typeof eventData.message === "object" &&
-      "storage" in eventData.message &&
-      eventData.message.storage !== undefined);
+    storageLocation !== undefined &&
+    (payload["event-data"] === undefined ||
+      event === "stored" ||
+      payload["event-data"].event === undefined);
 
   if (isInboundEmail || isStoredMessage) {
-    const messageStorage =
-      eventData.message &&
-      typeof eventData.message === "object" &&
-      "storage" in eventData.message
-        ? (eventData.message.storage as { url?: string })
-        : undefined;
+    const storageUrl = storageLocation?.url;
 
-    const storageUrl =
-      messageStorage?.url ||
-      (payload["storage"] as { url?: string } | undefined)?.url ||
-      (payload["message-url"] as string | undefined) ||
-      undefined;
-
-    let bodyPlain = payload["body-plain"] as string | undefined;
-    let bodyHtml = payload["body-html"] as string | undefined;
+    let bodyPlain = firstString(payload["body-plain"]);
+    let bodyHtml = firstString(payload["body-html"]);
     let strippedText =
       (payload["stripped-text"] as string | undefined) ||
       (messageHeaders["stripped-text"] as string | undefined) ||
@@ -665,7 +1031,7 @@ const transformMailgunEvent = async ({
         } catch (error) {
           console.error(
             "Failed to fetch stored attachments, using metadata only:",
-            error
+            error,
           );
           // Already have metadata-only attachments as fallback
         }
@@ -755,6 +1121,8 @@ const transformMailgunEvent = async ({
     clicked: "clicked",
     bounced: "bounced",
     failed: "bounced",
+    permanent_fail: "bounced",
+    temporary_fail: "bounced",
     complained: "complained",
     rejected: "rejected",
     unsubscribed: "complained",
@@ -773,16 +1141,24 @@ const transformMailgunEvent = async ({
     "storage" in eventData.message
       ? (eventData.message.storage as { key?: string; url?: string })
       : undefined;
+  const outboundStorage = resolveMailgunStorageLocation(payload);
   const providerId =
     messageStorage?.key ||
     (messageStorage?.url
       ? extractProviderIdFromUrl(messageStorage.url)
+      : undefined) ||
+    outboundStorage?.key ||
+    (outboundStorage?.url
+      ? extractProviderIdFromUrl(outboundStorage.url)
       : undefined);
 
   // Build event - only include optional fields if they're actually available
   const outboundEvent: OutboundEmailEvent = {
     schemaVersion: "1",
-    eventId: `${event}:${messageId}:${timestamp.getTime()}`,
+    eventId:
+      typeof eventData.id === "string"
+        ? eventData.id
+        : `${event}:${messageId}:${timestamp.getTime()}`,
     messageId,
     providerId,
     recipient,
@@ -810,6 +1186,40 @@ const transformMailgunEvent = async ({
   }
 
   return outboundEvent;
+};
+
+const findMailgunStoredAttachment = (
+  attachments: MailgunStoredAttachment[],
+  metadataAttachment: Attachment,
+): MailgunStoredAttachment => {
+  const metadata = mailgunAttachmentProviderMetadata(
+    metadataAttachment.provider,
+  );
+  const filename = metadata?.filename || metadataAttachment.filename;
+  const contentId = cleanContentId(
+    metadata?.contentId || metadataAttachment.contentId,
+  );
+
+  const byName = filename
+    ? attachments.find((attachment) => {
+        const attachmentName = attachment.filename || attachment.name;
+        return attachmentName === filename;
+      })
+    : undefined;
+  if (byName) return byName;
+
+  const byIndex =
+    metadata?.index !== undefined ? attachments[metadata.index] : undefined;
+  if (byIndex) return byIndex;
+
+  const byContentId = contentId
+    ? attachments.find(
+        (attachment) => cleanContentId(attachment["content-id"]) === contentId,
+      )
+    : undefined;
+  if (byContentId) return byContentId;
+
+  return {};
 };
 
 /**
@@ -841,35 +1251,45 @@ const retrieveStoredAttachments = async ({
 
   // If attachment metadata already has URLs, fetch directly from those URLs
   // This is more efficient than fetching the message first
-  const attachmentsWithUrls = attachmentMetadata.filter((att) => att.url);
+  const attachmentsWithUrls = attachmentMetadata
+    .map((att) => {
+      const metadata = mailgunAttachmentProviderMetadata(att.provider);
+      const directUrl =
+        metadata?.attachmentUrl ||
+        (isDirectMailgunAttachmentUrl(att.url, storageUrl)
+          ? att.url
+          : undefined);
+      return { attachment: att, directUrl };
+    })
+    .filter(
+      (entry): entry is { attachment: Attachment; directUrl: string } =>
+        entry.directUrl !== undefined,
+    );
 
   if (attachmentsWithUrls.length > 0) {
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
-    for (const attachmentMeta of attachmentsWithUrls) {
-      if (attachmentMeta.url) {
-        try {
-          const res = await fetch(attachmentMeta.url, {
-            headers: { Authorization: basic },
-          });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const buf = new Uint8Array(await res.arrayBuffer());
+    for (const {
+      attachment: attachmentMeta,
+      directUrl,
+    } of attachmentsWithUrls) {
+      try {
+        const res = await fetch(directUrl, {
+          headers: { Authorization: basic },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = new Uint8Array(await res.arrayBuffer());
 
-          attachments.push({
-            filename: attachmentMeta.filename,
-            content: buf,
-            contentType: attachmentMeta.contentType,
-            url: attachmentMeta.url,
-            size: attachmentMeta.size,
-            contentId: attachmentMeta.contentId,
-            isInline: attachmentMeta.isInline,
-          });
-        } catch (error) {
-          console.error(
-            `Failed to retrieve attachment ${attachmentMeta.filename}:`,
-            error
-          );
-          attachments.push(attachmentMeta);
-        }
+        attachments.push({
+          ...attachmentMeta,
+          content: buf,
+          url: directUrl,
+        });
+      } catch (error) {
+        console.error(
+          `Failed to retrieve attachment ${attachmentMeta.filename}:`,
+          error,
+        );
+        attachments.push(attachmentMeta);
       }
     }
 
@@ -886,7 +1306,11 @@ const retrieveStoredAttachments = async ({
 
   if (messageData?.attachments && Array.isArray(messageData.attachments)) {
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
-    for (const attachment of messageData.attachments) {
+    for (const attachmentMeta of attachmentMetadata) {
+      const attachment = findMailgunStoredAttachment(
+        messageData.attachments,
+        attachmentMeta,
+      );
       const filename = attachment.filename || attachment.name;
       if (attachment.url && filename) {
         try {
@@ -896,22 +1320,19 @@ const retrieveStoredAttachments = async ({
           if (!ares.ok) throw new Error(`HTTP ${ares.status}`);
           const buf = new Uint8Array(await ares.arrayBuffer());
 
-          const matchingMeta = attachmentMetadata.find(
-            (m) => m.filename === filename
-          );
-
           attachments.push({
-            filename,
+            ...attachmentMeta,
             content: buf,
             contentType: attachment["content-type"],
             url: attachment.url,
             size: attachment.size,
-            contentId: matchingMeta?.contentId,
-            isInline: matchingMeta?.isInline,
           });
         } catch (error) {
           console.error(`Failed to retrieve attachment ${filename}:`, error);
+          attachments.push(attachmentMeta);
         }
+      } else {
+        attachments.push(attachmentMeta);
       }
     }
   }
@@ -977,7 +1398,7 @@ const mapDnsRecord = (
     is_active?: boolean;
     cached?: string[];
   },
-  purpose?: DomainRecordPurpose
+  purpose?: DomainRecordPurpose,
 ): DomainDNSRecord => {
   const type = (record.record_type?.toUpperCase() ||
     "TXT") as DomainDNSRecord["type"];
@@ -1044,7 +1465,7 @@ const parseDnsRecords = (
     valid?: string | boolean;
     is_active?: boolean;
     cached?: string[];
-  }>
+  }>,
 ): DomainDNSRecord[] => {
   const records: DomainDNSRecord[] = [];
 
@@ -1065,21 +1486,609 @@ const parseDnsRecords = (
   return records;
 };
 
+const MAILGUN_WEBHOOK_EVENTS = [
+  "accepted",
+  "clicked",
+  "opened",
+  "unsubscribed",
+  "delivered",
+  "permanent_fail",
+  "temporary_fail",
+  "complained",
+] as const;
+
+type MailgunWebhookEvent = (typeof MAILGUN_WEBHOOK_EVENTS)[number];
+
+const DEFAULT_EMAILKIT_WEBHOOK_EVENTS: WebhookEventType[] = [
+  "outbound",
+  "delivered",
+  "opened",
+  "clicked",
+  "bounced",
+  "complained",
+];
+
+const ALL_EMAILKIT_WEBHOOK_EVENTS: WebhookEventType[] = [
+  ...DEFAULT_EMAILKIT_WEBHOOK_EVENTS,
+  "unsubscribed",
+];
+
+const isMailgunWebhookEvent = (event: string): event is MailgunWebhookEvent =>
+  (MAILGUN_WEBHOOK_EVENTS as readonly string[]).includes(event);
+
+const unique = <T extends string>(values: T[]): T[] =>
+  Array.from(new Set(values));
+
+const escapeRegexLiteral = (value: string): string =>
+  value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+
+const mapWebhookEventToMailgun = (
+  event: WebhookEventType,
+): {
+  providerEvents: MailgunWebhookEvent[];
+  normalizedEvents: WebhookEventType[];
+  inbound?: boolean;
+} => {
+  switch (event) {
+    case "inbound":
+      return {
+        providerEvents: [],
+        normalizedEvents: ["inbound"],
+        inbound: true,
+      };
+    case "outbound":
+    case "accepted":
+      return { providerEvents: ["accepted"], normalizedEvents: ["outbound"] };
+    case "delivered":
+      return {
+        providerEvents: ["delivered"],
+        normalizedEvents: ["delivered"],
+      };
+    case "opened":
+      return { providerEvents: ["opened"], normalizedEvents: ["opened"] };
+    case "clicked":
+      return { providerEvents: ["clicked"], normalizedEvents: ["clicked"] };
+    case "bounced":
+    case "failed":
+      return {
+        providerEvents: ["permanent_fail", "temporary_fail"],
+        normalizedEvents: ["bounced"],
+      };
+    case "permanent_fail":
+    case "temporary_fail":
+      return {
+        providerEvents: [event as MailgunWebhookEvent],
+        normalizedEvents: ["bounced"],
+      };
+    case "complained":
+      return {
+        providerEvents: ["complained"],
+        normalizedEvents: ["complained"],
+      };
+    case "unsubscribed":
+      return {
+        providerEvents: ["unsubscribed"],
+        normalizedEvents: ["unsubscribed"],
+      };
+    default:
+      if (isMailgunWebhookEvent(event)) {
+        return { providerEvents: [event], normalizedEvents: [event] };
+      }
+      throw new EmailKitError(
+        `Mailgun webhook event '${event}' is not supported by Mailgun's webhook management API`,
+        "mailgun",
+      );
+  }
+};
+
+const resolveMailgunWebhookEvents = (
+  events?: WebhookEventSelection,
+  inbound?: WebhookInboundOptions,
+): {
+  providerEvents: MailgunWebhookEvent[];
+  normalizedEvents: WebhookEventType[];
+  wantsInbound: boolean;
+} => {
+  const wantsAll = events === "all";
+  const requestedEvents = wantsAll
+    ? ALL_EMAILKIT_WEBHOOK_EVENTS
+    : events && events.length > 0
+      ? events
+      : DEFAULT_EMAILKIT_WEBHOOK_EVENTS;
+
+  const providerEvents: MailgunWebhookEvent[] = [];
+  const normalizedEvents: WebhookEventType[] = [];
+  let wantsInbound = false;
+
+  for (const event of requestedEvents) {
+    const mapped = mapWebhookEventToMailgun(event);
+    providerEvents.push(...mapped.providerEvents);
+    normalizedEvents.push(...mapped.normalizedEvents);
+    wantsInbound ||= mapped.inbound === true;
+  }
+  if (wantsAll && inbound) {
+    normalizedEvents.push("inbound");
+    wantsInbound = true;
+  }
+
+  return {
+    providerEvents: unique(providerEvents),
+    normalizedEvents: unique(normalizedEvents),
+    wantsInbound,
+  };
+};
+
+const normalizeMailgunEvents = (
+  events: readonly string[] | undefined,
+): WebhookEventType[] => {
+  if (!events || events.length === 0) return [];
+
+  const normalized: WebhookEventType[] = [];
+  for (const event of events) {
+    if (event === "accepted") {
+      normalized.push("outbound");
+    } else if (event === "permanent_fail" || event === "temporary_fail") {
+      normalized.push("bounced");
+    } else if (isMailgunWebhookEvent(event)) {
+      normalized.push(event);
+    }
+  }
+  return unique(normalized);
+};
+
+const readMailgunApiResponse = async (res: Response): Promise<unknown> => {
+  if (res.status === 204) return undefined;
+
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return res.json();
+  }
+
+  const text = await res.text();
+  if (!text) return undefined;
+  return text;
+};
+
+const throwMailgunApiError = (
+  body: unknown,
+  status: number,
+  fallback: string,
+): never => {
+  throw new EmailKitError(
+    typeof (body as any)?.message === "string"
+      ? (body as any).message
+      : typeof (body as any)?.Description === "string"
+        ? (body as any).Description
+        : typeof body === "string"
+          ? body
+          : fallback,
+    "mailgun",
+    undefined,
+    status,
+    undefined,
+    body,
+  );
+};
+
+const fetchMailgunStoredAttachmentUrl = async ({
+  url,
+  apiKey,
+  filename,
+}: {
+  url: string;
+  apiKey: string;
+  filename?: string;
+}): Promise<Response> => {
+  if (!apiKey) {
+    throw new EmailKitError(
+      "Mailgun attachment retrieval requires an API key",
+      "mailgun",
+      "MISSING_AUTH",
+    );
+  }
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Basic ${stringToBase64(`api:${apiKey}`)}` },
+  });
+  if (!res.ok) {
+    const raw = await readMailgunApiResponse(res);
+    throw new EmailKitError(
+      `Failed to fetch Mailgun attachment${filename ? ` ${filename}` : ""}`,
+      "mailgun",
+      "ATTACHMENT_FETCH_FAILED",
+      res.status,
+      undefined,
+      raw,
+    );
+  }
+  return res;
+};
+
+const fetchMailgunAttachmentFromMetadata = async ({
+  metadata,
+  apiKey,
+}: {
+  metadata: MailgunAttachmentProviderMetadata;
+  apiKey: string;
+}): Promise<Response> => {
+  if (metadata.attachmentUrl) {
+    return fetchMailgunStoredAttachmentUrl({
+      url: metadata.attachmentUrl,
+      apiKey,
+      filename: metadata.filename,
+    });
+  }
+
+  if (!metadata.storageUrl) {
+    throw new EmailKitError(
+      "Mailgun attachment metadata does not include a storage URL",
+      "mailgun",
+      "ATTACHMENT_CONTENT_UNAVAILABLE",
+      undefined,
+      undefined,
+      metadata,
+    );
+  }
+
+  if (!apiKey) {
+    throw new EmailKitError(
+      "Mailgun stored message retrieval requires an API key",
+      "mailgun",
+      "MISSING_AUTH",
+    );
+  }
+
+  const storageResponse = await fetch(metadata.storageUrl, {
+    headers: { Authorization: `Basic ${stringToBase64(`api:${apiKey}`)}` },
+  });
+  const storedMessageBody = await readMailgunApiResponse(storageResponse);
+  if (!storageResponse.ok) {
+    throw new EmailKitError(
+      "Failed to fetch Mailgun stored message for attachment",
+      "mailgun",
+      "STORED_MESSAGE_FETCH_FAILED",
+      storageResponse.status,
+      undefined,
+      storedMessageBody,
+    );
+  }
+
+  const storedMessage = storedMessageBody as MailgunStoredMessage;
+  const storedAttachments = Array.isArray(storedMessage.attachments)
+    ? storedMessage.attachments
+    : [];
+  const matchingAttachment = findMailgunStoredAttachment(storedAttachments, {
+    filename: metadata.filename || "attachment",
+    contentId: metadata.contentId,
+    provider: { [MAILGUN_PROVIDER_METADATA_KEY]: metadata },
+  });
+
+  if (!matchingAttachment.url) {
+    throw new EmailKitError(
+      "Mailgun stored message did not include a matching attachment URL",
+      "mailgun",
+      "ATTACHMENT_NOT_FOUND",
+      undefined,
+      undefined,
+      {
+        metadata,
+        attachments: storedAttachments.map((attachment) => ({
+          filename: attachment.filename || attachment.name,
+          contentId: attachment["content-id"],
+          hasUrl: Boolean(attachment.url),
+        })),
+      },
+    );
+  }
+
+  return fetchMailgunStoredAttachmentUrl({
+    url: matchingAttachment.url,
+    apiKey,
+    filename: metadata.filename,
+  });
+};
+
+const mailgunDate = (value: unknown): Date | undefined =>
+  typeof value === "string" ? new Date(value) : undefined;
+
+const normalizeMailgunAccountWebhook = (
+  raw: unknown,
+  fallback?: Partial<Webhook>,
+): Webhook => {
+  const data = (raw || {}) as {
+    webhook_id?: string;
+    url?: string;
+    event_types?: string[];
+    created_at?: string;
+  };
+  const id = data.webhook_id || fallback?.providerId || fallback?.id || "";
+  const providerId = Object.prototype.hasOwnProperty.call(
+    fallback || {},
+    "providerId",
+  )
+    ? fallback?.providerId
+    : id;
+
+  return {
+    id,
+    scope: "account",
+    url: data.url || fallback?.url || "",
+    events:
+      fallback?.events ||
+      (data.event_types && data.event_types.length > 0
+        ? normalizeMailgunEvents(data.event_types)
+        : undefined),
+    status: "active",
+    providerId,
+    createdAt: mailgunDate(data.created_at) || fallback?.createdAt,
+    provider: fallback?.provider,
+    raw,
+  };
+};
+
+const normalizeMailgunDomainWebhook = (input: {
+  domain: string;
+  url: string;
+  events?: WebhookEventType[];
+  providerEvents?: MailgunWebhookEvent[];
+  providerId?: string;
+  routeId?: string;
+  raw?: unknown;
+  status?: Webhook["status"];
+}): Webhook => {
+  const providerId = input.providerId || `domain:${input.domain}:${input.url}`;
+
+  return {
+    id: providerId,
+    scope: "domain",
+    url: input.url,
+    events: input.events,
+    status: input.status || "active",
+    providerId,
+    provider: {
+      domain: input.domain,
+      deliveryEvents: input.providerEvents,
+      routeId: input.routeId,
+    },
+    raw: input.raw,
+  };
+};
+
+const resolveWebhookReferenceId = (input: {
+  webhook?: Webhook;
+  webhookId?: string;
+  providerId?: string;
+}): string =>
+  input.providerId ||
+  input.webhook?.providerId ||
+  input.webhookId ||
+  input.webhook?.id ||
+  "";
+
+const resolveMailgunRouteId = (input: {
+  webhook?: Webhook;
+  provider?: Record<string, unknown>;
+}): string | undefined => {
+  const routeId = input.provider?.routeId || input.webhook?.provider?.routeId;
+  return typeof routeId === "string" && routeId.trim() ? routeId : undefined;
+};
+
+const resolveMailgunAccountWebhookId = (input: {
+  webhook?: Webhook;
+  webhookId?: string;
+  providerId?: string;
+  provider?: Record<string, unknown>;
+}): string => {
+  const webhookId = resolveWebhookReferenceId(input);
+  const routeId = resolveMailgunRouteId(input);
+  const deliveryEvents = input.webhook?.provider?.deliveryEvents;
+  if (
+    webhookId &&
+    routeId &&
+    Array.isArray(deliveryEvents) &&
+    deliveryEvents.length === 0 &&
+    (webhookId === input.webhook?.providerId || webhookId === input.webhook?.id)
+  ) {
+    return "";
+  }
+  return webhookId;
+};
+
+const resolveWebhookDomain = (input: {
+  domain?: string;
+  webhook?: Webhook;
+  provider?: Record<string, unknown>;
+}): string => {
+  const fromProvider = input.provider?.domain;
+  const fromWebhookProvider = input.webhook?.provider?.domain;
+  if (input.domain) return input.domain;
+  if (typeof fromProvider === "string") return fromProvider;
+  if (typeof fromWebhookProvider === "string") return fromWebhookProvider;
+  throw new EmailKitError(
+    "Mailgun domain webhook operations require a domain",
+    "mailgun",
+  );
+};
+
+const extractDomainEventsForUrl = (
+  raw: unknown,
+  url: string,
+): {
+  providerEvents: MailgunWebhookEvent[];
+  normalizedEvents: WebhookEventType[];
+} => {
+  const webhooks = (raw as any)?.webhooks;
+  const providerEvents: MailgunWebhookEvent[] = [];
+
+  if (webhooks && typeof webhooks === "object") {
+    for (const [event, value] of Object.entries(webhooks)) {
+      const urls = (value as any)?.urls;
+      if (
+        isMailgunWebhookEvent(event) &&
+        Array.isArray(urls) &&
+        urls.includes(url)
+      ) {
+        providerEvents.push(event);
+      }
+    }
+  }
+
+  return {
+    providerEvents: unique(providerEvents),
+    normalizedEvents: normalizeMailgunEvents(providerEvents),
+  };
+};
+
+const escapeMailgunRouteString = (value: string): string =>
+  value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+const requireMailgunWebhookUrl = (
+  url: string | undefined,
+  scope: "account" | "domain",
+): string => {
+  const normalizedUrl = url?.trim();
+  if (!normalizedUrl) {
+    throw new EmailKitError(
+      `Mailgun ${scope} webhook setup requires a url`,
+      "mailgun",
+    );
+  }
+  return normalizedUrl;
+};
+
+const resolveMailgunRouteExpression = (input: {
+  provider?: Record<string, unknown>;
+  inbound?: WebhookInboundOptions;
+}): string => {
+  const inbound = input.inbound;
+  if (
+    typeof inbound?.routeExpression === "string" &&
+    inbound.routeExpression.trim()
+  ) {
+    return inbound.routeExpression;
+  }
+  if (inbound?.recipients === "all") {
+    return 'match_recipient(".*")';
+  }
+  if (typeof inbound?.recipients === "string" && inbound.recipients.trim()) {
+    return `match_recipient("^(?:${escapeRegexLiteral(inbound.recipients)})$")`;
+  }
+  if (Array.isArray(inbound?.recipients) && inbound.recipients.length > 0) {
+    const recipients = inbound.recipients
+      .map((recipient) => recipient.trim())
+      .filter(Boolean);
+    if (recipients.length > 0) {
+      return `match_recipient("^(?:${recipients
+        .map(escapeRegexLiteral)
+        .join("|")})$")`;
+    }
+  }
+
+  const provider = input.provider || {};
+  const expression = provider.routeExpression || provider.expression;
+  if (typeof expression === "string" && expression.trim()) {
+    return expression;
+  }
+
+  const recipient =
+    provider.routeRecipient || provider.recipient || provider.address;
+  if (typeof recipient === "string" && recipient.trim()) {
+    return `match_recipient("${escapeMailgunRouteString(recipient)}")`;
+  }
+
+  throw new EmailKitError(
+    "Mailgun inbound route setup requires inbound.recipients, inbound.routeExpression, provider.routeExpression, or provider.routeRecipient/provider.recipient/provider.address",
+    "mailgun",
+  );
+};
+
+const createMailgunInboundRoute = async (input: {
+  url: string;
+  provider?: Record<string, unknown>;
+  inbound?: WebhookInboundOptions;
+  defaultDescription: string;
+  baseUrl: string;
+  auth: string;
+}): Promise<{ routeId?: string; raw: unknown }> => {
+  const routeExpression = resolveMailgunRouteExpression(input);
+  const body = new URLSearchParams();
+  const provider = input.provider || {};
+  const priority =
+    typeof provider.routePriority === "number"
+      ? provider.routePriority
+      : typeof provider.priority === "number"
+        ? provider.priority
+        : 0;
+
+  body.append("priority", String(priority));
+  body.append(
+    "description",
+    typeof provider.routeDescription === "string"
+      ? provider.routeDescription
+      : input.defaultDescription,
+  );
+  body.append("expression", routeExpression);
+  body.append("action", `forward("${escapeMailgunRouteString(input.url)}")`);
+
+  const res = await fetch(`${input.baseUrl}/routes`, {
+    method: "POST",
+    headers: {
+      Authorization: input.auth,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+  const raw = await readMailgunApiResponse(res);
+  if (!res.ok) {
+    throwMailgunApiError(
+      raw,
+      res.status,
+      `HTTP ${res.status}: Failed to create inbound route`,
+    );
+  }
+
+  const routeId =
+    typeof (raw as any)?.route?.id === "string"
+      ? (raw as any).route.id
+      : undefined;
+  return { routeId, raw };
+};
+
 /**
  * Mailgun driver capabilities
  */
 export const MAILGUN_CAPABILITIES = {
-  templates: false, // Mailgun doesn't have built-in templates like SendGrid
+  cc: true,
+  bcc: true,
+  replyTo: true,
+  replyHeaders: true,
+  replyThreadId: false,
+  attachments: true,
+  customHeaders: true,
+  tags: true,
+  metadata: true,
+  templates: true,
   personalizations: false, // Mailgun doesn't support per-recipient personalizations
   scheduling: true, // Mailgun supports scheduled sending
-  unsubscribe: true, // Mailgun supports unsubscribe management
-  trackOpens: true, // Mailgun supports granular open tracking
-  trackClicks: true, // Mailgun supports granular click tracking
-  sandbox: false, // Mailgun doesn't have a sandbox mode
+  unsubscribe: false,
+  sendTracking: { opens: true, clicks: true },
+  eventTracking: { opens: true, clicks: true },
+  sandbox: true,
   sendIdempotency: false,
   tenantRouting: true,
-  domains: true, // Mailgun supports domain management API
-  domainIdentifier: "domain" as const, // Mailgun requires domain name
+  providerFetch: true,
+  domains: {
+    list: true,
+    create: true,
+    get: true,
+    update: true,
+    verify: true,
+    delete: true,
+    identifier: "domain" as const,
+  },
+  webhooks: { account: true, domain: true },
+  publicRoutes: { webhook: true },
+  requiresSecret: false,
 } as const satisfies DriverCapabilities;
 
 /**
@@ -1087,9 +2096,10 @@ export const MAILGUN_CAPABILITIES = {
  */
 export type MailgunCapabilities = typeof MAILGUN_CAPABILITIES;
 
-export const MailgunDriver = (
-  config: MailgunDriverConfig
-): EmailDriver<MailgunDriverConfig, typeof MAILGUN_CAPABILITIES> => {
+export const MailgunDriver = <const TId extends string = "mailgun">(
+  config: MailgunDriverConfig<TId>,
+): EmailDriver<MailgunDriverConfig<TId>, typeof MAILGUN_CAPABILITIES, TId> => {
+  const driverId = (config.id || "mailgun") as TId;
   // Determine region (default to 'us')
   const region = config.region || "us";
 
@@ -1100,20 +2110,34 @@ export const MailgunDriver = (
 
   // Basic auth header for API requests
   const auth = `Basic ${stringToBase64(`api:${config.apiKey}`)}`;
+  const baseProviderFetch = createProviderFetch({
+    baseUrl: apiBase,
+    defaultHeaders: {
+      Authorization: auth,
+    },
+  });
 
   return {
+    id: driverId,
     name: "mailgun",
     capabilities: MAILGUN_CAPABILITIES,
-    providerFetch: createProviderFetch({
-      baseUrl: apiBase,
-      defaultHeaders: {
-        Authorization: auth,
-      },
-    }),
+    providerFetch: async (path, init) => {
+      const attachmentMetadata = mailgunAttachmentProviderMetadata(
+        init?.provider,
+      );
+      if (attachmentMetadata) {
+        return fetchMailgunAttachmentFromMetadata({
+          metadata: attachmentMetadata,
+          apiKey: config.apiKey,
+        });
+      }
+
+      return baseProviderFetch(path, init);
+    },
 
     sendEmail: async (
-      message: EmailMessage<typeof MAILGUN_CAPABILITIES>,
-      options?: { signal?: AbortSignal }
+      message: EmailMessage<typeof MAILGUN_CAPABILITIES, EmailTag>,
+      options?: SendEmailOptions,
     ): Promise<SendEmailResult> => {
       // Extract domain from the 'from' email address
       // Mailgun requires the domain in the URL path to match the domain in the 'from' field
@@ -1132,6 +2156,12 @@ export const MailgunDriver = (
       if (message.html) {
         formData.append("html", message.html);
       }
+      if (message.templateId) {
+        formData.append("template", message.templateId);
+      }
+      if (message.templateData) {
+        formData.append("t:variables", JSON.stringify(message.templateData));
+      }
       if (message.cc) {
         formData.append("cc", formatEmailAddresses(message.cc));
       }
@@ -1140,6 +2170,24 @@ export const MailgunDriver = (
       }
       const reply = resolveMessageReplyContext(message);
       if (hasReplyData(reply)) {
+        if (reply.threadId) {
+          throw new EmailKitError(
+            "Mailgun does not support provider thread IDs for replies. Use reply.messageId and reply.references for RFC threading.",
+            "mailgun",
+            "UNSUPPORTED_REPLY_THREAD_ID",
+          );
+        }
+        if (
+          reply.isReply &&
+          !reply.messageId &&
+          (!reply.references || reply.references.length === 0)
+        ) {
+          throw new EmailKitError(
+            "Mailgun cannot send a reply from reply.isReply alone. Provide reply.messageId or reply.references.",
+            "mailgun",
+            "UNSUPPORTED_REPLY_FLAG",
+          );
+        }
         const replyAddresses = replyAddressesAsArray(reply);
         if (replyAddresses.length > 0) {
           const formattedReply =
@@ -1164,10 +2212,7 @@ export const MailgunDriver = (
       if (message.attachments) {
         for (const attachment of message.attachments) {
           // Convert content to Uint8Array or string for File constructor
-          const fileContent: Uint8Array | string =
-            typeof attachment.content === "string"
-              ? attachment.content
-              : (attachment.content as Uint8Array);
+          const fileContent = await resolveMailgunAttachmentContent(attachment);
 
           // For inline attachments, use 'inline' instead of 'attachment'
           // Mailgun generates Content-ID automatically from the filename
@@ -1205,7 +2250,7 @@ export const MailgunDriver = (
       // Tags
       if (message.tags) {
         for (const tag of message.tags) {
-          formData.append("o:tag", tag);
+          formData.append("o:tag", formatMailgunTag(tag));
         }
       }
 
@@ -1222,24 +2267,18 @@ export const MailgunDriver = (
         } else if (track.opens === true) {
           formData.append("o:tracking-opens", "yes");
         }
-        // If opens is undefined, use default (enabled)
 
         if (track.clicks === false) {
           formData.append("o:tracking-clicks", "no");
         } else if (track.clicks === true) {
           formData.append("o:tracking-clicks", "yes");
         }
-        // If clicks is undefined, use default (enabled)
       } else if (
         "trackingEnabled" in message &&
         message.trackingEnabled === false
       ) {
         // Legacy support: disable all tracking
         formData.append("o:tracking", "no");
-      } else {
-        // Default: enable tracking
-        formData.append("o:tracking-opens", "yes");
-        formData.append("o:tracking-clicks", "yes");
       }
 
       // Scheduling
@@ -1248,32 +2287,38 @@ export const MailgunDriver = (
           typeof message.sendAt === "number"
             ? new Date(message.sendAt)
             : message.sendAt;
-        // Mailgun expects RFC 2822 format or Unix timestamp
-        formData.append("o:deliverytime", sendAt.toISOString());
+        // Mailgun expects RFC 2822/RFC 822 style delivery time.
+        formData.append("o:deliverytime", formatMailgunDeliveryTime(sendAt));
       }
 
       // Unsubscribe configuration
       if ("unsubscribe" in message && message.unsubscribe !== undefined) {
-        const unsubscribe = message.unsubscribe;
-        if (unsubscribe.global === true) {
-          formData.append("o:require-tls", "false"); // Not directly related but Mailgun uses h:List-Unsubscribe
-        }
-        if (unsubscribe.listId) {
-          formData.append("o:tag", `list:${unsubscribe.listId}`);
-        }
-        if (unsubscribe.groupId) {
-          formData.append("o:tag", `group:${unsubscribe.groupId}`);
-        }
+        throw new EmailKitError(
+          "Mailgun send does not support EmailKit's normalized unsubscribe options.",
+          "mailgun",
+          "UNSUPPORTED_UNSUBSCRIBE",
+        );
       }
 
-      // Idempotency key (if provided)
+      if ("sandbox" in message && message.sandbox === true) {
+        formData.append("o:testmode", "yes");
+      }
+
+      if ("idempotencyKey" in message) {
+        throw new EmailKitError(
+          "Mailgun does not support idempotency keys for sends.",
+          "mailgun",
+          "UNSUPPORTED_IDEMPOTENCY_KEY",
+        );
+      }
+
       if ("provider" in message && message.provider) {
         const providerOptions = message.provider as Record<string, unknown>;
-        if (providerOptions.idempotencyKey) {
-          formData.append("o:require-tls", "false"); // Mailgun doesn't have native idempotency, but we can use tags
-          formData.append(
-            "o:tag",
-            `idempotency:${String(providerOptions.idempotencyKey)}`
+        if ("idempotencyKey" in providerOptions) {
+          throw new EmailKitError(
+            "Mailgun does not support idempotency keys for sends.",
+            "mailgun",
+            "UNSUPPORTED_IDEMPOTENCY_KEY",
           );
         }
         // Pass through other provider-specific options
@@ -1316,7 +2361,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1325,16 +2370,19 @@ export const MailgunDriver = (
           typeof data === "object" && data ? (data as any).id : undefined;
         return {
           messageId: id || `${Date.now()}@mailgun`,
-          provider: "mailgun",
+          provider: driverId,
           providerId: id,
         };
       } catch (error) {
+        if (error instanceof EmailKitError) {
+          throw error;
+        }
         throw new EmailKitError(
           error instanceof Error ? error.message : "Unknown error",
           "mailgun",
           undefined,
           undefined,
-          error
+          error,
         );
       }
     },
@@ -1355,15 +2403,44 @@ export const MailgunDriver = (
         (payload["body-plain"] !== undefined ||
           payload["body-html"] !== undefined ||
           payload["From"] !== undefined ||
+          payload.from !== undefined ||
+          payload.sender !== undefined ||
           payload["X-Mailgun-Incoming"] === "Yes") &&
         // But NOT an event field (that's for outbound webhooks)
         payload.event === undefined &&
         payload["event-data"] === undefined;
 
-      // Also check for stored messages with message-url
+      if (isInboundMailgunAcceptedEvent(payload)) {
+        const storage = resolveMailgunStorageLocation(payload);
+        const headers = parseMailgunMessageHeaders(
+          payload["event-data"]?.message?.headers,
+        );
+        return {
+          type: "unknown",
+          data: {
+            reason: "mailgun.inbound_accepted_lifecycle",
+            event,
+            eventId:
+              typeof payload["event-data"]?.id === "string"
+                ? payload["event-data"].id
+                : undefined,
+            messageId: headers["message-id"],
+            providerId:
+              storage?.key ||
+              (storage?.url
+                ? extractProviderIdFromUrl(storage.url)
+                : undefined),
+            raw: payload,
+          },
+        };
+      }
+
+      // Also check for stored messages with any Mailgun storage location.
       const isStoredMessageWebhook =
-        (payload["message-url"] as string | undefined) !== undefined &&
-        payload["event-data"] === undefined &&
+        resolveMailgunStorageLocation(payload) !== undefined &&
+        (payload["event-data"] === undefined ||
+          event === "stored" ||
+          payload["event-data"].event === undefined) &&
         payload.event === undefined;
 
       if (isInboundEmailWebhook || isStoredMessageWebhook) {
@@ -1394,12 +2471,7 @@ export const MailgunDriver = (
           if (
             payload["body-plain"] !== undefined ||
             payload["body-html"] !== undefined ||
-            (payload["storage"] as { url?: string } | undefined) !==
-              undefined ||
-            (eventData.message &&
-              typeof eventData.message === "object" &&
-              "storage" in eventData.message &&
-              eventData.message.storage !== undefined)
+            resolveMailgunStorageLocation(payload) !== undefined
           ) {
             return {
               type: "inbound",
@@ -1670,7 +2742,7 @@ export const MailgunDriver = (
 
     webhookResponse: async (
       request: WebhookRequest,
-      handled: boolean
+      handled: boolean,
     ): Promise<WebhookResponse> => {
       // Mailgun expects a 200 OK response
       return {
@@ -1679,9 +2751,465 @@ export const MailgunDriver = (
       };
     },
 
+    webhooks: {
+      account: {
+        setup: async (
+          input: AccountWebhookSetupInput,
+        ): Promise<AccountWebhookSetupResult> => {
+          const url = requireMailgunWebhookUrl(input.url, "account");
+
+          const { providerEvents, normalizedEvents, wantsInbound } =
+            resolveMailgunWebhookEvents(input.events, input.inbound);
+          if (wantsInbound) {
+            resolveMailgunRouteExpression(input);
+          }
+
+          const raw: Record<string, unknown> = {};
+          let providerId = "";
+          let routeId: string | undefined;
+
+          if (providerEvents.length > 0) {
+            const formData = new FormData();
+            formData.append(
+              "description",
+              typeof input.provider?.description === "string"
+                ? input.provider.description
+                : "EmailKit account webhook",
+            );
+            for (const event of providerEvents) {
+              formData.append("event_types", event);
+            }
+            formData.append("url", url);
+
+            const res = await fetch(`${apiBase}/v1/webhooks`, {
+              method: "POST",
+              headers: { Authorization: auth },
+              body: formData,
+            });
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to create account webhook`,
+              );
+            }
+            raw.delivery = body;
+            providerId = String((body as any)?.webhook_id || "");
+          }
+
+          if (wantsInbound) {
+            const route = await createMailgunInboundRoute({
+              url,
+              provider: input.provider,
+              inbound: input.inbound,
+              defaultDescription: "EmailKit account inbound webhook",
+              baseUrl,
+              auth,
+            });
+            routeId = route.routeId;
+            raw.route = route.raw;
+          }
+
+          const id = providerId || routeId || `account:${url}`;
+          const webhook = normalizeMailgunAccountWebhook(
+            {
+              webhook_id: id,
+              url,
+              event_types: providerEvents,
+            },
+            {
+              id,
+              url,
+              events: normalizedEvents,
+              providerId: providerId || undefined,
+              provider: {
+                deliveryEvents: providerEvents,
+                routeId,
+              },
+            },
+          );
+
+          return { webhook: { ...webhook, raw }, raw };
+        },
+
+        refresh: async (
+          input: AccountWebhookRefreshInput,
+        ): Promise<AccountWebhookRefreshResult> => {
+          const webhookId = resolveMailgunAccountWebhookId(input);
+          const routeId = resolveMailgunRouteId(input);
+          if (!webhookId && !routeId) {
+            throw new EmailKitError(
+              "Mailgun account webhook refresh requires a webhookId, providerId, or inbound routeId",
+              "mailgun",
+            );
+          }
+
+          const raw: Record<string, unknown> = {};
+          let accountBody: unknown;
+          let normalizedEvents = input.webhook?.events;
+          let deliveryEvents = input.webhook?.provider?.deliveryEvents as
+            | MailgunWebhookEvent[]
+            | undefined;
+
+          if (webhookId) {
+            const res = await fetch(
+              `${apiBase}/v1/webhooks/${encodeURIComponent(webhookId)}`,
+              { headers: { Authorization: auth } },
+            );
+            accountBody = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                accountBody,
+                res.status,
+                `HTTP ${res.status}: Failed to refresh account webhook`,
+              );
+            }
+            raw.delivery = accountBody;
+            const accountEventTypes = (accountBody as any)?.event_types;
+            if (Array.isArray(accountEventTypes)) {
+              deliveryEvents = accountEventTypes.filter(
+                (event): event is MailgunWebhookEvent =>
+                  typeof event === "string" && isMailgunWebhookEvent(event),
+              );
+              normalizedEvents = normalizeMailgunEvents(deliveryEvents);
+            }
+          }
+
+          if (routeId) {
+            const res = await fetch(
+              `${baseUrl}/routes/${encodeURIComponent(routeId)}`,
+              { headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to refresh inbound route`,
+              );
+            }
+            raw.route = body;
+            normalizedEvents = unique([...(normalizedEvents || []), "inbound"]);
+          }
+
+          const webhook = normalizeMailgunAccountWebhook(accountBody, {
+            ...input.webhook,
+            id: input.webhook?.id || webhookId || routeId,
+            providerId: input.webhook?.providerId || webhookId || undefined,
+            events: normalizedEvents,
+            provider: {
+              ...(input.webhook?.provider || {}),
+              deliveryEvents,
+              routeId,
+            },
+          });
+
+          return {
+            webhook: { ...webhook, raw },
+            raw,
+          };
+        },
+
+        delete: async (
+          input: AccountWebhookDeleteInput,
+        ): Promise<AccountWebhookDeleteResult> => {
+          const webhookId = resolveMailgunAccountWebhookId(input);
+          const routeId = resolveMailgunRouteId(input);
+          if (!webhookId && !routeId) {
+            throw new EmailKitError(
+              "Mailgun account webhook delete requires a webhookId, providerId, or inbound routeId",
+              "mailgun",
+            );
+          }
+
+          const raw: Record<string, unknown> = {};
+
+          if (webhookId) {
+            const res = await fetch(
+              `${apiBase}/v1/webhooks/${encodeURIComponent(webhookId)}`,
+              { method: "DELETE", headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to delete account webhook`,
+              );
+            }
+            raw.delivery = body;
+          }
+
+          if (routeId) {
+            const res = await fetch(
+              `${baseUrl}/routes/${encodeURIComponent(routeId)}`,
+              { method: "DELETE", headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to delete inbound route`,
+              );
+            }
+            raw.route = body;
+          }
+
+          return {
+            deleted: true,
+            webhook: {
+              id: input.webhook?.id || webhookId || routeId || "",
+              providerId: input.webhook?.providerId || webhookId || undefined,
+              scope: "account",
+              url: input.webhook?.url || "",
+              events: input.webhook?.events,
+              status: "deleted",
+              provider: {
+                ...(input.webhook?.provider || {}),
+                routeId,
+              },
+              raw,
+            },
+            raw,
+          };
+        },
+      },
+
+      domain: {
+        setup: async (
+          input: DomainWebhookSetupInput,
+        ): Promise<DomainWebhookSetupResult> => {
+          const url = requireMailgunWebhookUrl(input.url, "domain");
+
+          const domain = resolveWebhookDomain(input);
+          const { providerEvents, normalizedEvents, wantsInbound } =
+            resolveMailgunWebhookEvents(input.events, input.inbound);
+          if (wantsInbound) {
+            resolveMailgunRouteExpression(input);
+          }
+
+          let routeId: string | undefined;
+          const raw: Record<string, unknown> = {};
+
+          if (providerEvents.length > 0) {
+            const body = new URLSearchParams();
+            body.append("url", url);
+            for (const event of providerEvents) {
+              body.append("event_types", event);
+            }
+
+            const res = await fetch(
+              `${baseUrlV4}/domains/${encodeURIComponent(domain)}/webhooks`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: auth,
+                  "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body,
+              },
+            );
+            const responseBody = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                responseBody,
+                res.status,
+                `HTTP ${res.status}: Failed to create domain webhook`,
+              );
+            }
+            raw.delivery = responseBody;
+          }
+
+          if (wantsInbound) {
+            const route = await createMailgunInboundRoute({
+              url,
+              provider: input.provider,
+              inbound: input.inbound,
+              defaultDescription: `EmailKit inbound webhook for ${domain}`,
+              baseUrl,
+              auth,
+            });
+            routeId = route.routeId;
+            raw.route = route.raw;
+          }
+
+          const webhook = normalizeMailgunDomainWebhook({
+            domain,
+            url,
+            events: normalizedEvents,
+            providerEvents,
+            routeId,
+            raw,
+          });
+
+          return { webhook, raw };
+        },
+
+        refresh: async (
+          input: DomainWebhookRefreshInput,
+        ): Promise<DomainWebhookRefreshResult> => {
+          const domain = resolveWebhookDomain(input);
+          const url = input.webhook?.url;
+          const routeId = resolveMailgunRouteId(input);
+          const raw: Record<string, unknown> = {};
+          let deliveryEvents = input.webhook?.provider?.deliveryEvents as
+            | MailgunWebhookEvent[]
+            | undefined;
+          let normalizedEvents = input.webhook?.events;
+
+          if (url) {
+            const res = await fetch(
+              `${baseUrl}/domains/${encodeURIComponent(domain)}/webhooks`,
+              { headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to refresh domain webhooks`,
+              );
+            }
+            raw.delivery = body;
+            const found = extractDomainEventsForUrl(body, url);
+            deliveryEvents = found.providerEvents;
+            normalizedEvents = unique([
+              ...found.normalizedEvents,
+              ...(normalizedEvents?.includes("inbound")
+                ? (["inbound"] as WebhookEventType[])
+                : []),
+            ]);
+          }
+
+          if (routeId) {
+            const res = await fetch(
+              `${baseUrl}/routes/${encodeURIComponent(routeId)}`,
+              { headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to refresh inbound route`,
+              );
+            }
+            raw.route = body;
+            normalizedEvents = unique([...(normalizedEvents || []), "inbound"]);
+          }
+
+          const webhook = normalizeMailgunDomainWebhook({
+            domain,
+            url: url || "",
+            events: normalizedEvents,
+            providerEvents: deliveryEvents,
+            providerId: resolveWebhookReferenceId(input),
+            routeId,
+            raw,
+          });
+
+          return { webhook, raw };
+        },
+
+        delete: async (
+          input: DomainWebhookDeleteInput,
+        ): Promise<DomainWebhookDeleteResult> => {
+          const domain = resolveWebhookDomain(input);
+          const url = input.webhook?.url;
+          const routeId = resolveMailgunRouteId(input);
+          const raw: Record<string, unknown> = {};
+
+          if (!url && !routeId) {
+            throw new EmailKitError(
+              "Mailgun domain webhook delete requires a webhook url or inbound routeId",
+              "mailgun",
+            );
+          }
+
+          if (url) {
+            const params = new URLSearchParams({ url });
+            const res = await fetch(
+              `${baseUrlV4}/domains/${encodeURIComponent(
+                domain,
+              )}/webhooks?${params.toString()}`,
+              { method: "DELETE", headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to delete domain webhook`,
+              );
+            }
+            raw.delivery = body;
+          }
+
+          if (routeId) {
+            const res = await fetch(
+              `${baseUrl}/routes/${encodeURIComponent(routeId)}`,
+              { method: "DELETE", headers: { Authorization: auth } },
+            );
+            const body = await readMailgunApiResponse(res);
+            if (!res.ok) {
+              throwMailgunApiError(
+                body,
+                res.status,
+                `HTTP ${res.status}: Failed to delete inbound route`,
+              );
+            }
+            raw.route = body;
+          }
+
+          return {
+            deleted: true,
+            webhook: {
+              id: input.webhook?.id || resolveWebhookReferenceId(input) || "",
+              providerId:
+                input.webhook?.providerId || resolveWebhookReferenceId(input),
+              scope: "domain",
+              url: input.webhook?.url || url || "",
+              events: input.webhook?.events,
+              status: "deleted",
+              provider: {
+                ...(input.webhook?.provider || {}),
+                domain,
+                routeId,
+              },
+              raw,
+            },
+            raw,
+          };
+        },
+      },
+    },
+
     domains: {
       list: async (opts?: ListDomainsOptions): Promise<Domain[]> => {
-        const url = `${baseUrl}/domains`;
+        const searchParams = new URLSearchParams();
+        if (opts?.limit !== undefined || opts?.pageSize !== undefined) {
+          searchParams.set("limit", String(opts.limit ?? opts.pageSize));
+        }
+        if (opts?.page !== undefined && (opts?.limit || opts?.pageSize)) {
+          const limit = opts.limit ?? opts.pageSize ?? 100;
+          searchParams.set("skip", String(Math.max(0, opts.page - 1) * limit));
+        }
+        if (opts?.status) {
+          const state = opts.status === "verified" ? "active" : opts.status;
+          searchParams.set("state", state);
+        }
+        if (opts?.provider) {
+          for (const [key, value] of Object.entries(opts.provider)) {
+            if (value !== undefined && value !== null) {
+              searchParams.set(key, String(value));
+            }
+          }
+        }
+
+        const query = searchParams.toString();
+        const url = `${baseUrlV4}/domains${query ? `?${query}` : ""}`;
         const res = await fetch(url, {
           headers: { Authorization: auth },
         });
@@ -1700,7 +3228,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1709,12 +3237,12 @@ export const MailgunDriver = (
           const status = mapDomainStatus(d.state);
           const records = parseDnsRecords(
             d.sending_dns_records,
-            d.receiving_dns_records
+            d.receiving_dns_records,
           );
 
           const domain: Domain = {
             id: d.id || d.name,
-            name: d.name,
+            domain: d.name,
             status,
             createdAt: d.created_at ? new Date(d.created_at) : undefined,
             verification:
@@ -1730,7 +3258,7 @@ export const MailgunDriver = (
 
       create: async (input: CreateDomainInput): Promise<Domain> => {
         const formData = new FormData();
-        formData.append("name", input.name);
+        formData.append("name", input.domain);
 
         // Add optional parameters from input
         if (input.dkimSelector) {
@@ -1772,7 +3300,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1780,12 +3308,12 @@ export const MailgunDriver = (
         const status = mapDomainStatus(domainData?.state);
         const records = parseDnsRecords(
           (body as any)?.sending_dns_records,
-          (body as any)?.receiving_dns_records
+          (body as any)?.receiving_dns_records,
         );
 
         const domain: Domain = {
-          id: domainData?.id || input.name,
-          name: domainData?.name || input.name,
+          id: domainData?.id || input.domain,
+          domain: domainData?.name || input.domain,
           status,
           createdAt: domainData?.created_at
             ? new Date(domainData.created_at)
@@ -1801,8 +3329,7 @@ export const MailgunDriver = (
       },
 
       get: async (idOrName: string): Promise<Domain> => {
-        // Include DNS records by default
-        const url = `${baseUrlV4}/domains/${encodeURIComponent(idOrName)}?h:with_dns=true`;
+        const url = `${baseUrlV4}/domains/${encodeURIComponent(idOrName)}`;
         const res = await fetch(url, {
           headers: { Authorization: auth },
         });
@@ -1821,7 +3348,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1829,12 +3356,12 @@ export const MailgunDriver = (
         const status = mapDomainStatus(domainData?.state);
         const records = parseDnsRecords(
           (body as any)?.sending_dns_records,
-          (body as any)?.receiving_dns_records
+          (body as any)?.receiving_dns_records,
         );
 
         const domain: Domain = {
           id: domainData?.id || domainData?.name || idOrName,
-          name: domainData?.name || idOrName,
+          domain: domainData?.name || idOrName,
           status,
           createdAt: domainData?.created_at
             ? new Date(domainData.created_at)
@@ -1851,7 +3378,7 @@ export const MailgunDriver = (
 
       update: async (
         idOrName: string,
-        patch: UpdateDomainInput
+        patch: UpdateDomainInput,
       ): Promise<Domain> => {
         const formData = new FormData();
 
@@ -1890,7 +3417,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1898,12 +3425,12 @@ export const MailgunDriver = (
         const status = mapDomainStatus(domainData?.state);
         const records = parseDnsRecords(
           (body as any)?.sending_dns_records,
-          (body as any)?.receiving_dns_records
+          (body as any)?.receiving_dns_records,
         );
 
         const domain: Domain = {
           id: domainData?.id || domainData?.name || idOrName,
-          name: domainData?.name || idOrName,
+          domain: domainData?.name || idOrName,
           status,
           createdAt: domainData?.created_at
             ? new Date(domainData.created_at)
@@ -1939,7 +3466,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1947,7 +3474,7 @@ export const MailgunDriver = (
         const status = mapDomainStatus(domainData?.state);
         const records = parseDnsRecords(
           (body as any)?.sending_dns_records,
-          (body as any)?.receiving_dns_records
+          (body as any)?.receiving_dns_records,
         );
 
         const verification: DomainVerification = {
@@ -1981,7 +3508,7 @@ export const MailgunDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 

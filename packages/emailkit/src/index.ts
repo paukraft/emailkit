@@ -6,19 +6,17 @@
  *
  * @example
  * ```ts
- * import { EmailKit } from 'emailkit'
- * import { MailgunDriver } from 'emailkit/drivers/mailgun'
+ * import { EmailKit, MailgunDriver } from 'emailkit'
  *
  * const emailkit = EmailKit({
- *   emailDriver: MailgunDriver({
+ *   emailDrivers: [MailgunDriver({
  *     apiKey: process.env.MAILGUN_API_KEY!,
- *   }),
+ *   })],
  *   hooks: {
- *     onInboundEmail: async (event) => {
- *       console.log('Received email:', event.subject)
- *     },
- *     onOutboundEmailDelivered: async (event) => {
- *       console.log('Email delivered:', event.messageId)
+ *     email: {
+ *       onInbound: async (event) => {
+ *         console.log('Received email:', event.subject)
+ *       },
  *     },
  *   },
  * })
@@ -33,26 +31,34 @@
  * ```
  */
 
-import { createEmailKitClient, type EmailKitClient } from "./client";
-import type { EmailDriver } from "./driver";
-import type { EmailKitHooks } from "./types";
+import {
+  createEmailKitClient,
+  type EmailDriverTuple,
+  type EmailKitClient,
+  type EmailKitConfig,
+} from "./client";
 
 /**
  * Create an EmailKit client instance
  *
- * @param config - Configuration including email driver and hooks
+ * @param config - Configuration including email drivers and hooks
  * @returns EmailKit client instance with type-safe sendEmail based on driver capabilities
  */
-export const EmailKit = <TDriver extends EmailDriver>(config: {
-  emailDriver: TDriver;
-  hooks?: EmailKitHooks;
-}): EmailKitClient<TDriver> => {
+export const EmailKit = <const TDrivers extends EmailDriverTuple>(
+  config: EmailKitConfig<TDrivers>,
+): EmailKitClient<TDrivers> => {
   return createEmailKitClient(config);
 };
 
 // Export types
 export type {
   AllEventsHook,
+  AccountWebhookDeleteInput,
+  AccountWebhookDeleteResult,
+  AccountWebhookRefreshInput,
+  AccountWebhookRefreshResult,
+  AccountWebhookSetupInput,
+  AccountWebhookSetupResult,
   Attachment,
   BaseEmailMessage,
   CreateDomainInput,
@@ -63,16 +69,52 @@ export type {
   DomainDNSRecord,
   DomainIdentifier,
   DomainIdentifierType,
+  DomainOperationInput,
   DomainStatus,
   DomainVerification,
+  DomainWebhookDeleteInput,
+  DomainWebhookDeleteResult,
+  DomainWebhookRefreshInput,
+  DomainWebhookRefreshResult,
+  DomainWebhookSetupInput,
+  DomainWebhookSetupResult,
   DriverCapabilities,
+  DriverDomainCapabilities,
+  DriverEventTrackingCapabilities,
+  DriverPublicRoutes,
+  DriverPublicRouteCapabilities,
+  DriverSendTrackingCapabilities,
+  DriverWebhookCapabilities,
+  EmailTag,
+  EmailDriverSelector,
   EmailAddress,
   EmailKitHooks,
   EmailMessage,
+  EmailSenderOverride,
   ReplyContext,
   InboundEmailEvent,
   InboundEmailHook,
   ListDomainsOptions,
+  ListMailboxesOptions,
+  Mailbox,
+  MailboxConnectedHookEvent,
+  MailboxAuthUpdatedHookEvent,
+  MailboxConnectionResult,
+  MailboxDeleteResult,
+  MailboxWebhookDeleteInput,
+  MailboxWebhookDeleteResult,
+  MailboxWebhookRefreshInput,
+  MailboxWebhookRefreshResult,
+  MailboxWebhookSetupInput,
+  MailboxWebhookSetupResult,
+  MailboxHookEvent,
+  HookResult,
+  MaybePromise,
+  MailboxIdentity,
+  ConnectMailboxInput,
+  CreateMailboxInput,
+  DomainHookEvent,
+  EmailHookEvent,
   OutboundEmailBouncedHook,
   OutboundEmailClickedHook,
   OutboundEmailComplainedHook,
@@ -82,39 +124,87 @@ export type {
   OutboundEmailOpenedHook,
   OutboundEmailRejectedHook,
   Personalization,
+  PublicRouteDriverConfig,
+  PublicRouteGroup,
+  PublicRoutesConfig,
+  PublicRouteTemplate,
   SendEmailResult,
   TrackConfig,
   UnknownEventHook,
   UnsubscribeConfig,
   UpdateDomainInput,
+  Webhook,
+  WebhookDriverEvent,
   WebhookEvent,
+  WebhookEventSelection,
+  WebhookEventType,
+  WebhookLifecycleDriverEvent,
+  WebhookInboundOptions,
+  WebhookLifecycleAction,
+  WebhookLifecycleEvent,
+  WebhookLifecycleEventBase,
+  WebhookLifecycleHookEvent,
+  WebhookLifecycleReason,
+  WebhookLifecycleSource,
+  WebhookLifecycleTarget,
+  WebhookRecommendedAction,
+  WebhookReference,
   WebhookRequest,
   WebhookResponse,
+  WebhookScope,
+  WebhookSetupInput,
+  WebhookSetupResult,
+  WebhookRefreshInput,
+  WebhookRefreshResult,
+  WebhookDeleteInput,
+  WebhookDeleteResult,
+  WebhookStatus,
 } from "./types";
 
 export type {
+  DriverAccountWebhooksAPI,
   DriverCapabilitiesType,
+  DriverAuthUpdate,
   DriverConfig,
+  DriverCallbackResult,
+  DriverDomainWebhooksAPI,
   DriverDomainsAPI,
+  EmailDriverOperationOptions,
+  DriverId,
+  DriverMailboxesAPI,
+  DriverMailboxWebhooksAPI,
+  DriverWebhookScopeAPI,
+  DriverWebhooksAPI,
   EmailDriver,
   EmailDriverConfig,
   ProviderFetch,
   ProviderFetchInit,
   ProviderFetchParamValue,
   ProviderFetchSearchParams,
+  SendEmailOptions,
 } from "./driver";
 
 export type {
+  AccountWebhooksFacade,
   AttachmentsFacade,
+  DomainWebhooksFacade,
   DomainsFacade,
+  EmailDriverTuple,
   EmailKitClient,
   EmailKitConfig,
+  EmailDriverSelection,
+  MailboxWebhooksFacade,
+  MailboxesFacade,
+  ProviderFetchFacade,
+  ResolveEmailDriver,
+  ResolveEmailDriverContext,
+  SendEmailMessage,
 } from "./client";
 
 export { EmailKitError } from "./types";
 
 // Export package version constant (keep in sync with package.json)
-export const VERSION = "0.2.0";
+export const VERSION = "2.0.0";
 
 // Export drivers
 export {
@@ -133,6 +223,14 @@ export type { AIInbxCapabilities, AIInbxDriverConfig } from "./drivers/aiinbx";
 
 export { RESEND_CAPABILITIES, ResendDriver } from "./drivers/resend";
 export type { ResendCapabilities, ResendDriverConfig } from "./drivers/resend";
+
+export { OUTLOOK_CAPABILITIES, OutlookDriver } from "./drivers/outlook";
+export type {
+  OutlookCapabilities,
+  OutlookDriverConfig,
+  OutlookMailboxAuth,
+  OutlookSendEmailResult,
+} from "./drivers/outlook";
 
 // Export Next.js helpers
 // Next.js helpers are available under the optional subpath: `emailkit/nextjs`

@@ -1,79 +1,78 @@
-import { NextResponse } from "next/server";
+import { handleDomainAction, jsonError, jsonOk, parseDomainIdentifier } from "@/app/sandbox/actions"
 
-import { getSandboxProviderRuntime } from "@/lib/sandbox-providers";
-import { SANDBOX_PROVIDERS, type SandboxProviderId } from "@/lib/sandbox-types";
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+const str = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined)
+const obj = <T extends Record<string, unknown>>(value: unknown) =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as T) : undefined
 
-const isProvider = (value: unknown): value is SandboxProviderId =>
-  SANDBOX_PROVIDERS.includes(value as SandboxProviderId);
-
-const err = (message: string, status = 400) =>
-  NextResponse.json({ ok: false, error: message }, { status });
-
-/** GET /api/sandbox/domains?provider=mailgun */
 export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const provider = searchParams.get("provider");
-  if (!isProvider(provider)) return err("Unknown provider.");
-
-  const { domains } = getSandboxProviderRuntime(provider);
-  if (!domains) return err(`${provider} does not support domains.`);
+  const url = new URL(request.url)
+  const emailDriver = str(url.searchParams.get("emailDriver"))
+  if (!emailDriver) return jsonError(new Error("emailDriver is required."))
 
   try {
-    const list = await domains.list();
-    return NextResponse.json({ ok: true, domains: list });
+    return jsonOk(await handleDomainAction({ action: "list", emailDriver }))
   } catch (error) {
-    return err(error instanceof Error ? error.message : "Failed to list domains", 500);
+    return jsonError(error)
   }
 }
 
-/** POST /api/sandbox/domains — create or action (verify/delete) */
 export async function POST(request: Request) {
-  const body = (await request.json()) as Record<string, unknown>;
-  const provider = body.provider;
-  if (!isProvider(provider)) return err("Unknown provider.");
-
-  const { domains } = getSandboxProviderRuntime(provider);
-  if (!domains) return err(`${provider} does not support domains.`);
-
-  const action = (body.action as string) ?? "create";
-
   try {
-    switch (action) {
-      case "create": {
-        const name = body.name as string | undefined;
-        if (!name?.trim()) return err("Domain name is required.");
-        const domain = await domains.create({ name: name.trim() });
-        return NextResponse.json({ ok: true, domain });
-      }
+    const body = (await request.json()) as Record<string, unknown>
+    const action = str(body.action) ?? "create"
+    const emailDriver = str(body.emailDriver)
+    if (!emailDriver) throw new Error("emailDriver is required.")
 
-      case "get": {
-        const identifier = body.identifier as { domain?: string; domainId?: string } | undefined;
-        if (!identifier?.domain && !identifier?.domainId) return err("Domain identifier required.");
-        const domain = await domains.get(identifier);
-        return NextResponse.json({ ok: true, domain });
-      }
-
-      case "verify": {
-        const identifier = body.identifier as { domain?: string; domainId?: string } | undefined;
-        if (!identifier?.domain && !identifier?.domainId) return err("Domain identifier required.");
-        const verification = await domains.verify(identifier);
-        return NextResponse.json({ ok: true, verification });
-      }
-
-      case "delete": {
-        const identifier = body.identifier as { domain?: string; domainId?: string } | undefined;
-        if (!identifier?.domain && !identifier?.domainId) return err("Domain identifier required.");
-        const result = await domains.delete(identifier);
-        return NextResponse.json({ ok: true, ...result });
-      }
-
-      default:
-        return err(`Unknown action: ${action}`);
+    if (action === "create" || action === "ensure") {
+      const domain = str(body.domain)
+      if (!domain) throw new Error("domain is required.")
+      return jsonOk(
+        await handleDomainAction({
+          action,
+          emailDriver,
+          input: {
+            domain,
+            dkimSelector: str(body.dkimSelector),
+            returnPathSubdomain: str(body.returnPathSubdomain),
+            region: str(body.region),
+            tracking: obj(body.tracking),
+            provider: obj(body.provider),
+          },
+        }),
+      )
     }
+
+    if (action === "get" || action === "verify" || action === "delete") {
+      return jsonOk(
+        await handleDomainAction({
+          action,
+          emailDriver,
+          identifier: parseDomainIdentifier(body),
+        }),
+      )
+    }
+
+    if (action === "update") {
+      return jsonOk(
+        await handleDomainAction({
+          action,
+          emailDriver,
+          identifier: parseDomainIdentifier(body),
+          patch: {
+            dkimSelector: str(body.dkimSelector),
+            returnPathSubdomain: str(body.returnPathSubdomain),
+            tracking: obj(body.tracking),
+            provider: obj(body.provider),
+          },
+        }),
+      )
+    }
+
+    throw new Error(`Unknown domain action: ${action}`)
   } catch (error) {
-    return err(error instanceof Error ? error.message : `Domain ${action} failed`, 500);
+    return jsonError(error)
   }
 }

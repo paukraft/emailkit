@@ -6,8 +6,19 @@
  */
 
 import { Webhook } from "svix";
-import type { EmailDriver, EmailDriverConfig } from "../driver";
 import type {
+  EmailDriver,
+  EmailDriverConfig,
+  ProviderFetch,
+  SendEmailOptions,
+} from "../driver";
+import type {
+  AccountWebhookDeleteInput,
+  AccountWebhookDeleteResult,
+  AccountWebhookRefreshInput,
+  AccountWebhookRefreshResult,
+  AccountWebhookSetupInput,
+  AccountWebhookSetupResult,
   Attachment,
   CreateDomainInput,
   Domain,
@@ -17,6 +28,7 @@ import type {
   DomainStatus,
   DomainVerification,
   DriverCapabilities,
+  EmailTag,
   EmailAddress,
   EmailMessage,
   InboundEmailEvent,
@@ -25,8 +37,12 @@ import type {
   SendEmailResult,
   UpdateDomainInput,
   WebhookEvent,
+  WebhookEventSelection,
+  WebhookEventType,
   WebhookRequest,
   WebhookResponse,
+  WebhookStatus,
+  Webhook as EmailKitWebhook,
 } from "../types";
 import { EmailKitError } from "../types";
 import { bytesToBase64, stringToBase64 } from "../utils/base64";
@@ -41,7 +57,12 @@ import {
 /**
  * Resend-specific configuration
  */
-export interface ResendDriverConfig extends EmailDriverConfig {
+export interface ResendDriverConfig<TId extends string = "resend">
+  extends EmailDriverConfig {
+  /**
+   * EmailKit driver id. Override when configuring multiple Resend drivers.
+   */
+  id?: TId;
   apiKey: string;
   /**
    * Optional API base URL (defaults to https://api.resend.com)
@@ -78,7 +99,7 @@ const formatEmailAddress = (address: EmailAddress): string => {
  * Format multiple email addresses for Resend API
  */
 const formatEmailAddresses = (
-  addresses: EmailAddress | EmailAddress[]
+  addresses: EmailAddress | EmailAddress[],
 ): string[] => {
   if (Array.isArray(addresses)) {
     return addresses.map(formatEmailAddress);
@@ -107,10 +128,13 @@ interface ResendWebhookEvent {
     | "email.sent"
     | "email.delivered"
     | "email.delivery_delayed"
+    | "email.failed"
     | "email.complained"
     | "email.bounced"
     | "email.opened"
     | "email.clicked"
+    | "email.scheduled"
+    | "email.suppressed"
     | "email.unsubscribed";
   created_at: string;
   data: ResendWebhookEventData;
@@ -203,17 +227,35 @@ type ResendAttachmentList = {
  * Resend driver capabilities
  */
 export const RESEND_CAPABILITIES = {
+  cc: true,
+  bcc: true,
+  replyTo: true,
+  replyHeaders: true,
+  attachments: true,
+  customHeaders: true,
+  tags: true,
+  metadata: true,
   templates: true, // Resend supports templates via template.id and template.variables
   personalizations: false, // Resend does not support per-recipient personalizations
   scheduling: true, // Resend supports scheduled_at for scheduling
   unsubscribe: false, // Resend does not support unsubscribe management in send API
-  trackOpens: true, // Resend tracks opens via webhooks (automatic)
-  trackClicks: true, // Resend tracks clicks via webhooks (automatic)
+  eventTracking: { opens: true, clicks: true },
   sandbox: false, // Resend does not have a sandbox mode
   sendIdempotency: true,
   tenantRouting: true,
-  domains: true, // Resend supports domain management API
-  domainIdentifier: "domainId" as const, // Resend requires domainId
+  providerFetch: true,
+  domains: {
+    list: true,
+    create: true,
+    get: true,
+    update: true,
+    verify: true,
+    delete: true,
+    identifier: "domainId" as const,
+  },
+  webhooks: { account: true },
+  publicRoutes: { webhook: true },
+  requiresSecret: false,
 } as const satisfies DriverCapabilities;
 
 /**
@@ -315,11 +357,263 @@ const mapDnsRecord = (record: {
   };
 };
 
+type ResendEmailTag = { name: string; value: string };
+
+const RESEND_TAG_PART_PATTERN = /^[A-Za-z0-9_-]+$/;
+const RESEND_TAG_PART_MAX_LENGTH = 256;
+const RESEND_TAGS_MAX_COUNT = 75;
+
+const assertValidResendTagPart = (
+  field: "name" | "value",
+  value: unknown,
+  source: string,
+): string => {
+  if (typeof value !== "string") {
+    throw new EmailKitError(
+      `Resend ${source} tag ${field} must be a string`,
+      "resend",
+      "INVALID_TAG",
+    );
+  }
+  if (value.length === 0) {
+    throw new EmailKitError(
+      `Resend ${source} tag ${field} cannot be empty`,
+      "resend",
+      "INVALID_TAG",
+    );
+  }
+  if (value.length > RESEND_TAG_PART_MAX_LENGTH) {
+    throw new EmailKitError(
+      `Resend ${source} tag ${field} must be ${RESEND_TAG_PART_MAX_LENGTH} characters or fewer`,
+      "resend",
+      "INVALID_TAG",
+    );
+  }
+  if (!RESEND_TAG_PART_PATTERN.test(value)) {
+    throw new EmailKitError(
+      `Resend ${source} tag ${field} can only contain ASCII letters, numbers, underscores, or dashes`,
+      "resend",
+      "INVALID_TAG",
+    );
+  }
+  return value;
+};
+
+const toResendTag = (
+  tag: EmailTag,
+  source = "message.tags",
+): ResendEmailTag => {
+  if (typeof tag === "string") {
+    return {
+      name: assertValidResendTagPart("name", tag, source),
+      value: "true",
+    };
+  }
+
+  return {
+    name: assertValidResendTagPart("name", tag.name, source),
+    value: assertValidResendTagPart("value", tag.value, source),
+  };
+};
+
+const toResendMetadataTag = (name: string, value: string): ResendEmailTag => ({
+  name: assertValidResendTagPart("name", name, "message.metadata"),
+  value: assertValidResendTagPart("value", value, "message.metadata"),
+});
+
+const assertResendTagCount = (tags: ResendEmailTag[]): void => {
+  if (tags.length > RESEND_TAGS_MAX_COUNT) {
+    throw new EmailKitError(
+      `Resend supports at most ${RESEND_TAGS_MAX_COUNT} tags per email`,
+      "resend",
+      "INVALID_TAG",
+    );
+  }
+};
+
+const normalizeResendWebhookTags = (
+  tags: unknown,
+): Pick<OutboundEmailEvent, "tags" | "metadata"> => {
+  const normalizedTags: EmailTag[] = [];
+  const metadata: Record<string, string> = {};
+
+  if (Array.isArray(tags)) {
+    for (const tag of tags) {
+      if (!tag || typeof tag !== "object") continue;
+      const { name, value } = tag as { name?: unknown; value?: unknown };
+      if (typeof name !== "string" || typeof value !== "string") continue;
+      normalizedTags.push({ name, value });
+      metadata[name] = value;
+    }
+  } else if (tags && typeof tags === "object") {
+    for (const [name, value] of Object.entries(tags)) {
+      if (typeof value !== "string") continue;
+      normalizedTags.push({ name, value });
+      metadata[name] = value;
+    }
+  }
+
+  return {
+    ...(normalizedTags.length > 0 ? { tags: normalizedTags } : {}),
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+  };
+};
+
+type ResendAccountWebhook = {
+  id?: string;
+  endpoint?: string;
+  status?: string;
+  events?: string[];
+  created_at?: string;
+  updated_at?: string;
+  signing_secret?: string;
+};
+
+const RESEND_DEFAULT_WEBHOOK_EVENTS = [
+  "email.sent",
+  "email.delivered",
+  "email.delivery_delayed",
+  "email.failed",
+  "email.opened",
+  "email.clicked",
+  "email.bounced",
+  "email.complained",
+  "email.unsubscribed",
+  "email.received",
+  "email.scheduled",
+  "email.suppressed",
+] as const;
+
+const RESEND_EVENT_BY_EMAILKIT_EVENT: Record<string, string[]> = {
+  outbound: ["email.sent"],
+  sent: ["email.sent"],
+  delivered: ["email.delivered"],
+  opened: ["email.opened"],
+  clicked: ["email.clicked"],
+  bounced: ["email.bounced"],
+  complained: ["email.complained"],
+  rejected: ["email.failed", "email.suppressed"],
+  inbound: ["email.received"],
+};
+
+const EMAILKIT_EVENT_BY_RESEND_EVENT: Record<string, WebhookEventType> = {
+  "email.sent": "outbound",
+  "email.delivered": "delivered",
+  "email.delivery_delayed": "outbound",
+  "email.failed": "rejected",
+  "email.opened": "opened",
+  "email.clicked": "clicked",
+  "email.bounced": "bounced",
+  "email.complained": "complained",
+  "email.scheduled": "outbound",
+  "email.suppressed": "rejected",
+  "email.unsubscribed": "complained",
+  "email.received": "inbound",
+};
+
+const unique = <T>(values: T[]): T[] => Array.from(new Set(values));
+
+const toResendWebhookEvents = (events?: WebhookEventSelection): string[] => {
+  if (events === "all") {
+    return [...RESEND_DEFAULT_WEBHOOK_EVENTS];
+  }
+  const requested = events?.length ? events : undefined;
+  if (!requested?.length) {
+    return [...RESEND_DEFAULT_WEBHOOK_EVENTS];
+  }
+
+  return unique(
+    requested.flatMap((event) => {
+      if (event.startsWith("email.")) return [event];
+      return RESEND_EVENT_BY_EMAILKIT_EVENT[event] || [event];
+    }),
+  );
+};
+
+const fromResendWebhookEvents = (events?: string[]): WebhookEventType[] =>
+  unique(
+    (events || []).map(
+      (event) => EMAILKIT_EVENT_BY_RESEND_EVENT[event] || event,
+    ),
+  );
+
+const mapResendWebhookStatus = (status?: string): WebhookStatus => {
+  const normalized = status?.toLowerCase();
+  if (!normalized) return "active";
+  if (normalized === "enabled") return "active";
+  if (normalized === "disabled") return "disabled";
+  return "unknown";
+};
+
+const resolveWebhookId = (
+  input: AccountWebhookRefreshInput | AccountWebhookDeleteInput,
+): string | undefined => {
+  return (
+    input.webhook?.providerId ||
+    input.webhook?.id ||
+    ("providerId" in input ? input.providerId : undefined) ||
+    input.webhookId
+  );
+};
+
+const requireWebhookSetupUrl = (url: string | undefined): string => {
+  if (!url?.trim()) {
+    throw new EmailKitError(
+      "Webhook setup requires input.url",
+      "resend",
+      "MISSING_REQUIRED_FIELD",
+    );
+  }
+  return url;
+};
+
+const normalizeUrlBase = (value: string): string => value.replace(/\/+$/, "");
+
+const isAbsoluteHttpUrl = (value: string): boolean =>
+  /^https?:\/\//i.test(value);
+
+const isResendApiUrl = (path: string | URL, apiBase: string): boolean => {
+  if (typeof path === "string" && !isAbsoluteHttpUrl(path)) {
+    return true;
+  }
+
+  try {
+    const url = path instanceof URL ? path : new URL(path);
+    const base = new URL(normalizeUrlBase(apiBase));
+    const basePath = normalizeUrlBase(base.pathname);
+
+    if (url.origin !== base.origin) return false;
+    if (!basePath) return true;
+
+    return url.pathname === basePath || url.pathname.startsWith(`${basePath}/`);
+  } catch {
+    return true;
+  }
+};
+
+const createResendProviderFetch = (
+  apiBase: string,
+  apiKey: string,
+): ProviderFetch => {
+  const authedFetch = createProviderFetch({
+    baseUrl: apiBase,
+    defaultHeaders: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+  });
+  const anonymousFetch = createProviderFetch({ baseUrl: apiBase });
+
+  return (path, init) =>
+    isResendApiUrl(path, apiBase)
+      ? authedFetch(path, init)
+      : anonymousFetch(path, init);
+};
+
 /**
  * Retrieve attachment content from Resend download URLs
  */
 const retrieveResendAttachments = async (
-  attachmentMetadata: Attachment[]
+  attachmentMetadata: Attachment[],
 ): Promise<Attachment[]> => {
   const attachments: Attachment[] = [];
 
@@ -342,7 +636,7 @@ const retrieveResendAttachments = async (
       } catch (error) {
         console.error(
           `Failed to retrieve Resend attachment ${attachmentMeta.filename}:`,
-          error
+          error,
         );
         attachments.push(attachmentMeta);
       }
@@ -364,7 +658,7 @@ const transformInboundEmail = async (
   rawPayload: ResendInboundEmailWebhook,
   apiBaseUrl: string,
   apiKey: string,
-  autoFetchAttachments: boolean
+  autoFetchAttachments: boolean,
 ): Promise<InboundEmailEvent> => {
   const parseEmailAddressList = (addresses: string[]): EmailAddress[] => {
     return addresses.map(parseEmailAddress);
@@ -376,7 +670,7 @@ const transformInboundEmail = async (
     throw new EmailKitError(
       "Missing email id in Resend inbound webhook payload",
       "resend",
-      "MISSING_EMAIL_ID"
+      "MISSING_EMAIL_ID",
     );
   }
 
@@ -390,7 +684,7 @@ const transformInboundEmail = async (
     throw new EmailKitError(
       `Failed to retrieve received email: HTTP ${emailRes.status} ${body}`,
       "resend",
-      emailRes.status
+      emailRes.status,
     );
   }
   const email = (await emailRes.json()) as ResendReceivedEmail;
@@ -405,7 +699,7 @@ const transformInboundEmail = async (
     throw new EmailKitError(
       `Failed to list received email attachments: HTTP ${attRes.status} ${body}`,
       "resend",
-      attRes.status
+      attRes.status,
     );
   }
   const attList = (await attRes.json()) as ResendAttachmentList;
@@ -489,7 +783,7 @@ const transformOutboundEvent = (
   eventType: string,
   data: ResendWebhookEventData,
   timestamp: string,
-  rawPayload: ResendWebhookEvent
+  rawPayload: ResendWebhookEvent,
 ): OutboundEmailEvent => {
   const baseEvent: OutboundEmailEvent = {
     schemaVersion: "1",
@@ -504,11 +798,14 @@ const transformOutboundEvent = (
   const statusMap: Record<string, OutboundEmailEvent["status"]> = {
     "email.sent": "sent",
     "email.delivered": "delivered",
-    "email.delivery_delayed": "delivered",
+    "email.delivery_delayed": "sent",
+    "email.failed": "rejected",
     "email.opened": "opened",
     "email.clicked": "clicked",
     "email.bounced": "bounced",
     "email.complained": "complained",
+    "email.scheduled": "sent",
+    "email.suppressed": "rejected",
     "email.unsubscribed": "complained", // Map unsubscribe to complained
   };
 
@@ -528,6 +825,7 @@ const transformOutboundEvent = (
   if (data.subject) {
     baseEvent.subject = data.subject;
   }
+  Object.assign(baseEvent, normalizeResendWebhookTags(data["tags"]));
 
   // Extract event-specific fields
   switch (eventType) {
@@ -536,6 +834,20 @@ const transformOutboundEvent = (
         ...baseEvent,
         responseTime: data["processing_time_ms"] as number | undefined,
       } as OutboundEmailEvent & { responseTime?: number };
+    }
+
+    case "email.delivery_delayed": {
+      const delayed = data["delayed"] as
+        | { reason?: string; message?: string; category?: string }
+        | undefined;
+      return {
+        ...baseEvent,
+        category: delayed?.category || "delivery_delayed",
+        reason:
+          delayed?.reason ||
+          delayed?.message ||
+          (data["delay_reason"] as string | undefined),
+      } as OutboundEmailEvent & { category: string; reason?: string };
     }
 
     case "email.opened": {
@@ -615,16 +927,124 @@ const transformOutboundEvent = (
       };
     }
 
+    case "email.failed": {
+      const failed = data["failed"] as
+        | { reason?: string; code?: string | number; message?: string }
+        | undefined;
+      return {
+        ...baseEvent,
+        reason:
+          failed?.reason ||
+          failed?.message ||
+          (data["failed_reason"] as string | undefined),
+        code:
+          failed?.code || (data["failed_code"] as string | number | undefined),
+      } as OutboundEmailEvent & {
+        reason?: string;
+        code?: string | number;
+      };
+    }
+
+    case "email.suppressed": {
+      const suppressed = data["suppressed"] as
+        | { message?: string; type?: string }
+        | undefined;
+      return {
+        ...baseEvent,
+        reason:
+          suppressed?.message ||
+          (data["suppressed_reason"] as string | undefined),
+        category: suppressed?.type,
+      } as OutboundEmailEvent & {
+        reason?: string;
+        category?: string;
+      };
+    }
+
     default:
       return baseEvent;
   }
 };
 
-export const ResendDriver = (
-  config: ResendDriverConfig
-): EmailDriver<ResendDriverConfig, typeof RESEND_CAPABILITIES> => {
+export const ResendDriver = <const TId extends string = "resend">(
+  config: ResendDriverConfig<TId>,
+): EmailDriver<ResendDriverConfig<TId>, typeof RESEND_CAPABILITIES, TId> => {
   const apiBase = config.apiBase || "https://api.resend.com";
   const baseUrl = `${apiBase}`;
+  const driverId = (config.id || "resend") as TId;
+
+  const parseResendResponse = async (res: Response): Promise<unknown> => {
+    if (res.status === 204) return undefined;
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      return res.json();
+    }
+    const text = await res.text();
+    return text || undefined;
+  };
+
+  const requestResendWebhook = async (
+    path: string,
+    init?: RequestInit,
+    action = "manage webhook",
+  ): Promise<unknown> => {
+    const res = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        ...(init?.body ? { "Content-Type": "application/json" } : {}),
+        ...init?.headers,
+      },
+    });
+    const body = await parseResendResponse(res);
+
+    if (!res.ok) {
+      throw new EmailKitError(
+        typeof (body as any)?.message === "string"
+          ? (body as any).message
+          : `HTTP ${res.status}: Failed to ${action}`,
+        "resend",
+        undefined,
+        res.status,
+        undefined,
+        body,
+      );
+    }
+
+    return body;
+  };
+
+  const normalizeResendAccountWebhook = (
+    raw: ResendAccountWebhook,
+    fallback?: Partial<EmailKitWebhook>,
+  ): EmailKitWebhook => {
+    const id = raw.id || fallback?.providerId || fallback?.id || "";
+    const events = raw.events?.length
+      ? fromResendWebhookEvents(raw.events)
+      : fallback?.events;
+    const provider: Record<string, unknown> | undefined = raw.signing_secret
+      ? { signingSecret: raw.signing_secret }
+      : fallback?.provider;
+
+    return {
+      id,
+      scope: "account",
+      url: raw.endpoint || fallback?.url || "",
+      events,
+      status: raw.status
+        ? mapResendWebhookStatus(raw.status)
+        : (fallback?.status ?? "active"),
+      providerId: id,
+      createdAt: raw.created_at
+        ? new Date(raw.created_at)
+        : fallback?.createdAt,
+      updatedAt: raw.updated_at
+        ? new Date(raw.updated_at)
+        : fallback?.updatedAt,
+      provider,
+      raw,
+    };
+  };
 
   // Helper to get domain details
   const getDomainDetails = async (idOrName: string): Promise<Domain> => {
@@ -634,7 +1054,7 @@ export const ResendDriver = (
         headers: {
           Authorization: `Bearer ${config.apiKey}`,
         },
-      }
+      },
     );
 
     const contentType = res.headers.get("content-type") || "";
@@ -651,7 +1071,7 @@ export const ResendDriver = (
         undefined,
         res.status,
         undefined,
-        body
+        body,
       );
     }
 
@@ -679,7 +1099,7 @@ export const ResendDriver = (
 
     const domain: Domain = {
       id: domainData.id || domainData.name || idOrName,
-      name: domainData.name || idOrName,
+      domain: domainData.name || idOrName,
       status,
       region: domainData.region,
       createdAt: domainData.created_at
@@ -696,25 +1116,21 @@ export const ResendDriver = (
   };
 
   return {
+    id: driverId,
     name: "resend",
     capabilities: RESEND_CAPABILITIES,
-    providerFetch: createProviderFetch({
-      baseUrl: apiBase,
-      defaultHeaders: {
-        Authorization: `Bearer ${config.apiKey}`,
-      },
-    }),
+    providerFetch: createResendProviderFetch(apiBase, config.apiKey),
 
     sendEmail: async (
       message: EmailMessage<typeof RESEND_CAPABILITIES>,
-      options?: { signal?: AbortSignal }
+      options?: SendEmailOptions,
     ): Promise<SendEmailResult> => {
       // Resend requires either html or text, or template
       if (!message.html && !message.text && !message.templateId) {
         throw new EmailKitError(
           "Either html, text, or templateId must be provided",
           "resend",
-          "MISSING_REQUIRED_FIELD"
+          "MISSING_REQUIRED_FIELD",
         );
       }
 
@@ -726,6 +1142,25 @@ export const ResendDriver = (
       const headers: Record<string, string> = { ...(message.headers ?? {}) };
       const reply = resolveMessageReplyContext(message);
       if (hasReplyData(reply)) {
+        if (reply.threadId) {
+          throw new EmailKitError(
+            "Resend does not support provider thread IDs. Use reply.messageId and reply.references to set RFC reply headers.",
+            "resend",
+            "UNSUPPORTED_REPLY_THREAD_ID",
+          );
+        }
+        if (
+          reply.isReply &&
+          !reply.messageId &&
+          (!reply.references || reply.references.length === 0)
+        ) {
+          throw new EmailKitError(
+            "Resend does not support reply.isReply by itself. Use reply.messageId or reply.references to set RFC reply headers.",
+            "resend",
+            "UNSUPPORTED_REPLY_FLAG",
+          );
+        }
+
         const replyAddresses = replyAddressesAsArray(reply);
         if (replyAddresses.length === 1) {
           requestBody.reply_to = replyAddresses[0].email;
@@ -745,20 +1180,19 @@ export const ResendDriver = (
         }
       }
 
-      // Add html or text (or both)
-      if (message.html) {
-        requestBody.html = message.html;
-      }
-      if (message.text) {
-        requestBody.text = message.text;
-      }
-
-      // Add template if provided
       if (message.templateId) {
         requestBody.template = {
           id: message.templateId,
           variables: message.templateData || {},
         };
+      } else {
+        // Add html or text (or both). Resend rejects html/text when a template is provided.
+        if (message.html) {
+          requestBody.html = message.html;
+        }
+        if (message.text) {
+          requestBody.text = message.text;
+        }
       }
 
       // Optional CC/BCC
@@ -804,37 +1238,32 @@ export const ResendDriver = (
             throw new EmailKitError(
               `Attachment ${att.filename} must have either content or url`,
               "resend",
-              "INVALID_ATTACHMENT"
+              "INVALID_ATTACHMENT",
             );
           }
         });
       }
 
-      // Add tags
+      const tags: ResendEmailTag[] = [];
       if (message.tags && message.tags.length > 0) {
-        requestBody.tags = message.tags.map((tag) => {
-          // Resend tags can be strings or objects with name/value
-          if (typeof tag === "string") {
-            return { name: tag };
-          }
-          return tag;
-        });
+        tags.push(...message.tags.map((tag) => toResendTag(tag)));
+      }
+
+      if (message.metadata) {
+        for (const [key, value] of Object.entries(message.metadata)) {
+          tags.push(toResendMetadataTag(key, value));
+        }
       }
 
       // Tenant routing (capability)
       if ("tenantId" in message && message.tenantId) {
         headers["X-Tenant-Id"] = message.tenantId;
-        // Also add as a tag for searchability
-        if (Array.isArray(requestBody.tags)) {
-          (
-            requestBody.tags as unknown as Array<{
-              name: string;
-              value?: string;
-            }>
-          ).push({ name: `tenant:${message.tenantId}` });
-        } else {
-          requestBody.tags = [{ name: `tenant:${message.tenantId}` }];
-        }
+        tags.push(toResendMetadataTag("tenant", message.tenantId));
+      }
+
+      if (tags.length > 0) {
+        assertResendTagCount(tags);
+        requestBody.tags = tags;
       }
 
       // Add scheduling
@@ -846,25 +1275,16 @@ export const ResendDriver = (
         requestBody.scheduled_at = sendAtDate.toISOString();
       }
 
-      // Add metadata (if supported)
-      if (message.metadata) {
-        // Resend doesn't have explicit metadata field, but we can use headers
-        for (const [key, value] of Object.entries(message.metadata)) {
-          headers[`X-Metadata-${key}`] = value;
-        }
-      }
       if (Object.keys(headers).length > 0) {
         requestBody.headers = headers;
       }
 
-      // Tracking configuration - Resend tracks automatically via webhooks
-      // No explicit control in send API
       if ("track" in message && message.track !== undefined) {
-        if (message.track.opens === false || message.track.clicks === false) {
-          console.warn(
-            "Resend API does not support disabling tracking in the send endpoint. Tracking is enabled by default via webhooks."
-          );
-        }
+        throw new EmailKitError(
+          "Resend does not support send-time message.track controls. Use account webhooks and eventTracking for open/click events.",
+          "resend",
+          "UNSUPPORTED_SEND_TRACKING",
+        );
       }
 
       // Idempotency key (optional; capability)
@@ -920,7 +1340,7 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -932,22 +1352,42 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
         return {
           messageId: emailId,
-          provider: "resend",
+          provider: driverId,
           providerId: emailId,
         };
       } catch (error) {
+        if (error instanceof EmailKitError) {
+          throw error;
+        }
+
+        const errorRecord =
+          error && typeof error === "object"
+            ? (error as {
+                httpStatus?: unknown;
+                status?: unknown;
+                raw?: unknown;
+              })
+            : undefined;
+        const httpStatus =
+          typeof errorRecord?.httpStatus === "number"
+            ? errorRecord.httpStatus
+            : typeof errorRecord?.status === "number"
+              ? errorRecord.status
+              : undefined;
+
         throw new EmailKitError(
           `Failed to send email: ${error instanceof Error ? error.message : String(error)}`,
           "resend",
           undefined,
-          undefined,
-          error
+          httpStatus,
+          error,
+          errorRecord && "raw" in errorRecord ? errorRecord.raw : undefined,
         );
       }
     },
@@ -966,7 +1406,7 @@ export const ResendDriver = (
           inboundPayload,
           baseUrl,
           config.apiKey,
-          config.autoFetchInboundAttachments ?? true
+          config.autoFetchInboundAttachments ?? true,
         );
         return { type: "inbound", data: inboundEvent };
       }
@@ -979,10 +1419,13 @@ export const ResendDriver = (
         "email.sent",
         "email.delivered",
         "email.delivery_delayed",
+        "email.failed",
         "email.opened",
         "email.clicked",
         "email.bounced",
         "email.complained",
+        "email.scheduled",
+        "email.suppressed",
         "email.unsubscribed",
       ] as const;
 
@@ -991,7 +1434,7 @@ export const ResendDriver = (
           eventType,
           outboundPayload.data,
           outboundPayload.created_at,
-          outboundPayload
+          outboundPayload,
         );
 
         // Map to specific event type
@@ -1004,19 +1447,23 @@ export const ResendDriver = (
           | "bounced"
           | "complained"
           | "rejected"
+          | "outbound"
         > = {
           "email.sent": "sent",
           "email.delivered": "delivered",
-          "email.delivery_delayed": "delivered",
+          "email.delivery_delayed": "outbound",
+          "email.failed": "rejected",
           "email.opened": "opened",
           "email.clicked": "clicked",
           "email.bounced": "bounced",
           "email.complained": "complained",
+          "email.scheduled": "outbound",
+          "email.suppressed": "rejected",
           "email.unsubscribed": "complained",
         };
 
         const mappedType = eventTypeMap[eventType];
-        if (mappedType === "sent") {
+        if (mappedType === "sent" || mappedType === "outbound") {
           return { type: "outbound", data: outboundEvent } as WebhookEvent;
         }
         return {
@@ -1079,12 +1526,102 @@ export const ResendDriver = (
 
     webhookResponse: async (
       request: WebhookRequest,
-      handled: boolean
+      handled: boolean,
     ): Promise<WebhookResponse> => {
       return {
         status: 200,
         body: { success: true },
       };
+    },
+
+    webhooks: {
+      account: {
+        setup: async (
+          input: AccountWebhookSetupInput,
+        ): Promise<AccountWebhookSetupResult> => {
+          const webhookUrl = requireWebhookSetupUrl(input.url);
+
+          const resendEvents = toResendWebhookEvents(input.events);
+          const raw = (await requestResendWebhook(
+            "/webhooks",
+            {
+              method: "POST",
+              body: JSON.stringify({
+                endpoint: webhookUrl,
+                events: resendEvents,
+              }),
+            },
+            "create webhook",
+          )) as ResendAccountWebhook;
+          const webhook = normalizeResendAccountWebhook(raw, {
+            id: raw.id,
+            providerId: raw.id,
+            scope: "account",
+            url: webhookUrl,
+            events: fromResendWebhookEvents(resendEvents),
+            status: "active",
+          });
+
+          return { webhook, raw };
+        },
+
+        refresh: async (
+          input: AccountWebhookRefreshInput,
+        ): Promise<AccountWebhookRefreshResult> => {
+          const webhookId = resolveWebhookId(input);
+          if (!webhookId) {
+            throw new EmailKitError(
+              "Webhook refresh requires a webhook id or providerId",
+              "resend",
+              "MISSING_REQUIRED_FIELD",
+            );
+          }
+
+          const raw = (await requestResendWebhook(
+            `/webhooks/${encodeURIComponent(webhookId)}`,
+            { method: "GET" },
+            "refresh webhook",
+          )) as ResendAccountWebhook;
+
+          return {
+            webhook: normalizeResendAccountWebhook(raw, input.webhook),
+            raw,
+          };
+        },
+
+        delete: async (
+          input: AccountWebhookDeleteInput,
+        ): Promise<AccountWebhookDeleteResult> => {
+          const webhookId = resolveWebhookId(input);
+          if (!webhookId) {
+            throw new EmailKitError(
+              "Webhook delete requires a webhook id or providerId",
+              "resend",
+              "MISSING_REQUIRED_FIELD",
+            );
+          }
+
+          const raw = await requestResendWebhook(
+            `/webhooks/${encodeURIComponent(webhookId)}`,
+            { method: "DELETE" },
+            "delete webhook",
+          );
+
+          return {
+            deleted: true,
+            webhook: {
+              id: input.webhook?.id || webhookId,
+              providerId: input.webhook?.providerId || webhookId,
+              scope: "account",
+              url: input.webhook?.url || "",
+              events: input.webhook?.events,
+              status: "deleted",
+              raw,
+            },
+            raw,
+          };
+        },
+      },
     },
 
     domains: {
@@ -1123,7 +1660,7 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1142,7 +1679,7 @@ export const ResendDriver = (
           const status = mapDomainStatus(d.status);
           const domain: Domain = {
             id: d.id || d.name || "",
-            name: d.name || "",
+            domain: d.name || "",
             status,
             region: d.region,
             createdAt: d.created_at ? new Date(d.created_at) : undefined,
@@ -1154,7 +1691,7 @@ export const ResendDriver = (
 
       create: async (input: CreateDomainInput): Promise<Domain> => {
         const requestBody: Record<string, unknown> = {
-          name: input.name,
+          name: input.domain,
         };
 
         if (input.region) {
@@ -1163,6 +1700,13 @@ export const ResendDriver = (
 
         if (input.returnPathSubdomain) {
           requestBody.custom_return_path = input.returnPathSubdomain;
+        }
+
+        if (input.tracking?.opens !== undefined) {
+          requestBody.open_tracking = input.tracking.opens;
+        }
+        if (input.tracking?.clicks !== undefined) {
+          requestBody.click_tracking = input.tracking.clicks;
         }
 
         // Add provider-specific options
@@ -1193,7 +1737,7 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1220,8 +1764,8 @@ export const ResendDriver = (
           : [];
 
         const domain: Domain = {
-          id: domainData.id || input.name,
-          name: domainData.name || input.name,
+          id: domainData.id || input.domain,
+          domain: domainData.name || input.domain,
           status,
           region: domainData.region,
           createdAt: domainData.created_at
@@ -1243,12 +1787,55 @@ export const ResendDriver = (
 
       update: async (
         idOrName: string,
-        patch: UpdateDomainInput
+        patch: UpdateDomainInput,
       ): Promise<Domain> => {
-        // Resend doesn't support updating domains via API
-        // According to docs, domain settings are immutable after creation
-        // So we'll just return the current domain state
-        return getDomainDetails(idOrName);
+        const requestBody: Record<string, unknown> = {};
+
+        if (patch.tracking?.opens !== undefined) {
+          requestBody.open_tracking = patch.tracking.opens;
+        }
+        if (patch.tracking?.clicks !== undefined) {
+          requestBody.click_tracking = patch.tracking.clicks;
+        }
+        if (patch.provider) {
+          Object.assign(requestBody, patch.provider);
+        }
+
+        const res = await fetch(
+          `${baseUrl}/domains/${encodeURIComponent(idOrName)}`,
+          {
+            method: "PATCH",
+            headers: {
+              Authorization: `Bearer ${config.apiKey}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(requestBody),
+          },
+        );
+
+        const contentType = res.headers.get("content-type") || "";
+        const body = contentType.includes("application/json")
+          ? await res.json()
+          : await res.text();
+
+        if (!res.ok) {
+          throw new EmailKitError(
+            typeof (body as any)?.message === "string"
+              ? (body as any).message
+              : `HTTP ${res.status}: Failed to update domain`,
+            "resend",
+            undefined,
+            res.status,
+            undefined,
+            body,
+          );
+        }
+
+        const updatedId =
+          typeof body === "object" && body !== null
+            ? ((body as { id?: string }).id ?? idOrName)
+            : idOrName;
+        return getDomainDetails(updatedId);
       },
 
       verify: async (idOrName: string): Promise<DomainVerification> => {
@@ -1266,7 +1853,7 @@ export const ResendDriver = (
             headers: {
               Authorization: `Bearer ${config.apiKey}`,
             },
-          }
+          },
         );
 
         const contentType = res.headers.get("content-type") || "";
@@ -1283,7 +1870,7 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
@@ -1329,7 +1916,7 @@ export const ResendDriver = (
             headers: {
               Authorization: `Bearer ${config.apiKey}`,
             },
-          }
+          },
         );
 
         const contentType = res.headers.get("content-type") || "";
@@ -1346,13 +1933,15 @@ export const ResendDriver = (
             undefined,
             res.status,
             undefined,
-            body
+            body,
           );
         }
 
-        const deleted = res.ok && res.status === 200;
         return {
-          deleted,
+          deleted:
+            typeof body === "object" && body !== null && "deleted" in body
+              ? Boolean((body as { deleted?: boolean }).deleted)
+              : res.ok,
         };
       },
     },

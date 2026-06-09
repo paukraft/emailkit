@@ -1,14 +1,8 @@
 {
   "commands": [
     {
-      "command": "bun dev",
-      "id": "command-bun-dev",
-      "startMode": "auto"
-    },
-    {
       "command": "cloudflared tunnel --url http://localhost:3210 run dev",
-      "id": "command-tunnel",
-      "startMode": "manual"
+      "id": "command-tunnel"
     }
   ]
 }
