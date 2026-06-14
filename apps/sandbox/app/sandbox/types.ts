@@ -191,3 +191,26 @@ export type SandboxWebhookView = {
   createdAt?: string
   updatedAt?: string
 }
+
+export type SyncTarget =
+  | { scope: "account" }
+  | { scope: "mailbox"; mailboxEmail: string }
+  | { scope: "domain"; domain: string }
+
+export type SyncActionInput = {
+  emailDriver: string
+  target: SyncTarget
+  since: string
+  until?: string
+  context?: unknown
+}
+
+export type SandboxSyncResult = {
+  ok: boolean
+  scope: WebhookScope
+  dispatched: number
+  syncedFrom?: string
+  /** Set when the run failed partway; resume with `since: lastEventTimestamp`. */
+  lastEventTimestamp?: string
+  error?: string
+}

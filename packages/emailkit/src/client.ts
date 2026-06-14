@@ -10,12 +10,15 @@ import type {
   DriverDomainsAPI,
   DriverId,
   DriverMailboxesAPI,
+  DriverSyncAPI,
   DriverWebhooksAPI,
   EmailDriver,
   ProviderFetch,
   ProviderFetchInit,
+  SyncStream,
 } from "./driver";
 import type {
+  AccountSyncInput,
   AccountWebhookDeleteInput,
   AccountWebhookDeleteResult,
   AccountWebhookRefreshInput,
@@ -31,6 +34,7 @@ import type {
   DomainIdentifier,
   DomainIdentifierType,
   DomainOperationInput,
+  DomainSyncInput,
   DomainWebhookDeleteInput,
   DomainWebhookDeleteResult,
   DomainWebhookRefreshInput,
@@ -43,6 +47,7 @@ import type {
   DriverPublicRouteCapabilities,
   DriverSendTrackingCapabilities,
   DriverDomainCapabilities,
+  DriverSyncCapabilities,
   DriverWebhookCapabilities,
   DriverWebhookMethodCapabilities,
   EmailKitHooks,
@@ -54,6 +59,7 @@ import type {
   Mailbox,
   MailboxIdentity,
   MailboxConnectionResult,
+  MailboxSyncInput,
   MailboxWebhookDeleteInput,
   MailboxWebhookDeleteResult,
   MailboxWebhookRefreshInput,
@@ -65,6 +71,8 @@ import type {
   PublicRouteTemplate,
   PublicRoutesConfig,
   SendEmailResult,
+  SyncInput,
+  SyncResult,
   UpdateDomainInput,
   Webhook,
   WebhookDriverEvent,
@@ -80,7 +88,7 @@ import type {
   WebhookScope,
   WebhookStatus,
 } from "./types";
-import { EmailKitError } from "./types";
+import { EmailKitError, EmailKitSyncError } from "./types";
 
 export type EmailDriverTuple = readonly [
   EmailDriver<any, any, string>,
@@ -230,6 +238,28 @@ type MailboxWebhookDriverId<TDrivers extends EmailDriverTuple> =
   AnyWebhookMethodDriverId<TDrivers, "mailbox">;
 type DomainWebhookDriverId<TDrivers extends EmailDriverTuple> =
   AnyWebhookMethodDriverId<TDrivers, "domain">;
+type SyncScopeDriverId<
+  TDrivers extends EmailDriverTuple,
+  TScope extends keyof DriverSyncCapabilities,
+> =
+  ConfiguredDriver<TDrivers> extends infer TDriver
+    ? TDriver extends EmailDriver<any, any, string>
+      ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
+          DriverCapabilities
+        ? keyof TCapabilities extends never
+          ? never
+          : DriverCapabilities extends TCapabilities
+            ? DriverId<TDriver>
+            : TCapabilities["sync"] extends infer TSync
+              ? TSync extends DriverSyncCapabilities
+                ? TSync[TScope] extends true
+                  ? DriverId<TDriver>
+                  : never
+                : never
+              : never
+        : never
+      : never
+    : never;
 type ProviderFetchDriverId<TDrivers extends EmailDriverTuple> =
   CapabilityDriverId<TDrivers, "providerFetch">;
 type EmailSenderOverrideForConfiguredDrivers<
@@ -315,6 +345,10 @@ type AllConfiguredDriversSupport<
 type DriverSupportsReplyHeaders<TCapabilities extends DriverCapabilities> =
   TCapabilities["replyHeaders"] extends true ? true : false;
 
+type DriverSupportsNativeReplyThreading<
+  TCapabilities extends DriverCapabilities,
+> = TCapabilities["nativeReplyThreading"] extends true ? true : false;
+
 type DriverSupportsReplyThreadId<TCapabilities extends DriverCapabilities> =
   TCapabilities["replyThreadId"] extends true ? true : false;
 
@@ -324,6 +358,18 @@ type ConfiguredReplyHeadersSupportValues<TDrivers extends EmailDriverTuple> =
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DriverSupportsReplyHeaders<TCapabilities>
+        : never
+      : never
+    : never;
+
+type ConfiguredNativeReplyThreadingSupportValues<
+  TDrivers extends EmailDriverTuple,
+> =
+  ConfiguredDriver<TDrivers> extends infer TDriver
+    ? TDriver extends EmailDriver<any, any, string>
+      ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
+          DriverCapabilities
+        ? DriverSupportsNativeReplyThreading<TCapabilities>
         : never
       : never
     : never;
@@ -342,6 +388,16 @@ type AllConfiguredDriversSupportReplyHeaders<
   TDrivers extends EmailDriverTuple,
 > =
   Exclude<ConfiguredReplyHeadersSupportValues<TDrivers>, true> extends never
+    ? true
+    : false;
+
+type AllConfiguredDriversSupportNativeReplyThreading<
+  TDrivers extends EmailDriverTuple,
+> =
+  Exclude<
+    ConfiguredNativeReplyThreadingSupportValues<TDrivers>,
+    true
+  > extends never
     ? true
     : false;
 
@@ -390,6 +446,7 @@ type CommonSendCapabilities<TDrivers extends EmailDriverTuple> = {
   bcc: AllConfiguredDriversSupport<TDrivers, "bcc">;
   replyTo: AllConfiguredDriversSupport<TDrivers, "replyTo">;
   replyHeaders: AllConfiguredDriversSupportReplyHeaders<TDrivers>;
+  nativeReplyThreading: AllConfiguredDriversSupportNativeReplyThreading<TDrivers>;
   replyThreadId: AllConfiguredDriversSupportReplyThreadId<TDrivers>;
   attachments: AllConfiguredDriversSupport<TDrivers, "attachments">;
   customHeaders: AllConfiguredDriversSupport<TDrivers, "customHeaders">;
@@ -493,6 +550,18 @@ export type ResolveEmailDriverContext<TDrivers extends EmailDriverTuple> =
   | {
       operation: "domains.webhooks.delete";
       input: DomainWebhookDeleteInput;
+    }
+  | {
+      operation: "sync";
+      input: AccountSyncInput;
+    }
+  | {
+      operation: "mailboxes.sync";
+      input: MailboxSyncInput;
+    }
+  | {
+      operation: "domains.sync";
+      input: DomainSyncInput;
     };
 
 export type ResolveEmailDriver<TDrivers extends EmailDriverTuple> = (
@@ -846,7 +915,15 @@ export type EmailKitClient<TDrivers extends EmailDriverTuple> =
       : { providerFetch: ProviderFetchFacade<TDrivers> }) &
     ([AccountWebhookDriverId<TDrivers>] extends [never]
       ? {}
-      : { webhooks: AccountWebhooksFacade<TDrivers> });
+      : { webhooks: AccountWebhooksFacade<TDrivers> }) &
+    ([SyncScopeDriverId<TDrivers, "account">] extends [never]
+      ? {}
+      : {
+          sync: (
+            input: AccountSyncInput &
+              OperationSelector<SyncScopeDriverId<TDrivers, "account">>,
+          ) => Promise<SyncResult>;
+        });
 
 export type AccountWebhooksFacade<
   TDrivers extends EmailDriverTuple = EmailDriverTuple,
@@ -938,7 +1015,15 @@ export type DomainsFacade<
 > = DomainsBaseFacade<TDrivers> &
   ([DomainWebhookDriverId<TDrivers>] extends [never]
     ? {}
-    : { webhooks: DomainWebhooksFacade<TDrivers> });
+    : { webhooks: DomainWebhooksFacade<TDrivers> }) &
+  ([SyncScopeDriverId<TDrivers, "domain">] extends [never]
+    ? {}
+    : {
+        sync: (
+          input: DomainSyncInput &
+            OperationSelector<SyncScopeDriverId<TDrivers, "domain">>,
+        ) => Promise<SyncResult>;
+      });
 
 export type DomainsBaseFacade<
   TDrivers extends EmailDriverTuple = EmailDriverTuple,
@@ -1013,7 +1098,15 @@ export type MailboxesFacade<
 > = MailboxesBaseFacade<TDrivers> &
   ([MailboxWebhookDriverId<TDrivers>] extends [never]
     ? {}
-    : { webhooks: MailboxWebhooksFacade<TDrivers> });
+    : { webhooks: MailboxWebhooksFacade<TDrivers> }) &
+  ([SyncScopeDriverId<TDrivers, "mailbox">] extends [never]
+    ? {}
+    : {
+        sync: (
+          input: MailboxSyncInput &
+            OperationSelector<SyncScopeDriverId<TDrivers, "mailbox">>,
+        ) => Promise<SyncResult>;
+      });
 
 export type MailboxesBaseFacade<
   TDrivers extends EmailDriverTuple = EmailDriverTuple,
@@ -1110,6 +1203,10 @@ const withAttachmentEmailDriver = <TData>(
 const supportsReplyHeaders = (capabilities: DriverCapabilities): boolean =>
   capabilities.replyHeaders === true;
 
+const supportsNativeReplyThreading = (
+  capabilities: DriverCapabilities,
+): boolean => capabilities.nativeReplyThreading === true;
+
 const supportsReplyThreadId = (capabilities: DriverCapabilities): boolean =>
   capabilities.replyThreadId === true;
 
@@ -1154,13 +1251,17 @@ const stripUnsupportedSendFields = <TMessage extends Record<string, unknown>>(
     if (capabilities.replyTo === true && "addresses" in replyRecord) {
       cleanedReply.addresses = replyRecord.addresses;
     }
-    if (supportsReplyHeaders(capabilities)) {
+    if (
+      supportsReplyHeaders(capabilities) ||
+      supportsNativeReplyThreading(capabilities)
+    ) {
       if ("messageId" in replyRecord) {
         cleanedReply.messageId = replyRecord.messageId;
       }
-      if ("references" in replyRecord) {
-        cleanedReply.references = replyRecord.references;
-      }
+      if ("isReply" in replyRecord) cleanedReply.isReply = replyRecord.isReply;
+    }
+    if (supportsReplyHeaders(capabilities) && "references" in replyRecord) {
+      cleanedReply.references = replyRecord.references;
     }
     if (supportsReplyThreadId(capabilities)) {
       if ("threadId" in replyRecord)
@@ -1176,6 +1277,7 @@ const stripUnsupportedSendFields = <TMessage extends Record<string, unknown>>(
   } else if (
     capabilities.replyTo !== true &&
     !supportsReplyHeaders(capabilities) &&
+    !supportsNativeReplyThreading(capabilities) &&
     !supportsReplyThreadId(capabilities)
   ) {
     delete sanitized.reply;
@@ -1441,6 +1543,12 @@ const WEBHOOK_METHODS = [
 
 type WebhookMethod = (typeof WEBHOOK_METHODS)[number];
 
+const SYNC_SCOPES = [
+  "account",
+  "mailbox",
+  "domain",
+] as const satisfies readonly (keyof DriverSyncCapabilities)[];
+
 const webhookCapabilitySupportsMethod = (
   capability: DriverWebhookCapabilities[keyof DriverWebhookCapabilities],
   method: WebhookMethod,
@@ -1584,6 +1692,29 @@ const validateWebhookCapabilities = (driver: EmailDriver): void => {
   }
 };
 
+const validateSyncCapabilities = (driver: EmailDriver): void => {
+  for (const scope of SYNC_SCOPES) {
+    const declaresScope = driver.capabilities.sync?.[scope] === true;
+    const implementsScope = typeof driver.sync?.[scope] === "function";
+
+    if (declaresScope && !implementsScope) {
+      throw new EmailKitError(
+        `Sync capability sync.${scope} is declared but driver.sync.${scope} is not implemented`,
+        driverLabel(driver),
+        "INVALID_CONFIG",
+      );
+    }
+
+    if (!declaresScope && implementsScope) {
+      throw new EmailKitError(
+        `driver.sync.${scope} is implemented but capability sync.${scope} is not declared`,
+        driverLabel(driver),
+        "INVALID_CONFIG",
+      );
+    }
+  }
+};
+
 const validatePublicRouteCapabilities = (driver: EmailDriver): void => {
   const publicRoutes = driver.capabilities.publicRoutes;
   if (!publicRoutes) {
@@ -1681,6 +1812,23 @@ const ensureWebhookMethod = <
         "NOT_SUPPORTED",
       );
     }) as NonNullable<DriverWebhooksAPI[TScope][TMethod]>;
+  }
+  return impl;
+};
+
+const ensureSyncMethod = <TScope extends keyof DriverSyncAPI>(
+  driver: EmailDriver,
+  scope: TScope,
+): DriverSyncAPI[TScope] => {
+  const impl = driver.sync?.[scope] as DriverSyncAPI[TScope] | undefined;
+  if (!impl) {
+    return (() => {
+      throw new EmailKitError(
+        `Sync operation not supported by provider: ${String(scope)}`,
+        driverLabel(driver),
+        "NOT_SUPPORTED",
+      );
+    }) as DriverSyncAPI[TScope];
   }
   return impl;
 };
@@ -2046,6 +2194,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     validateProviderFetchCapability(driver);
     validateMailboxCapabilities(driver);
     validateWebhookCapabilities(driver);
+    validateSyncCapabilities(driver);
     validatePublicRouteCapabilities(driver);
     driverMap.set(driver.id, driver);
   }
@@ -2406,6 +2555,67 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     );
   };
 
+  const hasSyncCapability = (
+    driver: EmailDriver,
+    scope: keyof DriverSyncCapabilities,
+  ): boolean => driver.capabilities.sync?.[scope] === true;
+
+  const resolveSyncCapabilityDriver = async (
+    operation: string,
+    selectedId: string | undefined,
+    scope: keyof DriverSyncCapabilities,
+    context: ResolveEmailDriverContext<TDrivers>,
+  ): Promise<EmailDriver> => {
+    if (selectedId) {
+      const driver = getDriverById(selectedId);
+      if (!hasSyncCapability(driver, scope)) {
+        throw new EmailKitError(
+          `${operation} is not supported by email driver: ${selectedId}`,
+          selectedId,
+          "NOT_SUPPORTED",
+        );
+      }
+      return driver;
+    }
+
+    const capableDrivers = emailDrivers.filter((driver) =>
+      hasSyncCapability(driver, scope),
+    );
+
+    if (capableDrivers.length === 1) {
+      return capableDrivers[0];
+    }
+
+    if (capableDrivers.length === 0) {
+      throw new EmailKitError(
+        `${operation} is not supported by any configured email driver`,
+        "emailkit",
+        "NOT_SUPPORTED",
+      );
+    }
+
+    if (config.resolveEmailDriver) {
+      const selection = normalizeSender(
+        await config.resolveEmailDriver(context),
+      );
+      const driver = getDriverById(selection.emailDriver);
+      if (!hasSyncCapability(driver, scope)) {
+        throw new EmailKitError(
+          `${operation} is not supported by email driver: ${selection.emailDriver}`,
+          selection.emailDriver,
+          "NOT_SUPPORTED",
+        );
+      }
+      return driver;
+    }
+
+    throw new EmailKitError(
+      `${operation} requires emailDriver because multiple configured email drivers support it`,
+      "emailkit",
+      "INVALID_INPUT",
+    );
+  };
+
   const resolveProviderFetch = async (
     selectedId: string | undefined,
     path: string | URL,
@@ -2487,7 +2697,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
 
   const dispatchEmailHooks = async (
     driver: EmailDriver,
-    request: WebhookRequest,
+    source: { raw?: unknown; method?: string; context?: unknown },
     type: string,
     data: unknown,
   ): Promise<void> => {
@@ -2515,7 +2725,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
       const clickedData = dataWithDriver as any;
       const botDetection = checkClickBot({
         userAgent: clickedData.userAgent,
-        method: request.method,
+        method: source.method ?? "POST",
         url: clickedData.url,
       });
       dataForHooks = {
@@ -2531,7 +2741,8 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
       emailDriver,
       type: type as any,
       data: dataForHooks,
-      raw: request.body,
+      raw: source.raw,
+      ...(source.context !== undefined ? { context: source.context } : {}),
     });
 
     switch (type) {
@@ -2566,7 +2777,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
           emailDriver,
           type: "unknown",
           data: dataWithDriver,
-          raw: request.body,
+          raw: source.raw,
         });
         break;
       default:
@@ -2574,7 +2785,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
           emailDriver,
           type: "unknown",
           data: { type, data: dataWithDriver },
-          raw: request.body,
+          raw: source.raw,
         });
         break;
     }
@@ -2584,6 +2795,89 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     event: WebhookDriverEvent,
   ): event is WebhookLifecycleDriverEvent => {
     return event.type === "webhook.lifecycle";
+  };
+
+  const runSync = async (
+    driver: EmailDriver,
+    scope: WebhookScope,
+    stream: SyncStream,
+    input: SyncInput,
+  ): Promise<SyncResult> => {
+    let dispatched = 0;
+    let lastEventTimestamp: Date | undefined;
+    let streamClosed = false;
+
+    const closeStream = async () => {
+      if (streamClosed) return;
+      streamClosed = true;
+      try {
+        await stream.return({ syncedFrom: input.since });
+      } catch {
+        // Preserve the sync failure that triggered cleanup.
+      }
+    };
+
+    try {
+      while (true) {
+        if (input.signal?.aborted) {
+          await closeStream();
+          throw new EmailKitSyncError(
+            "Sync aborted",
+            driverLabel(driver),
+            dispatched,
+            lastEventTimestamp,
+          );
+        }
+
+        const result = await stream.next();
+        if (result.done) {
+          streamClosed = true;
+          return {
+            dispatched,
+            syncedFrom: result.value?.syncedFrom ?? input.since,
+          };
+        }
+
+        const event = result.value;
+        if (isWebhookLifecycleDriverEvent(event)) {
+          await dispatchWebhookLifecycle(
+            driver,
+            event.data.scope,
+            event.data.action,
+            {
+              ...event.data,
+              ...(event.data.action === "deleted" ? { deleted: true } : {}),
+            },
+          );
+        } else {
+          await dispatchEmailHooks(
+            driver,
+            {
+              raw:
+                (event.data as { raw?: unknown } | undefined)?.raw ??
+                event.data,
+              context: input.context,
+            },
+            event.type,
+            event.data,
+          );
+        }
+        dispatched += 1;
+        const timestamp = (event.data as { timestamp?: unknown } | undefined)
+          ?.timestamp;
+        if (timestamp instanceof Date) lastEventTimestamp = timestamp;
+      }
+    } catch (error) {
+      if (error instanceof EmailKitSyncError) throw error;
+      await closeStream();
+      throw new EmailKitSyncError(
+        `Sync ${scope} failed`,
+        driverLabel(driver),
+        dispatched,
+        lastEventTimestamp,
+        error,
+      );
+    }
   };
 
   const resolveRequestDriver = (request: WebhookRequest): EmailDriver => {
@@ -2726,7 +3020,12 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
           continue;
         }
 
-        await dispatchEmailHooks(driver, request, event.type, event.data);
+        await dispatchEmailHooks(
+          driver,
+          { raw: request.body, method: request.method },
+          event.type,
+          event.data,
+        );
       }
 
       if (driver.webhookResponse) {
@@ -3457,6 +3756,92 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     },
   };
 
+  const accountSync = async (
+    input: AccountSyncInput & OperationSelector<string>,
+  ): Promise<SyncResult> => {
+    const driver = await resolveSyncCapabilityDriver(
+      "sync",
+      input.emailDriver,
+      "account",
+      {
+        operation: "sync",
+        input,
+      },
+    );
+    const { emailDriver: _emailDriver, ...driverInput } = input;
+    const stream = ensureSyncMethod(driver, "account")(
+      driverInput,
+      operationOptionsForDriver(driver, { context: input.context }),
+    );
+    return runSync(driver, "account", stream, driverInput);
+  };
+
+  const mailboxSync = async (
+    input: MailboxSyncInput & OperationSelector<string>,
+  ): Promise<SyncResult> => {
+    const driver = await resolveSyncCapabilityDriver(
+      "mailboxes.sync",
+      input.emailDriver,
+      "mailbox",
+      {
+        operation: "mailboxes.sync",
+        input,
+      },
+    );
+    const { emailDriver: _emailDriver, ...publicInput } = input;
+    const driverInput = normalizeMailboxAuthInput(
+      publicInput,
+      driverLabel(driver),
+    );
+    const stream = ensureSyncMethod(driver, "mailbox")(
+      driverInput,
+      operationOptionsForDriver(driver, {
+        mailbox: "mailbox" in driverInput ? driverInput.mailbox : undefined,
+        auth: driverInput.auth,
+        context: input.context,
+      }),
+    );
+    return runSync(driver, "mailbox", stream, driverInput);
+  };
+
+  const domainSync = async (
+    input: DomainSyncInput & OperationSelector<string>,
+  ): Promise<SyncResult> => {
+    const driver = await resolveSyncCapabilityDriver(
+      "domains.sync",
+      input.emailDriver,
+      "domain",
+      {
+        operation: "domains.sync",
+        input,
+      },
+    );
+    const idOrName = await resolveDomainIdentifier(driver, input);
+    if (!idOrName) {
+      throw new EmailKitError(
+        "Domain not found",
+        driverLabel(driver),
+        "NOT_FOUND",
+        404,
+      );
+    }
+    const {
+      emailDriver: _emailDriver,
+      domain: _domain,
+      domainId: _domainId,
+      ...rest
+    } = input;
+    const driverInput: DomainSyncInput =
+      driverDomainIdentifierType(driver) === "domainId"
+        ? { ...rest, domainId: idOrName }
+        : { ...rest, domain: idOrName };
+    const stream = ensureSyncMethod(driver, "domain")(
+      driverInput,
+      operationOptionsForDriver(driver, { context: input.context }),
+    );
+    return runSync(driver, "domain", stream, driverInput);
+  };
+
   if (
     emailDrivers.some((driver) => hasAnyWebhookCapability(driver, "mailbox"))
   ) {
@@ -3477,6 +3862,22 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     ).webhooks = domainWebhooks;
   }
 
+  if (emailDrivers.some((driver) => hasSyncCapability(driver, "mailbox"))) {
+    (
+      mailboxes as MailboxesBaseFacade<TDrivers> & {
+        sync: typeof mailboxSync;
+      }
+    ).sync = mailboxSync;
+  }
+
+  if (emailDrivers.some((driver) => hasSyncCapability(driver, "domain"))) {
+    (
+      domains as DomainsBaseFacade<TDrivers> & {
+        sync: typeof domainSync;
+      }
+    ).sync = domainSync;
+  }
+
   const providerFetch: ProviderFetchFacade<TDrivers> = async (path, init) => {
     const { emailDriver, ...driverInit } = init ?? {};
     const fetch = await resolveProviderFetch(emailDriver, path, driverInit);
@@ -3487,6 +3888,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     Partial<{
       providerFetch: ProviderFetchFacade<TDrivers>;
       webhooks: AccountWebhooksFacade<TDrivers>;
+      sync: typeof accountSync;
     }> = {
     sendEmail,
     handler,
@@ -3511,6 +3913,10 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     emailDrivers.some((driver) => hasAnyWebhookCapability(driver, "account"))
   ) {
     client.webhooks = accountWebhooks;
+  }
+
+  if (emailDrivers.some((driver) => hasSyncCapability(driver, "account"))) {
+    client.sync = accountSync;
   }
 
   return client as EmailKitClient<TDrivers>;

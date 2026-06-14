@@ -19,6 +19,7 @@ import type {
   EmailDriverOperationOptions,
   ProviderFetchInit,
   SendEmailOptions,
+  SyncStream,
 } from "../driver";
 import type {
   Attachment,
@@ -28,6 +29,8 @@ import type {
   InboundEmailEvent,
   Mailbox,
   MailboxConnectionResult,
+  MailboxIdentity,
+  MailboxSyncInput,
   MailboxWebhookDeleteInput,
   MailboxWebhookDeleteResult,
   MailboxWebhookRefreshInput,
@@ -52,8 +55,10 @@ import {
   resolveMessageReplyContext,
 } from "../utils/reply";
 
-export interface OutlookDriverConfig<TId extends string = "outlook">
-  extends EmailDriverConfig {
+export interface OutlookDriverConfig<
+  TId extends string = "outlook",
+  TSendEmailMode extends OutlookSendEmailMode = OutlookSendEmailMode,
+> extends EmailDriverConfig {
   /**
    * EmailKit driver id. Override when configuring multiple Outlook drivers.
    */
@@ -83,8 +88,16 @@ export interface OutlookDriverConfig<TId extends string = "outlook">
    *   as a send receipt because Graph returns 202 with no message object.
    * - "draft": creates a draft with immutable ids, sends it, and returns the
    *   Graph message id. This requires Mail.ReadWrite in addition to Mail.Send.
+   *   Draft mode also enables native reply threading: when `reply.messageId`
+   *   is set, the driver replies through Graph `createReply` so Exchange wires
+   *   up conversation threading and reply headers itself. Graph cannot set
+   *   `In-Reply-To`/`References` headers directly, so `reply.messageId`
+   *   throws NOT_SUPPORTED in "sendMail" mode. This is enforced at the type
+   *   level: the `nativeReplyThreading` capability (and with it
+   *   `reply.messageId`) only exists on drivers constructed with
+   *   `sendEmailMode: "draft"`.
    */
-  sendEmailMode?: OutlookSendEmailMode;
+  sendEmailMode?: TSendEmailMode;
   /**
    * Create a Microsoft Graph inbound-message subscription immediately after a
    * mailbox is connected. The created subscription is returned on mailbox.raw
@@ -101,8 +114,8 @@ export interface OutlookDriverConfig<TId extends string = "outlook">
    */
   autoRenewOnLifecycle?: boolean;
   /**
-   * Microsoft Graph subscription resource. Defaults to the connected user's
-   * Inbox messages.
+   * Microsoft Graph subscription resource. Defaults to all messages in the
+   * connected user's mailbox.
    */
   inboundResource?: string;
   /**
@@ -148,7 +161,9 @@ export interface OutlookSendEmailResult extends SendEmailResult {
   raw?: {
     skippedHeaders?: string[];
     messageIdKind?: "graphMessageId" | "sendReceipt";
+    replySourceLookup?: unknown;
     createDraft?: unknown;
+    updateDraft?: unknown;
     sendDraft?: unknown;
     sendMail?: unknown;
   };
@@ -179,12 +194,24 @@ export interface OutlookCapabilities extends DriverCapabilities {
   webhooks: {
     mailbox: true;
   };
+  sync: {
+    mailbox: true;
+  };
   publicRoutes: {
     webhook: true;
     lifecycleWebhook: true;
     connectCallback: true;
     connectLanding: true;
   };
+}
+
+/**
+ * Capabilities of an Outlook driver configured with `sendEmailMode: "draft"`.
+ * Only the draft send flow can thread replies natively through Graph
+ * `createReply`, so `nativeReplyThreading` exists exclusively here.
+ */
+export interface OutlookDraftCapabilities extends OutlookCapabilities {
+  nativeReplyThreading: true;
 }
 
 export const OUTLOOK_CAPABILITIES = {
@@ -201,6 +228,9 @@ export const OUTLOOK_CAPABILITIES = {
   webhooks: {
     mailbox: true,
   },
+  sync: {
+    mailbox: true,
+  },
   publicRoutes: {
     webhook: true,
     lifecycleWebhook: true,
@@ -208,6 +238,21 @@ export const OUTLOOK_CAPABILITIES = {
     connectLanding: true,
   },
 } as const satisfies OutlookCapabilities;
+
+export const OUTLOOK_DRAFT_CAPABILITIES = {
+  ...OUTLOOK_CAPABILITIES,
+  nativeReplyThreading: true,
+} as const satisfies OutlookDraftCapabilities;
+
+/**
+ * Capabilities advertised by an Outlook driver for a given configured
+ * `sendEmailMode`. Mirrors the runtime capabilities object the factory builds.
+ */
+export type OutlookCapabilitiesForSendMode<
+  TSendEmailMode extends OutlookSendEmailMode,
+> = TSendEmailMode extends "draft"
+  ? typeof OUTLOOK_DRAFT_CAPABILITIES
+  : typeof OUTLOOK_CAPABILITIES;
 
 const DEFAULT_SCOPES = [
   "offline_access",
@@ -220,7 +265,7 @@ const STATE_VERSION = 1;
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
 const STATE_MAX_AGE_MS = 10 * 60 * 1000;
 const STATE_ENCRYPTION_ALGORITHM = "aes-256-gcm";
-const DEFAULT_INBOUND_RESOURCE = "me/mailFolders('Inbox')/messages";
+const DEFAULT_INBOUND_RESOURCE = "me/messages";
 const DEFAULT_INBOUND_SUBSCRIPTION_MINUTES = 60 * 24 * 3;
 const WEBHOOK_RENEWAL_BUFFER_MS = 60 * 60 * 1000;
 const IMMUTABLE_ID_PREFER_HEADER = 'IdType="ImmutableId"';
@@ -678,6 +723,12 @@ const attachmentToGraph = (attachment: Attachment): Record<string, unknown> => {
   };
 };
 
+const angleBracketedMessageId = (messageId: string): string =>
+  `<${messageId.trim().replace(/^</, "").replace(/>$/, "")}>`;
+
+const escapeODataStringLiteral = (value: string): string =>
+  value.replace(/'/g, "''");
+
 const readJsonResponse = async (response: Response): Promise<unknown> => {
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("application/json")) return response.json();
@@ -1029,24 +1080,7 @@ const notificationResourcePath = (
   return messageId ? `me/messages/${encodeURIComponent(messageId)}` : undefined;
 };
 
-const graphMessageUrl = (graphBase: string, resourcePath: string): string => {
-  const base =
-    resourcePath.startsWith("http://") || resourcePath.startsWith("https://")
-      ? resourcePath
-      : `${graphBase}/${resourcePath}`;
-  const url = new URL(base);
-  const graphBaseUrl = new URL(`${graphBase}/`);
-  if (
-    url.origin !== graphBaseUrl.origin ||
-    !url.pathname.startsWith(graphBaseUrl.pathname)
-  ) {
-    throw new EmailKitError(
-      "Invalid Microsoft Graph message resource URL",
-      PROVIDER,
-      "INVALID_WEBHOOK_RESOURCE",
-      400,
-    );
-  }
+const applyGraphMessageSelection = (url: URL): void => {
   url.searchParams.set(
     "$select",
     [
@@ -1071,6 +1105,27 @@ const graphMessageUrl = (graphBase: string, resourcePath: string): string => {
     "$expand",
     "attachments($select=id,name,contentType,size,isInline)",
   );
+};
+
+const graphMessageUrl = (graphBase: string, resourcePath: string): string => {
+  const base =
+    resourcePath.startsWith("http://") || resourcePath.startsWith("https://")
+      ? resourcePath
+      : `${graphBase}/${resourcePath}`;
+  const url = new URL(base);
+  const graphBaseUrl = new URL(`${graphBase}/`);
+  if (
+    url.origin !== graphBaseUrl.origin ||
+    !url.pathname.startsWith(graphBaseUrl.pathname)
+  ) {
+    throw new EmailKitError(
+      "Invalid Microsoft Graph message resource URL",
+      PROVIDER,
+      "INVALID_WEBHOOK_RESOURCE",
+      400,
+    );
+  }
+  applyGraphMessageSelection(url);
   return url.toString();
 };
 
@@ -1083,6 +1138,18 @@ const resolveGraphUrl = (
   const url = /^https?:\/\//i.test(value)
     ? new URL(value)
     : new URL(value.replace(/^\/+/, ""), `${graphBase}/`);
+  const graphBaseUrl = new URL(`${graphBase}/`);
+  if (
+    url.origin !== graphBaseUrl.origin ||
+    !url.pathname.startsWith(graphBaseUrl.pathname)
+  ) {
+    throw new EmailKitError(
+      "Invalid Microsoft Graph providerFetch URL",
+      PROVIDER,
+      "INVALID_PROVIDER_FETCH_URL",
+      400,
+    );
+  }
 
   if (init?.searchParams) {
     const params =
@@ -1117,9 +1184,53 @@ const normalizeHeaders = (
   return normalized;
 };
 
+const addNormalizedMailboxEmail = (
+  emails: Set<string>,
+  value: unknown,
+): void => {
+  if (typeof value === "string" && value.trim()) {
+    emails.add(value.trim().toLowerCase());
+  }
+};
+
+const normalizedMailboxEmails = (input: MailboxSyncInput): Set<string> => {
+  const emails = new Set<string>();
+  addNormalizedMailboxEmail(emails, input.email);
+
+  if (
+    input.mailbox &&
+    typeof input.mailbox === "object" &&
+    !Array.isArray(input.mailbox)
+  ) {
+    addNormalizedMailboxEmail(emails, input.mailbox.email);
+    const raw = "raw" in input.mailbox ? input.mailbox.raw : undefined;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const user = (raw as { user?: unknown }).user;
+      if (user && typeof user === "object" && !Array.isArray(user)) {
+        addNormalizedMailboxEmail(emails, (user as { mail?: unknown }).mail);
+        addNormalizedMailboxEmail(
+          emails,
+          (user as { userPrincipalName?: unknown }).userPrincipalName,
+        );
+      }
+    }
+  }
+
+  return emails;
+};
+
+const isMessageFromMailbox = (
+  message: GraphMessage,
+  mailboxEmails: Set<string>,
+): boolean => {
+  if (mailboxEmails.size === 0) return false;
+  const from = graphAddressToEmailAddress(message.from)?.email;
+  return typeof from === "string" && mailboxEmails.has(from.toLowerCase());
+};
+
 const transformGraphMessage = (
   message: GraphMessage,
-  notification: GraphChangeNotification,
+  notification: GraphChangeNotification | undefined,
   messageUrl: string,
   request?: WebhookRequest,
 ): InboundEmailEvent => {
@@ -1153,7 +1264,7 @@ const transformGraphMessage = (
           : {}),
         provider: {
           outlook: {
-            notification,
+            ...(notification ? { notification } : {}),
             ...(request?.query ? { query: request.query } : {}),
           },
         },
@@ -1162,11 +1273,14 @@ const transformGraphMessage = (
 
   return {
     schemaVersion: "1",
-    eventId:
-      notification.subscriptionId && message.id
+    eventId: notification
+      ? notification.subscriptionId && message.id
         ? `${notification.subscriptionId}:${message.id}:${
             notification.changeType || "updated"
           }`
+        : undefined
+      : message.id
+        ? `sync:${message.id}`
         : undefined,
     messageId: message.internetMessageId || message.id || "",
     providerId: message.id,
@@ -1187,7 +1301,7 @@ const transformGraphMessage = (
     headers,
     timestamp: new Date(timestamp),
     raw: {
-      notification,
+      ...(notification ? { notification } : {}),
       message,
     },
   };
@@ -1207,9 +1321,16 @@ const requestIdFrom = (response: Response): string | undefined =>
   response.headers.get("client-request-id") ||
   undefined;
 
-export const OutlookDriver = <const TId extends string = "outlook">(
-  config: OutlookDriverConfig<TId>,
-): EmailDriver<OutlookDriverConfig<TId>, typeof OUTLOOK_CAPABILITIES, TId> => {
+export const OutlookDriver = <
+  const TId extends string = "outlook",
+  const TSendEmailMode extends OutlookSendEmailMode = "sendMail",
+>(
+  config: OutlookDriverConfig<TId, TSendEmailMode>,
+): EmailDriver<
+  OutlookDriverConfig<TId, TSendEmailMode>,
+  OutlookCapabilitiesForSendMode<TSendEmailMode>,
+  TId
+> => {
   const driverId = (config.id || "outlook") as TId;
   const tenant = encodeURIComponent(config.tenant || "common");
   const authBase = normalizeBaseUrl(
@@ -1220,6 +1341,13 @@ export const OutlookDriver = <const TId extends string = "outlook">(
   );
   const configuredSendEmailMode =
     resolveSendEmailMode(config.sendEmailMode, "sendEmailMode") || "sendMail";
+  // Runtime mirror of OutlookCapabilitiesForSendMode<TSendEmailMode>: only a
+  // draft-configured driver can thread replies natively.
+  const capabilities = (
+    configuredSendEmailMode === "draft"
+      ? OUTLOOK_DRAFT_CAPABILITIES
+      : OUTLOOK_CAPABILITIES
+  ) as OutlookCapabilitiesForSendMode<TSendEmailMode>;
   const scopes =
     config.scopes && config.scopes.length > 0 ? config.scopes : DEFAULT_SCOPES;
   const mailboxScopes = scopesForMailboxConnect(scopes, config);
@@ -1272,6 +1400,76 @@ export const OutlookDriver = <const TId extends string = "outlook">(
     });
     const token = await fetchToken(form, signal);
     return toAuth(token, auth);
+  };
+
+  const lookupNativeReplySource = async (
+    authorization: string,
+    replyMessageId: string,
+    signal?: AbortSignal,
+  ): Promise<{ sourceId?: string; raw: unknown }> => {
+    const internetMessageId = angleBracketedMessageId(replyMessageId);
+    const filter = `internetMessageId eq '${escapeODataStringLiteral(
+      internetMessageId,
+    )}'`;
+    const url = `${graphBase}/me/messages?$filter=${encodeURIComponent(
+      filter,
+    )}&$select=id,internetMessageId`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        Authorization: authorization,
+        Accept: "application/json",
+        Prefer: IMMUTABLE_ID_PREFER_HEADER,
+      },
+      signal,
+    });
+    const body = await readJsonResponse(response);
+    if (!response.ok) {
+      throw new EmailKitError(
+        microsoftErrorMessage(
+          body,
+          "Microsoft Graph reply source message lookup failed",
+        ),
+        PROVIDER,
+        undefined,
+        response.status,
+        undefined,
+        body,
+      );
+    }
+
+    // The internetMessageId filter is known to return stale or unrelated
+    // hits, so only trust a result whose internetMessageId matches exactly.
+    const value =
+      typeof body === "object" && body !== null
+        ? (body as { value?: unknown }).value
+        : undefined;
+    const match = Array.isArray(value)
+      ? (value as GraphMessage[]).find(
+          (candidate) =>
+            typeof candidate?.id === "string" &&
+            candidate.internetMessageId === internetMessageId,
+        )
+      : undefined;
+    return { sourceId: match?.id, raw: body };
+  };
+
+  const deleteDraftMessage = async (
+    authorization: string,
+    draftId: string,
+  ): Promise<void> => {
+    try {
+      await fetch(`${graphBase}/me/messages/${encodeURIComponent(draftId)}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: authorization,
+          Prefer: IMMUTABLE_ID_PREFER_HEADER,
+        },
+      });
+    } catch {
+      // Best-effort cleanup; the caller rethrows the original send error.
+    }
   };
 
   const createInboundSubscription = async (
@@ -1385,19 +1583,18 @@ export const OutlookDriver = <const TId extends string = "outlook">(
     };
   };
 
-  const resolveMailboxWebhookAuth = async (
-    input:
-      | MailboxWebhookSetupInput
-      | MailboxWebhookRefreshInput
-      | MailboxWebhookDeleteInput,
+  const resolveMailboxOperationAuth = async (
+    operation: string,
+    input: { auth?: unknown; mailbox?: MailboxIdentity | Mailbox },
     options?: EmailDriverOperationOptions,
+    signal?: AbortSignal,
   ): Promise<OutlookMailboxAuth> => {
     const inputAuth = isOutlookAuth(input.auth) ? input.auth : undefined;
     const optionsAuth = isOutlookAuth(options?.auth) ? options.auth : undefined;
     let auth = inputAuth || optionsAuth;
     if (!auth) {
       throw new EmailKitError(
-        "Outlook mailbox webhook operation requires mailbox auth with an accessToken",
+        `Outlook ${operation} requires mailbox auth with an accessToken`,
         PROVIDER,
         "MISSING_AUTH",
       );
@@ -1408,7 +1605,7 @@ export const OutlookDriver = <const TId extends string = "outlook">(
       auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
     ) {
       const previousAuth = auth;
-      auth = await refreshAuth(auth);
+      auth = await refreshAuth(auth, signal);
       await options?.onAuthUpdated?.({
         auth,
         previousAuth,
@@ -1595,7 +1792,11 @@ export const OutlookDriver = <const TId extends string = "outlook">(
     input: MailboxWebhookSetupInput,
     options?: EmailDriverOperationOptions,
   ): Promise<MailboxWebhookSetupResult> => {
-    const auth = await resolveMailboxWebhookAuth(input, options);
+    const auth = await resolveMailboxOperationAuth(
+      "mailbox webhook operation",
+      input,
+      options,
+    );
     const events = webhookEvents(input.events);
     const url = resolveWebhookSetupUrl(input);
     const inboundSubscription = await createInboundSubscription(auth, {
@@ -1643,10 +1844,12 @@ export const OutlookDriver = <const TId extends string = "outlook">(
   return {
     id: driverId,
     name: "outlook",
-    capabilities: OUTLOOK_CAPABILITIES,
+    capabilities,
 
     sendEmail: async (
-      message: EmailMessage<typeof OUTLOOK_CAPABILITIES>,
+      // The implementation accepts the widest (draft-mode) message shape; the
+      // factory return type narrows reply.messageId away for sendMail mode.
+      message: EmailMessage<typeof OUTLOOK_DRAFT_CAPABILITIES>,
       options?: SendEmailOptions,
     ): Promise<SendEmailResult> => {
       if (!isOutlookAuth(options?.auth)) {
@@ -1730,16 +1933,14 @@ export const OutlookDriver = <const TId extends string = "outlook">(
 
       const reply = resolveMessageReplyContext(message);
       const unsupportedReplyFields = [
-        ...(reply.messageId ? ["reply.messageId"] : []),
         ...(reply.references?.length ? ["reply.references"] : []),
         ...(reply.threadId ? ["reply.threadId"] : []),
-        ...(reply.isReply ? ["reply.isReply"] : []),
       ];
       if (unsupportedReplyFields.length > 0) {
         throw new EmailKitError(
           `Outlook sendEmail does not support reply threading fields: ${unsupportedReplyFields.join(
             ", ",
-          )}. Use reply.addresses only for Reply-To handling.`,
+          )}. Microsoft Graph derives the reference chain itself; use reply.messageId for native reply threading in draft send mode.`,
           PROVIDER,
           "NOT_SUPPORTED",
         );
@@ -1780,15 +1981,36 @@ export const OutlookDriver = <const TId extends string = "outlook">(
       if (internetMessageHeaders.length) {
         graphMessage.internetMessageHeaders = internetMessageHeaders;
       }
-      if (message.attachments?.length) {
-        graphMessage.attachments = message.attachments.map(attachmentToGraph);
-      }
+      const graphAttachments = message.attachments?.length
+        ? message.attachments.map(attachmentToGraph)
+        : undefined;
+      if (graphAttachments) graphMessage.attachments = graphAttachments;
 
       const sendEmailMode =
         resolveSendEmailMode(
           message.provider?.sendEmailMode,
           "message.provider.sendEmailMode",
         ) || configuredSendEmailMode;
+
+      if (reply.messageId && sendEmailMode !== "draft") {
+        throw new EmailKitError(
+          'Outlook native reply threading via reply.messageId requires draft send mode. Configure sendEmailMode: "draft" (Mail.ReadWrite) to send threaded replies.',
+          PROVIDER,
+          "NOT_SUPPORTED",
+        );
+      }
+
+      // Graph createReply only documents comment/message.body for its JSON
+      // message parameter; internetMessageHeaders are only documented as
+      // creation-writable on plain POST /messages and are rejected on PATCH.
+      // Refuse the combination instead of risking a 400 or a silent drop.
+      if (reply.messageId && internetMessageHeaders.length) {
+        throw new EmailKitError(
+          "Outlook cannot combine custom headers with native reply threading: Microsoft Graph createReply does not accept internetMessageHeaders. Send without reply.messageId or without headers.",
+          PROVIDER,
+          "NOT_SUPPORTED",
+        );
+      }
 
       if (
         sendEmailMode === "draft" &&
@@ -1802,22 +2024,43 @@ export const OutlookDriver = <const TId extends string = "outlook">(
       }
 
       if (sendEmailMode === "draft") {
-        const createDraftResponse = await fetch(`${graphBase}/me/messages`, {
-          method: "POST",
-          headers: {
-            Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
-            "Content-Type": "application/json",
-            Prefer: IMMUTABLE_ID_PREFER_HEADER,
+        const authorization = `${auth.tokenType || "Bearer"} ${auth.accessToken}`;
+        const replySource = reply.messageId
+          ? await lookupNativeReplySource(
+              authorization,
+              reply.messageId,
+              options?.signal,
+            )
+          : undefined;
+        const replySourceId = replySource?.sourceId;
+        const replyThreading: SendEmailResult["replyThreading"] =
+          reply.messageId ? (replySourceId ? "applied" : "skipped") : undefined;
+
+        const createDraftResponse = await fetch(
+          replySourceId
+            ? `${graphBase}/me/messages/${encodeURIComponent(
+                replySourceId,
+              )}/createReply`
+            : `${graphBase}/me/messages`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: authorization,
+              "Content-Type": "application/json",
+              Prefer: IMMUTABLE_ID_PREFER_HEADER,
+            },
+            ...(replySourceId ? {} : { body: JSON.stringify(graphMessage) }),
+            signal: options?.signal,
           },
-          body: JSON.stringify(graphMessage),
-          signal: options?.signal,
-        });
+        );
         const createDraftBody = await readJsonResponse(createDraftResponse);
         if (!createDraftResponse.ok) {
           throw new EmailKitError(
             microsoftErrorMessage(
               createDraftBody,
-              "Microsoft Graph create draft failed",
+              replySourceId
+                ? "Microsoft Graph create reply draft failed"
+                : "Microsoft Graph create draft failed",
             ),
             PROVIDER,
             undefined,
@@ -1829,7 +2072,7 @@ export const OutlookDriver = <const TId extends string = "outlook">(
 
         const draft =
           typeof createDraftBody === "object" && createDraftBody !== null
-            ? (createDraftBody as { id?: unknown })
+            ? (createDraftBody as { id?: unknown; conversationId?: unknown })
             : undefined;
         const draftId = typeof draft?.id === "string" ? draft.id : undefined;
         if (!draftId) {
@@ -1842,52 +2085,142 @@ export const OutlookDriver = <const TId extends string = "outlook">(
             createDraftBody,
           );
         }
+        const threadId =
+          typeof draft?.conversationId === "string"
+            ? draft.conversationId
+            : undefined;
 
-        const sendDraftResponse = await fetch(
-          `${graphBase}/me/messages/${encodeURIComponent(draftId)}/send`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `${auth.tokenType || "Bearer"} ${
-                auth.accessToken
-              }`,
-              Prefer: IMMUTABLE_ID_PREFER_HEADER,
+        // Draft cleanup must stay limited to failures that happen strictly
+        // before the send attempt: once /send has been issued, an ambiguous
+        // failure (timeout, abort, 5xx) may still have delivered the message,
+        // and deleting the draft id would remove the Sent Items copy.
+        let sendAttempted = false;
+        try {
+          let updateDraftBody: unknown;
+          if (replySourceId) {
+            const { attachments: _inlineAttachments, ...replyDraftMessage } =
+              graphMessage;
+            const updateDraftResponse = await fetch(
+              `${graphBase}/me/messages/${encodeURIComponent(draftId)}`,
+              {
+                method: "PATCH",
+                headers: {
+                  Authorization: authorization,
+                  "Content-Type": "application/json",
+                  Prefer: IMMUTABLE_ID_PREFER_HEADER,
+                },
+                body: JSON.stringify(replyDraftMessage),
+                signal: options?.signal,
+              },
+            );
+            updateDraftBody = await readJsonResponse(updateDraftResponse);
+            if (!updateDraftResponse.ok) {
+              throw new EmailKitError(
+                microsoftErrorMessage(
+                  updateDraftBody,
+                  "Microsoft Graph update reply draft failed",
+                ),
+                PROVIDER,
+                undefined,
+                updateDraftResponse.status,
+                undefined,
+                updateDraftBody,
+              );
+            }
+
+            // Graph message PATCH does not accept an attachments property, so
+            // reply drafts upload each attachment individually.
+            for (const attachment of graphAttachments || []) {
+              const attachmentResponse = await fetch(
+                `${graphBase}/me/messages/${encodeURIComponent(
+                  draftId,
+                )}/attachments`,
+                {
+                  method: "POST",
+                  headers: {
+                    Authorization: authorization,
+                    "Content-Type": "application/json",
+                    Prefer: IMMUTABLE_ID_PREFER_HEADER,
+                  },
+                  body: JSON.stringify(attachment),
+                  signal: options?.signal,
+                },
+              );
+              const attachmentBody = await readJsonResponse(attachmentResponse);
+              if (!attachmentResponse.ok) {
+                throw new EmailKitError(
+                  microsoftErrorMessage(
+                    attachmentBody,
+                    "Microsoft Graph reply draft attachment upload failed",
+                  ),
+                  PROVIDER,
+                  undefined,
+                  attachmentResponse.status,
+                  undefined,
+                  attachmentBody,
+                );
+              }
+            }
+          }
+
+          sendAttempted = true;
+          const sendDraftResponse = await fetch(
+            `${graphBase}/me/messages/${encodeURIComponent(draftId)}/send`,
+            {
+              method: "POST",
+              headers: {
+                Authorization: authorization,
+                Prefer: IMMUTABLE_ID_PREFER_HEADER,
+              },
+              signal: options?.signal,
             },
-            signal: options?.signal,
-          },
-        );
-        const sendDraftBody = await readJsonResponse(sendDraftResponse);
-        if (!sendDraftResponse.ok) {
-          throw new EmailKitError(
-            microsoftErrorMessage(
-              sendDraftBody,
-              "Microsoft Graph send draft failed",
-            ),
-            PROVIDER,
-            undefined,
-            sendDraftResponse.status,
-            undefined,
-            sendDraftBody,
           );
-        }
+          const sendDraftBody = await readJsonResponse(sendDraftResponse);
+          if (!sendDraftResponse.ok) {
+            throw new EmailKitError(
+              microsoftErrorMessage(
+                sendDraftBody,
+                "Microsoft Graph send draft failed",
+              ),
+              PROVIDER,
+              undefined,
+              sendDraftResponse.status,
+              undefined,
+              sendDraftBody,
+            );
+          }
 
-        const sendRequestId =
-          requestIdFrom(sendDraftResponse) ||
-          requestIdFrom(createDraftResponse);
-        const result: OutlookSendEmailResult = {
-          messageId: draftId,
-          provider: driverId,
-          requestId: sendRequestId,
-          receiptId: sendRequestId,
-          providerId: draftId,
-          raw: {
-            skippedHeaders: skippedHeaders.length ? skippedHeaders : undefined,
-            messageIdKind: "graphMessageId",
-            createDraft: createDraftBody,
-            sendDraft: sendDraftBody,
-          },
-        };
-        return result;
+          const sendRequestId =
+            requestIdFrom(sendDraftResponse) ||
+            requestIdFrom(createDraftResponse);
+          const result: OutlookSendEmailResult = {
+            messageId: draftId,
+            provider: driverId,
+            requestId: sendRequestId,
+            receiptId: sendRequestId,
+            providerId: draftId,
+            ...(threadId ? { threadId } : {}),
+            ...(replyThreading ? { replyThreading } : {}),
+            raw: {
+              skippedHeaders: skippedHeaders.length
+                ? skippedHeaders
+                : undefined,
+              messageIdKind: "graphMessageId",
+              ...(replySource ? { replySourceLookup: replySource.raw } : {}),
+              createDraft: createDraftBody,
+              ...(updateDraftBody !== undefined
+                ? { updateDraft: updateDraftBody }
+                : {}),
+              sendDraft: sendDraftBody,
+            },
+          };
+          return result;
+        } catch (error) {
+          if (!sendAttempted) {
+            await deleteDraftMessage(authorization, draftId);
+          }
+          throw error;
+        }
       }
 
       const requestBody: Record<string, unknown> = {
@@ -2264,7 +2597,11 @@ export const OutlookDriver = <const TId extends string = "outlook">(
           input: MailboxWebhookRefreshInput,
           options?: EmailDriverOperationOptions,
         ): Promise<MailboxWebhookRefreshResult> => {
-          const auth = await resolveMailboxWebhookAuth(input, options);
+          const auth = await resolveMailboxOperationAuth(
+            "mailbox webhook operation",
+            input,
+            options,
+          );
           const id = webhookSubscriptionId(input);
           const inboundSubscription = await refreshInboundSubscription(
             auth,
@@ -2301,7 +2638,11 @@ export const OutlookDriver = <const TId extends string = "outlook">(
           input: MailboxWebhookDeleteInput,
           options?: EmailDriverOperationOptions,
         ): Promise<MailboxWebhookDeleteResult> => {
-          const auth = await resolveMailboxWebhookAuth(input, options);
+          const auth = await resolveMailboxOperationAuth(
+            "mailbox webhook operation",
+            input,
+            options,
+          );
           const id = webhookSubscriptionId(input);
           const result = await deleteInboundSubscription(auth, id);
           const existingWebhook = input.webhook;
@@ -2330,6 +2671,78 @@ export const OutlookDriver = <const TId extends string = "outlook">(
             raw: result.raw,
           };
         },
+      },
+    },
+
+    sync: {
+      mailbox: async function* (
+        input: MailboxSyncInput,
+        options?: EmailDriverOperationOptions,
+      ): SyncStream {
+        const auth = await resolveMailboxOperationAuth(
+          "mailbox sync",
+          input,
+          options,
+          input.signal,
+        );
+        const until = input.until || new Date();
+        const mailboxEmails = normalizedMailboxEmails(input);
+        const resource = config.inboundResource || DEFAULT_INBOUND_RESOURCE;
+        const listUrl = new URL(`${graphBase}/${resource}`);
+        listUrl.searchParams.set(
+          "$filter",
+          `receivedDateTime ge ${input.since.toISOString()} and receivedDateTime lt ${until.toISOString()}`,
+        );
+        listUrl.searchParams.set("$orderby", "receivedDateTime asc");
+        listUrl.searchParams.set("$top", "50");
+        applyGraphMessageSelection(listUrl);
+
+        let nextUrl: string | undefined = listUrl.toString();
+        while (nextUrl) {
+          const response = await fetch(nextUrl, {
+            headers: {
+              Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+              Accept: "application/json",
+            },
+            signal: input.signal,
+          });
+          const body = await readJsonResponse(response);
+          if (!response.ok) {
+            throw new EmailKitError(
+              microsoftErrorMessage(
+                body,
+                "Microsoft Graph message listing failed",
+              ),
+              PROVIDER,
+              undefined,
+              response.status,
+              undefined,
+              body,
+            );
+          }
+
+          const page = body as {
+            value?: GraphMessage[];
+            "@odata.nextLink"?: string;
+          };
+          for (const message of page.value || []) {
+            if (isMessageFromMailbox(message, mailboxEmails)) continue;
+            yield {
+              type: "inbound",
+              data: transformGraphMessage(
+                message,
+                undefined,
+                `${graphBase}/${resource}/${encodeURIComponent(
+                  message.id || "",
+                )}`,
+              ),
+            };
+          }
+
+          nextUrl = page["@odata.nextLink"];
+        }
+
+        return { syncedFrom: input.since };
       },
     },
   };

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
-import { EmailKit, EmailKitError } from "../src";
+import { EmailKit, EmailKitError, EmailKitSyncError } from "../src";
 import type {
   Domain,
   DomainOperationInput,
@@ -590,6 +590,45 @@ describe("EmailKit client helpers", () => {
         addresses: [{ email: "reply@example.com" }],
         messageId: "<previous@example.com>",
         references: ["<root@example.com>", "<previous@example.com>"],
+        isReply: true,
+      },
+    });
+  });
+
+  it("keeps reply.messageId and reply.isReply for nativeReplyThreading drivers", async () => {
+    const sendEmail = vi.fn().mockResolvedValue({
+      messageId: "msg_123",
+      provider: "test-provider",
+    });
+    const { client } = createTestClient({
+      capabilities: {
+        replyTo: true,
+        nativeReplyThreading: true,
+      },
+      sendEmail,
+    });
+
+    await client.sendEmail({
+      from: { email: "sender@example.com" },
+      to: { email: "recipient@example.com" },
+      subject: "Native reply",
+      reply: {
+        addresses: [{ email: "reply@example.com" }],
+        messageId: "<previous@example.com>",
+        references: ["<root@example.com>", "<previous@example.com>"],
+        threadId: "thread_123",
+        isReply: true,
+      },
+    } as any);
+
+    expect(sendEmail.mock.calls[0]![0]).toEqual({
+      from: { email: "sender@example.com" },
+      to: { email: "recipient@example.com" },
+      subject: "Native reply",
+      reply: {
+        addresses: [{ email: "reply@example.com" }],
+        messageId: "<previous@example.com>",
+        isReply: true,
       },
     });
   });
@@ -2678,5 +2717,340 @@ describe("EmailKit client helpers", () => {
     expect(() =>
       EmailKit({ emailDrivers: [implementedUndeclared] }),
     ).toThrowError(/driver\.webhooks\.account\.setup is implemented/);
+  });
+});
+
+describe("EmailKit sync", () => {
+  const makeInboundEvent = (messageId: string, timestamp: Date) => ({
+    type: "inbound" as const,
+    data: {
+      messageId,
+      from: { email: "sender@example.com" },
+      to: [{ email: "recipient@example.com" }],
+      reply: {},
+      subject: `Subject ${messageId}`,
+      headers: {},
+      timestamp,
+      raw: { providerMessageId: messageId },
+    },
+  });
+
+  const createMailboxSyncDriver = <const TId extends string>(
+    id: TId,
+    mailbox: NonNullable<EmailDriver["sync"]>["mailbox"],
+  ): EmailDriver<any, { sync: { mailbox: true } }, TId> => ({
+    ...createPlainDriver(id),
+    capabilities: { sync: { mailbox: true } },
+    sync: { mailbox },
+  });
+
+  it("replays driver events through email hooks oldest-first with sync context", async () => {
+    const onInbound = vi.fn();
+    const onAll = vi.fn();
+    const first = makeInboundEvent("msg_1", new Date("2026-06-01T00:00:00Z"));
+    const second = makeInboundEvent("msg_2", new Date("2026-06-02T00:00:00Z"));
+    const syncedFrom = new Date("2026-05-30T00:00:00Z");
+    const syncMailbox = vi.fn(async function* () {
+      yield first;
+      yield second;
+      return { syncedFrom };
+    });
+    const client = EmailKit({
+      emailDrivers: [createMailboxSyncDriver("sync-driver", syncMailbox)],
+      hooks: { email: { onInbound, onAll } },
+    });
+
+    const result = await client.mailboxes.sync({
+      email: "support@example.com",
+      since: new Date("2026-06-01T00:00:00Z"),
+      context: { tenantId: "tenant_123" },
+    });
+
+    expect(result).toEqual({ dispatched: 2, syncedFrom });
+    expect(onInbound).toHaveBeenCalledTimes(2);
+    expect(onInbound.mock.calls[0]![0]).toMatchObject({
+      emailDriver: "sync-driver",
+      messageId: "msg_1",
+    });
+    expect(onInbound.mock.calls[1]![0]).toMatchObject({
+      messageId: "msg_2",
+    });
+    expect(onAll).toHaveBeenCalledTimes(2);
+    expect(onAll.mock.calls[0]![0]).toMatchObject({
+      emailDriver: "sync-driver",
+      type: "inbound",
+      raw: { providerMessageId: "msg_1" },
+      context: { tenantId: "tenant_123" },
+    });
+    expect(syncMailbox).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "support@example.com" }),
+      expect.objectContaining({
+        context: { tenantId: "tenant_123" },
+        onAuthUpdated: expect.any(Function),
+      }),
+    );
+  });
+
+  it("routes replayed lifecycle events through webhook hooks", async () => {
+    const onActionRequired = vi.fn();
+    const onWebhookAll = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [
+        createMailboxSyncDriver("sync-driver", async function* () {
+          yield {
+            type: "webhook.lifecycle" as const,
+            data: {
+              emailDriver: "sync-driver",
+              action: "action_required" as const,
+              source: "provider" as const,
+              reason: "expiring" as const,
+              scope: "mailbox" as const,
+            },
+          };
+          return { syncedFrom: new Date("2026-06-01T00:00:00Z") };
+        }),
+      ],
+      hooks: { webhook: { onActionRequired, onAll: onWebhookAll } },
+    });
+
+    const result = await client.mailboxes.sync({
+      email: "support@example.com",
+      since: new Date("2026-06-01T00:00:00Z"),
+    });
+
+    expect(result.dispatched).toBe(1);
+    expect(onWebhookAll).toHaveBeenCalledTimes(1);
+    expect(onActionRequired).toHaveBeenCalledWith(
+      expect.objectContaining({
+        emailDriver: "sync-driver",
+        action: "action_required",
+        source: "provider",
+        reason: "expiring",
+        scope: "mailbox",
+      }),
+    );
+  });
+
+  it("wraps user hook failures in EmailKitSyncError with replay progress", async () => {
+    const hookError = new Error("persist failed");
+    const onInbound = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(hookError);
+    const firstTimestamp = new Date("2026-06-01T00:00:00Z");
+    const client = EmailKit({
+      emailDrivers: [
+        createMailboxSyncDriver("sync-driver", async function* () {
+          yield makeInboundEvent("msg_1", firstTimestamp);
+          yield makeInboundEvent("msg_2", new Date("2026-06-02T00:00:00Z"));
+          return { syncedFrom: new Date("2026-05-30T00:00:00Z") };
+        }),
+      ],
+      hooks: { email: { onInbound } },
+    });
+
+    const error = await client.mailboxes
+      .sync({
+        email: "support@example.com",
+        since: new Date("2026-06-01T00:00:00Z"),
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(EmailKitSyncError);
+    expect(error).toMatchObject({
+      code: "SYNC_FAILED",
+      provider: "sync-driver",
+      dispatched: 1,
+      lastEventTimestamp: firstTimestamp,
+      cause: hookError,
+    });
+  });
+
+  it("finalizes the driver stream when a sync hook fails", async () => {
+    const hookError = new Error("persist failed");
+    let finalized = false;
+    const client = EmailKit({
+      emailDrivers: [
+        createMailboxSyncDriver("sync-driver", async function* () {
+          try {
+            yield makeInboundEvent("msg_1", new Date("2026-06-01T00:00:00Z"));
+            yield makeInboundEvent("msg_2", new Date("2026-06-02T00:00:00Z"));
+          } finally {
+            finalized = true;
+          }
+          return { syncedFrom: new Date("2026-05-30T00:00:00Z") };
+        }),
+      ],
+      hooks: {
+        email: {
+          onInbound: vi
+            .fn()
+            .mockResolvedValueOnce(undefined)
+            .mockRejectedValueOnce(hookError),
+        },
+      },
+    });
+
+    const error = await client.mailboxes
+      .sync({
+        email: "support@example.com",
+        since: new Date("2026-06-01T00:00:00Z"),
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(EmailKitSyncError);
+    expect(error.cause).toBe(hookError);
+    expect(finalized).toBe(true);
+  });
+
+  it("aborts between events and finalizes the driver stream", async () => {
+    const controller = new AbortController();
+    const onInbound = vi.fn(() => controller.abort());
+    let finalized = false;
+    const client = EmailKit({
+      emailDrivers: [
+        createMailboxSyncDriver("sync-driver", async function* () {
+          try {
+            yield makeInboundEvent("msg_1", new Date("2026-06-01T00:00:00Z"));
+            yield makeInboundEvent("msg_2", new Date("2026-06-02T00:00:00Z"));
+          } finally {
+            finalized = true;
+          }
+          return { syncedFrom: new Date("2026-05-30T00:00:00Z") };
+        }),
+      ],
+      hooks: { email: { onInbound } },
+    });
+
+    const error = await client.mailboxes
+      .sync({
+        email: "support@example.com",
+        since: new Date("2026-06-01T00:00:00Z"),
+        signal: controller.signal,
+      })
+      .catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(EmailKitSyncError);
+    expect(error).toMatchObject({
+      message: "Sync aborted",
+      dispatched: 1,
+      lastEventTimestamp: new Date("2026-06-01T00:00:00Z"),
+    });
+    expect(onInbound).toHaveBeenCalledTimes(1);
+    expect(finalized).toBe(true);
+  });
+
+  it("rejects sync for selected drivers without the capability", async () => {
+    const client = EmailKit({
+      emailDrivers: [
+        createMailboxSyncDriver("sync-driver", async function* () {
+          return { syncedFrom: new Date() };
+        }),
+        createPlainDriver("plain-driver"),
+      ],
+      resolveEmailDriver: () => "sync-driver",
+    });
+
+    await expect(
+      client.mailboxes.sync({
+        email: "support@example.com",
+        since: new Date("2026-06-01T00:00:00Z"),
+        emailDriver: "plain-driver",
+      } as any),
+    ).rejects.toMatchObject({ code: "NOT_SUPPORTED" });
+  });
+
+  it("validates sync scopes against implemented methods", () => {
+    const declaredMissing: EmailDriver<
+      any,
+      { sync: { mailbox: true } },
+      "declared-missing"
+    > = {
+      ...createPlainDriver("declared-missing"),
+      capabilities: { sync: { mailbox: true } },
+      sync: {},
+    };
+    const implementedUndeclared: EmailDriver<any, {}, "implemented-missing"> = {
+      ...createPlainDriver("implemented-missing"),
+      capabilities: {},
+      sync: { mailbox: vi.fn() },
+    };
+
+    expect(() => EmailKit({ emailDrivers: [declaredMissing] })).toThrowError(
+      /sync\.mailbox is declared/,
+    );
+    expect(() =>
+      EmailKit({ emailDrivers: [implementedUndeclared] }),
+    ).toThrowError(/driver\.sync\.mailbox is implemented/);
+  });
+
+  it("exposes top-level sync for account-scope drivers only", async () => {
+    const onInbound = vi.fn();
+    const accountDriver: EmailDriver<
+      any,
+      { sync: { account: true } },
+      "account-sync-driver"
+    > = {
+      ...createPlainDriver("account-sync-driver"),
+      capabilities: { sync: { account: true } },
+      sync: {
+        account: async function* () {
+          yield makeInboundEvent("msg_1", new Date("2026-06-01T00:00:00Z"));
+          return { syncedFrom: new Date("2026-05-30T00:00:00Z") };
+        },
+      },
+    };
+    const client = EmailKit({
+      emailDrivers: [accountDriver],
+      hooks: { email: { onInbound } },
+    });
+    const plainClient = EmailKit({
+      emailDrivers: [createPlainDriver("plain-driver")],
+    });
+
+    const result = await client.sync({
+      since: new Date("2026-06-01T00:00:00Z"),
+    });
+
+    expect(result).toEqual({
+      dispatched: 1,
+      syncedFrom: new Date("2026-05-30T00:00:00Z"),
+    });
+    expect(onInbound).toHaveBeenCalledTimes(1);
+    expect("sync" in plainClient).toBe(false);
+    expect("sync" in plainClient.mailboxes).toBe(false);
+    expect("sync" in plainClient.domains).toBe(false);
+  });
+
+  it("keeps live webhook dispatch unchanged", async () => {
+    const onInbound = vi.fn();
+    const onAll = vi.fn();
+    const driver: EmailDriver<any, {}, "webhook-driver"> = {
+      ...createPlainDriver("webhook-driver"),
+      handleWebhook: vi
+        .fn()
+        .mockResolvedValue(
+          makeInboundEvent("msg_live", new Date("2026-06-01T00:00:00Z")),
+        ),
+    };
+    const client = EmailKit({
+      emailDrivers: [driver],
+      hooks: { email: { onInbound, onAll } },
+    });
+
+    await client.handler()({
+      method: "POST",
+      headers: {},
+      query: {},
+      body: { payload: true },
+    });
+
+    expect(onInbound).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: "msg_live" }),
+    );
+    expect(onAll).toHaveBeenCalledTimes(1);
+    const allEvent = onAll.mock.calls[0]![0];
+    expect(allEvent.raw).toEqual({ payload: true });
+    expect("context" in allEvent).toBe(false);
   });
 });

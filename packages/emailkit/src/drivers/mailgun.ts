@@ -10,6 +10,7 @@ import type {
   EmailDriver,
   EmailDriverConfig,
   SendEmailOptions,
+  SyncStream,
 } from "../driver";
 import type {
   Attachment,
@@ -34,6 +35,7 @@ import type {
   WebhookEventType,
   WebhookInboundOptions,
   Webhook,
+  AccountSyncInput,
   AccountWebhookSetupInput,
   AccountWebhookRefreshInput,
   AccountWebhookDeleteInput,
@@ -46,6 +48,8 @@ import type {
   DomainWebhookSetupResult,
   DomainWebhookRefreshResult,
   DomainWebhookDeleteResult,
+  DomainSyncInput,
+  WebhookDriverEvent,
   WebhookRequest,
   WebhookResponse,
 } from "../types";
@@ -111,6 +115,12 @@ export interface MailgunDriverConfig<TId extends string = "mailgun">
    * Default: true
    */
   autoFetchInboundAttachments?: boolean;
+  /**
+   * How many days of events your Mailgun plan retains. Used as the coverage
+   * floor for `sync` results: a sync never reports `syncedFrom` earlier than
+   * this window. Default: 3, matching Mailgun's documented minimum.
+   */
+  eventsRetentionDays?: number;
 }
 
 /**
@@ -384,6 +394,50 @@ type MailgunStoredMessage = {
 type MailgunStorageLocation = {
   url?: string;
   key?: string;
+};
+
+type MailgunEventData = NonNullable<MailgunWebhookPayload["event-data"]>;
+
+type MailgunEventsPage = {
+  items?: MailgunEventData[];
+  paging?: {
+    next?: string;
+    previous?: string;
+  };
+};
+
+/**
+ * Mailgun retains events for a bounded window. The documented 3-day minimum is
+ * the default conservative retention floor when reporting sync coverage;
+ * override via `eventsRetentionDays` to match a paid plan.
+ */
+const DEFAULT_EVENTS_RETENTION_DAYS = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAILGUN_EVENTS_PAGE_LIMIT = 300;
+
+/**
+ * Honest `syncedFrom` for a completed sync run:
+ * - `since` within the retention floor: the full window was queryable, so
+ *   coverage starts at `since`.
+ * - `since` past retention with events returned: coverage starts at the
+ *   earliest event Mailgun actually returned.
+ * - `since` past retention with zero events: coverage starts at the retention
+ *   floor, or at `until` when the whole window is out of retention.
+ */
+const resolveMailgunSyncedFrom = ({
+  since,
+  until,
+  earliestEvent,
+  retentionFloor,
+}: {
+  since: Date;
+  until: Date;
+  earliestEvent?: Date;
+  retentionFloor: Date;
+}): Date => {
+  if (since.getTime() >= retentionFloor.getTime()) return since;
+  if (earliestEvent) return earliestEvent;
+  return until.getTime() < retentionFloor.getTime() ? until : retentionFloor;
 };
 
 type MailgunAttachmentProviderMetadata = {
@@ -835,11 +889,14 @@ const transformMailgunEvent = async ({
   attachmentHandling = "inline",
   apiKey,
   autoFetchAttachments = true,
+  storedMessage: prefetchedStoredMessage,
 }: {
   payload: MailgunWebhookPayload;
   attachmentHandling?: InboundAttachmentHandling;
   apiKey?: string;
   autoFetchAttachments?: boolean;
+  /** Already-fetched stored message, skips the storage URL fetch. */
+  storedMessage?: MailgunStoredMessage | null;
 }): Promise<OutboundEmailEvent | InboundEmailEvent> => {
   const eventData = payload["event-data"] || payload;
   const event = eventData.event || payload.event || "unknown";
@@ -958,9 +1015,11 @@ const transformMailgunEvent = async ({
       (payload["stripped-html"] as string | undefined) ||
       (messageHeaders["stripped-html"] as string | undefined) ||
       undefined;
-    let storedMessage: MailgunStoredMessage | null = null;
+    let storedMessage: MailgunStoredMessage | null =
+      prefetchedStoredMessage ?? null;
 
     if (
+      !storedMessage &&
       storageUrl &&
       apiKey &&
       (!bodyPlain || !bodyHtml || !strippedText || !strippedHtml)
@@ -2087,6 +2146,7 @@ export const MAILGUN_CAPABILITIES = {
     identifier: "domain" as const,
   },
   webhooks: { account: true, domain: true },
+  sync: { account: true, domain: true },
   publicRoutes: { webhook: true },
   requiresSecret: false,
 } as const satisfies DriverCapabilities;
@@ -2117,7 +2177,347 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
     },
   });
 
-  return {
+  const fetchSyncStoredMessage = async (
+    storageUrl: string,
+    signal?: AbortSignal,
+  ): Promise<MailgunStoredMessage | null> => {
+    const res = await fetch(storageUrl, {
+      headers: { Authorization: auth },
+      signal,
+    });
+    // Stored messages are only retained for a few days; a 404 means the
+    // message is past Mailgun's storage retention and cannot be replayed.
+    if (res.status === 404) return null;
+    const body = await readMailgunApiResponse(res);
+    if (!res.ok) {
+      throwMailgunApiError(
+        body,
+        res.status,
+        `HTTP ${res.status}: Failed to fetch stored message`,
+      );
+    }
+    return body as MailgunStoredMessage;
+  };
+
+  const listDomains = async (
+    opts?: ListDomainsOptions,
+    signal?: AbortSignal,
+  ): Promise<Domain[]> => {
+    const searchParams = new URLSearchParams();
+    if (opts?.limit !== undefined || opts?.pageSize !== undefined) {
+      searchParams.set("limit", String(opts.limit ?? opts.pageSize));
+    }
+    if (opts?.page !== undefined && (opts?.limit || opts?.pageSize)) {
+      const limit = opts.limit ?? opts.pageSize ?? 100;
+      searchParams.set("skip", String(Math.max(0, opts.page - 1) * limit));
+    }
+    if (opts?.status) {
+      const state = opts.status === "verified" ? "active" : opts.status;
+      searchParams.set("state", state);
+    }
+    if (opts?.provider) {
+      for (const [key, value] of Object.entries(opts.provider)) {
+        if (value !== undefined && value !== null) {
+          searchParams.set(key, String(value));
+        }
+      }
+    }
+
+    const query = searchParams.toString();
+    const url = `${baseUrlV4}/domains${query ? `?${query}` : ""}`;
+    const res = await fetch(url, {
+      headers: { Authorization: auth },
+      signal,
+    });
+
+    const contentType = res.headers.get("content-type") || "";
+    const body = contentType.includes("application/json")
+      ? await res.json()
+      : await res.text();
+
+    if (!res.ok) {
+      throw new EmailKitError(
+        typeof (body as any)?.message === "string"
+          ? (body as any).message
+          : `HTTP ${res.status}: Failed to list domains`,
+        "mailgun",
+        undefined,
+        res.status,
+        undefined,
+        body,
+      );
+    }
+
+    const domains = ((body as any)?.items || []) as any[];
+    return domains.map((d) => {
+      const status = mapDomainStatus(d.state);
+      const records = parseDnsRecords(
+        d.sending_dns_records,
+        d.receiving_dns_records,
+      );
+
+      const domain: Domain = {
+        id: d.id || d.name,
+        domain: d.name,
+        status,
+        createdAt: d.created_at ? new Date(d.created_at) : undefined,
+        verification:
+          records.length > 0
+            ? { status, records, checkedAt: undefined }
+            : undefined,
+        raw: d,
+      };
+
+      return domain;
+    });
+  };
+
+  const listAllSyncDomains = async (
+    signal?: AbortSignal,
+  ): Promise<Domain[]> => {
+    const domains: Domain[] = [];
+    const pageSize = 100;
+
+    for (let page = 1; ; page++) {
+      const batch = await listDomains({ limit: pageSize, page }, signal);
+      domains.push(...batch.filter((domain) => domain.domain));
+      if (batch.length < pageSize) break;
+    }
+
+    return domains;
+  };
+
+  /**
+   * Replay events for a domain from the Mailgun Events API, oldest-first.
+   * Outbound tracking events go through the same normalization as webhooks;
+   * `stored` events are hydrated from message storage and replayed as inbound.
+   */
+  const syncDomainEvents = async function* (
+    input: DomainSyncInput,
+  ): SyncStream {
+    const domain = input.domain;
+    if (!domain) {
+      throw new EmailKitError("Mailgun domain sync requires a domain", "mailgun");
+    }
+
+    const now = new Date();
+    const until = input.until ?? now;
+    const retentionFloor = new Date(
+      now.getTime() -
+        (config.eventsRetentionDays ?? DEFAULT_EVENTS_RETENTION_DAYS) * DAY_MS,
+    );
+    let earliestEvent: Date | undefined;
+    let storageFloor: Date | undefined;
+    const seenStoredMessages = new Set<string>();
+
+    const searchParams = new URLSearchParams({
+      begin: String(Math.floor(input.since.getTime() / 1000)),
+      end: String(Math.floor(until.getTime() / 1000)),
+      ascending: "yes",
+      limit: String(MAILGUN_EVENTS_PAGE_LIMIT),
+    });
+    let pageUrl: string | undefined = `${baseUrl}/${encodeURIComponent(
+      domain,
+    )}/events?${searchParams}`;
+
+    while (pageUrl) {
+      const res = await fetch(pageUrl, {
+        headers: { Authorization: auth },
+        signal: input.signal,
+      });
+      const body = await readMailgunApiResponse(res);
+      if (!res.ok) {
+        throwMailgunApiError(
+          body,
+          res.status,
+          `HTTP ${res.status}: Failed to list events`,
+        );
+      }
+
+      const page = body as MailgunEventsPage;
+      const items = Array.isArray(page.items) ? page.items : [];
+      if (items.length === 0) break;
+
+      for (const item of items) {
+        const timestamp =
+          typeof item.timestamp === "number"
+            ? new Date(item.timestamp * 1000)
+            : undefined;
+        // `begin` is floored to whole seconds, so the API can return events
+        // from earlier in the same second as `since`; `until` is exclusive
+        // while Mailgun's `end` bound is not.
+        if (timestamp && timestamp.getTime() < input.since.getTime()) continue;
+        if (timestamp && timestamp.getTime() >= until.getTime()) continue;
+        if (timestamp && (!earliestEvent || timestamp < earliestEvent)) {
+          earliestEvent = timestamp;
+        }
+
+        const payload: MailgunWebhookPayload = {
+          domain,
+          "event-data": item,
+        };
+        if (item.event === "stored") {
+          const storageLocation = resolveMailgunStorageLocation(payload);
+          const storedMessageKey = storageLocation?.key
+            ? `key:${storageLocation.key}`
+            : storageLocation?.url
+              ? `url:${storageLocation.url}`
+              : undefined;
+          if (storedMessageKey) {
+            if (seenStoredMessages.has(storedMessageKey)) continue;
+            seenStoredMessages.add(storedMessageKey);
+          }
+
+          const storageUrl = storageLocation?.url;
+          const storedMessage = storageUrl
+            ? await fetchSyncStoredMessage(storageUrl, input.signal)
+            : null;
+          if (storageUrl && !storedMessage) {
+            // Content past Mailgun's storage retention cannot be replayed;
+            // report the lost coverage through `syncedFrom`.
+            if (timestamp) storageFloor = timestamp;
+            continue;
+          }
+          const data = (await transformMailgunEvent({
+            payload: {
+              ...storedMessage,
+              "event-data": item,
+            } as MailgunWebhookPayload,
+            attachmentHandling: config.inboundAttachmentHandling || "inline",
+            apiKey: config.apiKey,
+            autoFetchAttachments: config.autoFetchInboundAttachments ?? true,
+            storedMessage,
+          })) as InboundEmailEvent;
+          yield {
+            type: "inbound",
+            data:
+              typeof item.id === "string" ? { ...data, eventId: item.id } : data,
+          };
+          continue;
+        }
+
+        const result = await driver.handleWebhook({
+          method: "POST",
+          headers: {},
+          body: payload,
+        });
+        for (const event of Array.isArray(result) ? result : [result]) {
+          yield event;
+        }
+      }
+
+      pageUrl =
+        typeof page.paging?.next === "string" ? page.paging.next : undefined;
+    }
+
+    const syncedFrom = resolveMailgunSyncedFrom({
+      since: input.since,
+      until,
+      earliestEvent,
+      retentionFloor,
+    });
+    return {
+      syncedFrom:
+        storageFloor && storageFloor.getTime() >= syncedFrom.getTime()
+          ? new Date(storageFloor.getTime() + 1)
+          : syncedFrom,
+    };
+  };
+
+  const syncEventTime = (event: WebhookDriverEvent): number => {
+    const timestamp = (event.data as { timestamp?: unknown }).timestamp;
+    if (timestamp instanceof Date) return timestamp.getTime();
+    if (typeof timestamp === "number") return timestamp;
+    if (typeof timestamp === "string") {
+      const parsed = Date.parse(timestamp);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    return Number.MAX_SAFE_INTEGER;
+  };
+
+  const syncAccountEvents = async function* (
+    input: AccountSyncInput,
+  ): SyncStream {
+    const domains = await listAllSyncDomains(input.signal);
+    if (domains.length === 0) {
+      return { syncedFrom: input.since };
+    }
+
+    const streams = domains.map((domain, index) => ({
+      index,
+      stream: syncDomainEvents({ ...input, domain: domain.domain }),
+      head: undefined as WebhookDriverEvent | undefined,
+      syncedFrom: undefined as Date | undefined,
+      done: false,
+    }));
+
+    const advance = async (entry: (typeof streams)[number]) => {
+      const next = await entry.stream.next();
+      if (next.done) {
+        entry.done = true;
+        entry.syncedFrom = next.value.syncedFrom;
+        entry.head = undefined;
+      } else {
+        entry.head = next.value;
+      }
+    };
+
+    try {
+      for (const entry of streams) {
+        await advance(entry);
+      }
+
+      while (true) {
+        let nextEntry: (typeof streams)[number] | undefined;
+        for (const entry of streams) {
+          if (!entry.head) continue;
+          if (
+            !nextEntry ||
+            syncEventTime(entry.head) < syncEventTime(nextEntry.head!) ||
+            (syncEventTime(entry.head) === syncEventTime(nextEntry.head!) &&
+              entry.index < nextEntry.index)
+          ) {
+            nextEntry = entry;
+          }
+        }
+
+        if (!nextEntry?.head) break;
+
+        const event = nextEntry.head;
+        nextEntry.head = undefined;
+        yield event;
+        await advance(nextEntry);
+      }
+    } finally {
+      await Promise.all(
+        streams
+          .filter((entry) => !entry.done)
+          .map(async (entry) => {
+            try {
+              await entry.stream.return({ syncedFrom: input.since });
+            } catch {
+              // Preserve the original sync error when cleanup happens during
+              // an abort or provider failure.
+            }
+          }),
+      );
+    }
+
+    return {
+      syncedFrom: streams.reduce((latest, entry) => {
+        if (entry.syncedFrom && entry.syncedFrom > latest) {
+          return entry.syncedFrom;
+        }
+        return latest;
+      }, input.since),
+    };
+  };
+
+  const driver: EmailDriver<
+    MailgunDriverConfig<TId>,
+    typeof MAILGUN_CAPABILITIES,
+    TId
+  > = {
     id: driverId,
     name: "mailgun",
     capabilities: MAILGUN_CAPABILITIES,
@@ -2610,9 +3010,8 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
       // Mailgun webhook signature verification
       // Documentation: https://documentation.mailgun.com/docs/webhooks#webhook-signing
 
-      // If no webhook signing key is provided, skip verification
       if (!config.webhookSigningKey) {
-        return true;
+        return false;
       }
 
       const payload = request.body as MailgunWebhookPayload;
@@ -2749,6 +3148,11 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
         status: 200,
         body: { success: true },
       };
+    },
+
+    sync: {
+      account: syncAccountEvents,
+      domain: syncDomainEvents,
     },
 
     webhooks: {
@@ -3187,74 +3591,7 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
     },
 
     domains: {
-      list: async (opts?: ListDomainsOptions): Promise<Domain[]> => {
-        const searchParams = new URLSearchParams();
-        if (opts?.limit !== undefined || opts?.pageSize !== undefined) {
-          searchParams.set("limit", String(opts.limit ?? opts.pageSize));
-        }
-        if (opts?.page !== undefined && (opts?.limit || opts?.pageSize)) {
-          const limit = opts.limit ?? opts.pageSize ?? 100;
-          searchParams.set("skip", String(Math.max(0, opts.page - 1) * limit));
-        }
-        if (opts?.status) {
-          const state = opts.status === "verified" ? "active" : opts.status;
-          searchParams.set("state", state);
-        }
-        if (opts?.provider) {
-          for (const [key, value] of Object.entries(opts.provider)) {
-            if (value !== undefined && value !== null) {
-              searchParams.set(key, String(value));
-            }
-          }
-        }
-
-        const query = searchParams.toString();
-        const url = `${baseUrlV4}/domains${query ? `?${query}` : ""}`;
-        const res = await fetch(url, {
-          headers: { Authorization: auth },
-        });
-
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to list domains`,
-            "mailgun",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
-
-        const domains = ((body as any)?.items || []) as any[];
-        return domains.map((d) => {
-          const status = mapDomainStatus(d.state);
-          const records = parseDnsRecords(
-            d.sending_dns_records,
-            d.receiving_dns_records,
-          );
-
-          const domain: Domain = {
-            id: d.id || d.name,
-            domain: d.name,
-            status,
-            createdAt: d.created_at ? new Date(d.created_at) : undefined,
-            verification:
-              records.length > 0
-                ? { status, records, checkedAt: undefined }
-                : undefined,
-            raw: d,
-          };
-
-          return domain;
-        });
-      },
+      list: listDomains,
 
       create: async (input: CreateDomainInput): Promise<Domain> => {
         const formData = new FormData();
@@ -3380,6 +3717,21 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
         idOrName: string,
         patch: UpdateDomainInput,
       ): Promise<Domain> => {
+        if (patch.tracking !== undefined) {
+          throw new EmailKitError(
+            "Mailgun does not support updating normalized domain tracking defaults through this driver. Use provider-specific update options if available.",
+            "mailgun",
+            "NOT_SUPPORTED",
+          );
+        }
+        if (patch.dkimSelector !== undefined) {
+          throw new EmailKitError(
+            "Mailgun does not support updating dkimSelector through this driver.",
+            "mailgun",
+            "NOT_SUPPORTED",
+          );
+        }
+
         const formData = new FormData();
 
         // Add optional parameters from patch
@@ -3519,4 +3871,6 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
       },
     },
   };
+
+  return driver;
 };

@@ -20,6 +20,27 @@ export class EmailKitError extends Error {
 }
 
 /**
+ * Error thrown when a sync run fails after events may already have been
+ * dispatched. Resume by calling sync again with
+ * `since: lastEventTimestamp ?? originalSince` — events are yielded
+ * oldest-first, dispatch is at-least-once, dedup by messageId.
+ */
+export class EmailKitSyncError extends EmailKitError {
+  constructor(
+    message: string,
+    provider: string,
+    /** Number of driver events dispatched through hooks before the failure. */
+    public readonly dispatched: number,
+    /** Timestamp of the last dispatched event, when the driver provided one. */
+    public readonly lastEventTimestamp?: Date,
+    cause?: unknown,
+  ) {
+    super(message, provider, "SYNC_FAILED", undefined, cause);
+    this.name = "EmailKitSyncError";
+  }
+}
+
+/**
  * Email address with optional name
  */
 export interface EmailAddress {
@@ -202,6 +223,18 @@ export interface DriverWebhookCapabilities {
 }
 
 /**
+ * Sync (replay of missed events) scopes supported by drivers.
+ */
+export interface DriverSyncCapabilities {
+  /** Account/provider-level sync */
+  account?: true;
+  /** Mailbox-scoped sync */
+  mailbox?: true;
+  /** Domain-scoped sync */
+  domain?: true;
+}
+
+/**
  * Send-time tracking controls supported by drivers.
  */
 export interface DriverSendTrackingCapabilities {
@@ -267,6 +300,12 @@ export interface DriverCapabilities {
   replyTo?: boolean;
   /** Supports RFC reply headers (`In-Reply-To` / `References`) on send */
   replyHeaders?: boolean;
+  /**
+   * Supports provider-native reply threading on send: the provider threads
+   * the outgoing message onto the conversation identified by `reply.messageId`
+   * itself instead of accepting raw RFC reply headers.
+   */
+  nativeReplyThreading?: boolean;
   /** Supports provider-native thread identifiers or reply flags on send */
   replyThreadId?: boolean;
   /** Supports outbound attachments */
@@ -305,6 +344,8 @@ export interface DriverCapabilities {
   domains?: DriverDomainCapabilities;
   /** Supports webhook management APIs by scope */
   webhooks?: DriverWebhookCapabilities;
+  /** Supports sync (replay of missed events) APIs by scope */
+  sync?: DriverSyncCapabilities;
   /** Public URL routes this driver consumes from EmailKit */
   publicRoutes?: DriverPublicRouteCapabilities;
   /** Driver requires a configured EmailKit secret for signed callback state or OAuth flows */
@@ -404,6 +445,9 @@ export interface BaseEmailMessage {
 type SupportsReplyHeaders<TCapabilities extends DriverCapabilities> =
   TCapabilities["replyHeaders"] extends true ? true : false;
 
+type SupportsNativeReplyThreading<TCapabilities extends DriverCapabilities> =
+  TCapabilities["nativeReplyThreading"] extends true ? true : false;
+
 type SupportsReplyThreadId<TCapabilities extends DriverCapabilities> =
   TCapabilities["replyThreadId"] extends true ? true : false;
 
@@ -412,16 +456,21 @@ type SupportsAnyReply<TCapabilities extends DriverCapabilities> =
     ? true
     : SupportsReplyHeaders<TCapabilities> extends true
       ? true
-      : SupportsReplyThreadId<TCapabilities> extends true
+      : SupportsNativeReplyThreading<TCapabilities> extends true
         ? true
-        : false;
+        : SupportsReplyThreadId<TCapabilities> extends true
+          ? true
+          : false;
 
 type ReplyContextForCapabilities<TCapabilities extends DriverCapabilities> =
   (TCapabilities["replyTo"] extends true
     ? Pick<ReplyContext, "addresses">
     : {}) &
     (SupportsReplyHeaders<TCapabilities> extends true
-      ? Pick<ReplyContext, "messageId" | "references">
+      ? Pick<ReplyContext, "messageId" | "references" | "isReply">
+      : {}) &
+    (SupportsNativeReplyThreading<TCapabilities> extends true
+      ? Pick<ReplyContext, "messageId" | "isReply">
       : {}) &
     (SupportsReplyThreadId<TCapabilities> extends true
       ? Pick<ReplyContext, "threadId" | "isReply">
@@ -550,6 +599,19 @@ export interface SendEmailResult {
    * Useful for provider-specific operations or tracking.
    */
   providerId?: string;
+  /**
+   * How `reply.messageId` threading was honored by drivers with the
+   * `nativeReplyThreading` capability.
+   *
+   * - "applied": the provider created a native reply to `reply.messageId`,
+   *   so the outgoing message carries proper reply headers and threading.
+   * - "skipped": `reply.messageId` was provided but the source message was
+   *   not found in the mailbox; the message was sent unthreaded.
+   *
+   * Absent for drivers that emit RFC reply headers directly (the
+   * `replyHeaders` capability) and for sends without `reply.messageId`.
+   */
+  replyThreading?: "applied" | "skipped";
   accepted?: string[];
   rejected?: string[];
 }
@@ -1095,6 +1157,8 @@ export type AllEventsHook = (event: {
     | "unknown";
   data: unknown;
   raw?: unknown;
+  /** User round-trip data from `SyncInput.context`, set only for sync-replayed events. */
+  context?: unknown;
 }) => HookResult;
 
 export interface MailboxHookEvent {
@@ -1609,3 +1673,36 @@ export type DomainWebhookDeleteInput = WebhookDeleteInput &
 export type DomainWebhookSetupResult = WebhookSetupResult;
 export type DomainWebhookRefreshResult = WebhookRefreshResult;
 export type DomainWebhookDeleteResult = WebhookDeleteResult;
+
+/**
+ * Input for sync (replay of missed events) operations.
+ */
+export interface SyncInput {
+  /** Replay events received at or after this time. */
+  since: Date;
+  /** Optional exclusive upper bound; defaults to now. */
+  until?: Date;
+  /** Abort long-running syncs. */
+  signal?: AbortSignal;
+  /** User round-trip data surfaced on the email onAll hook envelope for replayed events. */
+  context?: unknown;
+  /** Provider-specific options (escape hatch) */
+  provider?: Record<string, unknown>;
+}
+
+export type AccountSyncInput = SyncInput;
+export type MailboxSyncInput = SyncInput & MailboxWebhookTarget;
+export type DomainSyncInput = SyncInput & DomainIdentifier;
+
+/**
+ * Result of a completed sync run.
+ */
+export interface SyncResult {
+  /** Number of driver events dispatched through hooks. */
+  dispatched: number;
+  /**
+   * Earliest time the provider data actually covered. Greater than `since`
+   * when provider retention cut the window short.
+   */
+  syncedFrom: Date;
+}

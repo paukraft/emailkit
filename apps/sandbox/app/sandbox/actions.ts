@@ -3,10 +3,12 @@ import type {
   Domain,
   DomainIdentifier,
   Mailbox,
+  SyncResult,
   Webhook,
   WebhookRequest,
   WebhookResponse,
 } from "emailkit"
+import { EmailKitSyncError } from "emailkit"
 
 import { emailkit } from "../emailkit"
 import { getSandboxDriverInfo, hasSandboxDriver } from "./drivers"
@@ -33,8 +35,10 @@ import type {
   DomainActionInput,
   MailboxActionInput,
   ProviderFetchInput,
+  SandboxSyncResult,
   SendSandboxEmailInput,
   SandboxWebhookView,
+  SyncActionInput,
   WebhookActionInput,
 } from "./types"
 
@@ -778,6 +782,108 @@ export const handleWebhookAction = async (input: WebhookActionInput) => {
         webhooks: (await listWebhooks(emailDriver)).map(toWebhookView),
       }
     }
+  }
+}
+
+type SyncMethod = (input: Record<string, unknown>) => Promise<SyncResult>
+
+const runSync = async (
+  client: NonNullable<typeof emailkit>,
+  emailDriver: string,
+  input: SyncActionInput,
+  base: Record<string, unknown>
+): Promise<SyncResult> => {
+  if (input.target.scope === "account") {
+    const accountSync = (client as unknown as { sync?: SyncMethod }).sync
+    if (!accountSync)
+      throw new SandboxHttpError("Driver does not support account sync", 400)
+    return accountSync(base)
+  }
+
+  if (input.target.scope === "mailbox") {
+    const mailboxSync = (client.mailboxes as unknown as { sync?: SyncMethod })
+      .sync
+    if (!mailboxSync)
+      throw new SandboxHttpError("Driver does not support mailbox sync", 400)
+    const auth = await findMailboxAuth(emailDriver, input.target.mailboxEmail)
+    return mailboxSync({
+      ...base,
+      mailbox: { email: input.target.mailboxEmail },
+      ...(auth ? { auth } : {}),
+    })
+  }
+
+  const domainSync = (client.domains as unknown as { sync?: SyncMethod }).sync
+  if (!domainSync)
+    throw new SandboxHttpError("Driver does not support domain sync", 400)
+  return domainSync({ ...base, domain: input.target.domain })
+}
+
+export const handleSyncAction = async (
+  input: SyncActionInput
+): Promise<SandboxSyncResult> => {
+  const client = requireEmailKit()
+  const emailDriver = requireReadyDriver(input.emailDriver)
+  const scope = input.target.scope
+
+  const since = new Date(input.since)
+  if (Number.isNaN(since.getTime())) throw new Error("Invalid 'since' timestamp.")
+  const until = input.until ? new Date(input.until) : undefined
+  if (until && Number.isNaN(until.getTime()))
+    throw new Error("Invalid 'until' timestamp.")
+
+  const base: Record<string, unknown> = {
+    emailDriver,
+    since,
+    ...(until ? { until } : {}),
+    ...(input.context !== undefined ? { context: input.context } : {}),
+  }
+
+  recordSandboxEvent({
+    driver: emailDriver,
+    category: "system",
+    kind: "sync.start",
+    summary: `Sync started: ${scope} since ${since.toISOString()}`,
+    details: { ...base, target: input.target },
+  })
+
+  try {
+    const result = await runSync(client, emailDriver, input, base)
+    recordSandboxEvent({
+      driver: emailDriver,
+      category: "system",
+      kind: "sync.complete",
+      summary: `Sync complete: ${result.dispatched} event${result.dispatched === 1 ? "" : "s"} replayed`,
+      details: result,
+    })
+    return {
+      ok: true,
+      scope,
+      dispatched: result.dispatched,
+      syncedFrom: result.syncedFrom?.toISOString(),
+    }
+  } catch (error) {
+    if (error instanceof EmailKitSyncError) {
+      recordSandboxEvent({
+        driver: emailDriver,
+        category: "system",
+        kind: "sync.error",
+        summary: `Sync failed after ${error.dispatched} dispatched`,
+        details: {
+          dispatched: error.dispatched,
+          lastEventTimestamp: error.lastEventTimestamp,
+          message: error.message,
+        },
+      })
+      return {
+        ok: false,
+        scope,
+        dispatched: error.dispatched,
+        lastEventTimestamp: error.lastEventTimestamp?.toISOString(),
+        error: error.message,
+      }
+    }
+    throw error
   }
 }
 

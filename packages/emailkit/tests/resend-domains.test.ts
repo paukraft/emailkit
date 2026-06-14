@@ -225,6 +225,27 @@ describe("ResendDriver domains", () => {
     expect(domain.domain).toBe("example.com");
   });
 
+  it("rejects unsupported Resend domain update fields before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = ResendDriver({ apiKey: "re_test" });
+
+    await expect(
+      driver.domains!.update("dom_123", { returnPathSubdomain: "bounce" }),
+    ).rejects.toMatchObject({
+      provider: "resend",
+      code: "NOT_SUPPORTED",
+    });
+    await expect(
+      driver.domains!.update("dom_123", { dkimSelector: "s2" }),
+    ).rejects.toMatchObject({
+      provider: "resend",
+      code: "NOT_SUPPORTED",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("uses Resend delete response deleted flag", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(
       new Response(

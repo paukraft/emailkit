@@ -15,8 +15,16 @@ import { EmailKit, MailgunDriver, ResendDriver } from "emailkit";
 
 const emailkit = EmailKit({
   emailDrivers: [
-    ResendDriver({ id: "resend", apiKey: process.env.RESEND_API_KEY! }),
-    MailgunDriver({ id: "mailgun", apiKey: process.env.MAILGUN_API_KEY! }),
+    ResendDriver({
+      id: "resend",
+      apiKey: process.env.RESEND_API_KEY!,
+      webhookSecret: process.env.RESEND_WEBHOOK_SECRET!,
+    }),
+    MailgunDriver({
+      id: "mailgun",
+      apiKey: process.env.MAILGUN_API_KEY!,
+      webhookSigningKey: process.env.MAILGUN_WEBHOOK_SIGNING_KEY!,
+    }),
   ],
   resolveEmailDriver: async (ctx) => {
     if (ctx.operation === "sendEmail") {
@@ -81,31 +89,41 @@ driver route is `https://app.example.com/api/email/:emailDriverId`. Passing
 ### Mailboxes
 
 Mailbox objects are durable identity only. Store provider OAuth material from
-the top-level `auth` field returned by connection flows, then pass it back as a
-separate `auth` value when sending or managing mailbox-scoped webhooks:
+`hooks.mailbox.onConnected`, then pass it back as a separate `auth` value when
+sending or managing mailbox-scoped webhooks:
 
 ```ts
-import type { MailboxConnectionResult, WebhookResponse } from "emailkit";
+import { EmailKit, OutlookDriver } from "emailkit";
 
-const isMailboxConnectionResponse = (
-  response: WebhookResponse,
-): response is WebhookResponse & {
-  body: { result: MailboxConnectionResult };
-} =>
-  response.status === 200 &&
-  typeof response.body === "object" &&
-  response.body !== null &&
-  "result" in response.body;
+const emailkit = EmailKit({
+  secret: process.env.EMAILKIT_SECRET!,
+  emailDrivers: [
+    OutlookDriver({
+      id: "outlook",
+      clientId: process.env.OUTLOOK_CLIENT_ID!,
+      clientSecret: process.env.OUTLOOK_CLIENT_SECRET!,
+      webhookClientState: process.env.OUTLOOK_WEBHOOK_CLIENT_STATE!,
+      webhookAuthResolver: async ({ mailbox }) => {
+        return mailbox?.id ? await loadOutlookAuth(mailbox.id) : undefined;
+      },
+    }),
+  ],
+  hooks: {
+    mailbox: {
+      onConnected: async ({ mailbox, auth }) => {
+        if (mailbox && auth) await saveOutlookAuth(mailbox.id, auth);
+      },
+    },
+  },
+});
 
-const connection = await emailkit.handler()(callbackRequest);
-if (
-  !isMailboxConnectionResponse(connection) ||
-  !connection.body.result.mailbox
-) {
-  throw new Error("Mailbox connection failed");
-}
+await emailkit.mailboxes.connect({
+  emailDriver: "outlook",
+  email: "support@example.com",
+});
 
-const { mailbox, auth } = connection.body.result;
+const mailbox = await loadMailbox("support@example.com");
+const auth = await loadOutlookAuth(mailbox.id);
 
 await emailkit.sendEmail({
   from: { email: mailbox.email },
@@ -155,9 +173,37 @@ export const emailkit = EmailKit({
 The Outlook driver exposes only the send features it can map to Microsoft
 Graph: CC, BCC, Reply-To addresses, attachments with content, and custom
 headers that begin with `X-`. It does not expose templates, scheduling,
-unsubscribe, tracking controls, tags, metadata, idempotency, domain APIs, or
-reply threading. Shared mailbox/send-as is not supported by the normalized
-driver; use `providerFetch` for Graph-specific escape hatches.
+unsubscribe, tracking controls, tags, metadata, idempotency, or domain APIs.
+Shared mailbox/send-as is not supported by the normalized driver; use
+`providerFetch` for Graph-specific escape hatches.
+
+Outlook webhook setup uses the `auth` you pass to create the Microsoft Graph
+subscription, but live webhook parsing happens later in a separate request.
+Configure `webhookAuthResolver` or `webhookAuth` so EmailKit can hydrate Graph
+notifications when those webhooks arrive.
+
+Reply threading is native (`nativeReplyThreading` capability): Microsoft Graph
+cannot set `In-Reply-To`/`References` headers on outbound mail, so the driver
+maps `reply.messageId` onto Graph `createReply` instead and lets Exchange wire
+up conversation threading and reply headers itself. This requires
+`sendEmailMode: "draft"` (Mail.ReadWrite), and the capability is derived from
+the configuration: only a driver constructed with `sendEmailMode: "draft"`
+advertises `nativeReplyThreading`, so `reply.messageId` is a compile error on
+a driver using the default `"sendMail"` mode. A per-message
+`provider.sendEmailMode: "sendMail"` override on a draft-configured driver
+still throws `NOT_SUPPORTED` at runtime when combined with `reply.messageId`.
+The driver looks the source message up by `internetMessageId` in the connected
+mailbox, creates a reply draft, patches in the outgoing message, uploads
+attachments, and sends it. The send result reports
+`replyThreading: "applied"` on success, or `replyThreading: "skipped"` when
+the source message was not found and the message was sent unthreaded instead
+(an unthreaded reply beats a failed send). `reply.references` and
+`reply.threadId` stay unsupported because Exchange derives the reference chain
+itself. Custom `headers` cannot be combined with `reply.messageId`: Graph
+`createReply` does not accept `internetMessageHeaders` and drafts cannot
+receive them after creation, so the driver throws `NOT_SUPPORTED` instead of
+risking a silently dropped header — send without `reply.messageId` or without
+custom headers.
 
 ### Domains
 
@@ -223,12 +269,70 @@ If a driver can hydrate stored attachments before your hook runs, it will popula
 
 Inbound attachments are stamped with `attachment.emailDriver` by the EmailKit client. That means stored attachment records can be persisted and later passed back to `emailkit.attachments.getContent(attachment)` without also passing `{ emailDriver }`. If you do pass an explicit `{ emailDriver }`, it must match the attachment stamp.
 
+### Sync (replay missed events)
+
+If your server was down and webhooks were lost, ask the provider to replay the
+window. Synced events are re-pulled from the provider and dispatched through
+the same hooks as live webhooks (`onInbound`, `onDelivered`, ...), so nothing
+else in your app changes. The only knob is `since`:
+
+```ts
+// Mailbox-scoped (Outlook): same mailbox + auth as other mailbox operations
+const result = await emailkit.mailboxes.sync({
+  emailDriver: "outlook",
+  mailbox,
+  auth,
+  since: outageStartedAt,
+});
+
+// Domain-scoped (Mailgun): replays inbound and outbound tracking events
+await emailkit.domains.sync({ emailDriver: "mailgun", domain: "mg.example.com", since });
+
+// Account-scoped (Resend, AIInbx): replays inbound email only
+await emailkit.sync({ emailDriver: "resend", since });
+await emailkit.sync({ emailDriver: "aiinbx", since });
+
+console.log(result.dispatched, result.syncedFrom);
+```
+
+Semantics:
+
+- Events are replayed oldest-first and are indistinguishable from live webhook
+  events. Sync is at-least-once: handle inbound idempotently (upsert by
+  `messageId`) and replays cost nothing.
+- Event coverage is bounded by what the provider's API can list after the
+  fact. Mailgun replays inbound and outbound tracking events; Outlook queries
+  the mailbox message collection by default so moved or archived received mail
+  can still replay, while skipping messages sent by the synced mailbox; Resend
+  and AIInbx replay inbound email only — their APIs expose no tracking-event
+  history, so `onDelivered`/`onOpened` webhooks missed during the outage are
+  not recoverable there.
+- `result.syncedFrom` is the earliest time the provider data actually covered.
+  When provider retention cuts the window short (Mailgun stores events for a
+  bounded window), `syncedFrom` is later than `since` — reported, never thrown.
+  For Mailgun, set `eventsRetentionDays` in the driver config to match your
+  plan (default 3, the documented minimum) so coverage isn't under-reported.
+- Optional `until` bounds the window (exclusive), `signal` aborts long syncs,
+  and `context` is surfaced on the `email.onAll` envelope for replayed events
+  so you can suppress side effects like auto-replies during a replay.
+- If a hook throws mid-replay, sync throws `EmailKitSyncError` carrying
+  `dispatched` and `lastEventTimestamp`; resume with
+  `since: error.lastEventTimestamp`.
+
+Like every other facade, sync is typed by capability (`sync: { mailbox: true }`
+etc.) — the method only exists on scopes your configured drivers support.
+
 ### Webhooks (framework-agnostic)
 
 ```ts
 const handle = emailkit.handler();
 const res = await handle({ method, headers, body });
 ```
+
+Provider webhooks are verified before dispatch. Configure each driver's
+webhook signing secret (`webhookSecret`, `webhookSigningKey`, or Outlook
+`webhookClientState`) before accepting production webhook traffic; unsigned
+webhook requests are rejected.
 
 ### Provider fetch helper
 
@@ -245,7 +349,11 @@ if (!response.ok) throw new Error("Provider API failed");
 const domains = await response.json();
 ```
 
-The helper accepts any `fetch` options plus an optional `searchParams` object. Pass absolute URLs when the provider returns fully qualified links (for example, stored attachment URLs); the helper still injects auth headers.
+The helper accepts any `fetch` options plus an optional `searchParams` object.
+Use relative paths for provider APIs, or absolute URLs that stay inside the
+provider API origin. Stored attachment downloads should go through
+`emailkit.attachments.getContent(...)`; drivers avoid sending provider bearer
+tokens to unrelated absolute URLs.
 
 ### Next.js adapter (optional)
 
@@ -265,7 +373,8 @@ import { createNextEmailKitHandler } from "emailkit/nextjs";
 export const { GET, POST } = createNextEmailKitHandler(emailkit, {
   emailDriver: async (_request, context) => {
     const params = await context.params;
-    return params.emailDriver;
+    const emailDriver = params?.emailDriver;
+    return typeof emailDriver === "string" ? emailDriver : undefined;
   },
 });
 ```

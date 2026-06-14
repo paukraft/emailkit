@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AIInbxDriver, EmailKit, EmailKitError } from "../src";
@@ -6,6 +7,13 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+const testAIInbxWebhookSecret = "aiinbx-webhook-secret";
+
+const signAIInbxWebhookBody = (body: unknown, timestamp: string) =>
+  `sha256=${createHmac("sha256", testAIInbxWebhookSecret)
+    .update(`${timestamp}.${JSON.stringify(body)}`)
+    .digest("hex")}`;
 
 describe("AIInbxDriver sendEmail", () => {
   it("advertises the current reply and tracking capability model", () => {
@@ -266,6 +274,33 @@ describe("AIInbxDriver sendEmail", () => {
 });
 
 describe("AIInbxDriver webhooks", () => {
+  it("rejects public AIInbx webhooks when no signing secret is configured", async () => {
+    const onClicked = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [AIInbxDriver({ apiKey: "ai_test" })],
+      hooks: { email: { onClicked } },
+    });
+
+    const response = await client.handler()({
+      method: "POST",
+      headers: {},
+      body: {
+        event: "outbound.email.clicked",
+        data: {
+          emailId: "email_123",
+          messageId: "<message-123@example.com>",
+          clickedAt: "2026-04-02T10:00:00.000Z",
+          link: "https://example.com/demo",
+        },
+        attempt: 1,
+        timestamp: 1775124000,
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(onClicked).not.toHaveBeenCalled();
+  });
+
   it("fetches stored signed attachment URLs without AIInbx bearer auth", async () => {
     const signedUrl =
       "https://signed-bucket.s3.amazonaws.com/report.txt?X-Amz-Signature=abc";
@@ -278,6 +313,7 @@ describe("AIInbxDriver webhooks", () => {
     const driver = AIInbxDriver({
       id: "support-aiinbx",
       apiKey: "ai_test",
+      webhookSecret: testAIInbxWebhookSecret,
       autoFetchInboundAttachments: false,
     });
     const client = EmailKit({
@@ -289,57 +325,62 @@ describe("AIInbxDriver webhooks", () => {
       },
     });
 
+    const body = {
+      event: "inbound.email.received",
+      data: {
+        email: {
+          id: "email_inbound_123",
+          createdAt: "2026-04-02T10:00:00.000Z",
+          messageId: "<inbound-123@example.com>",
+          inReplyToId: null,
+          references: [],
+          subject: "Inbound",
+          text: "Hello",
+          html: null,
+          strippedText: "Hello",
+          strippedHtml: null,
+          snippet: "Hello",
+          fromName: null,
+          fromAddress: "buyer@example.net",
+          toAddresses: ["agent@example.com"],
+          ccAddresses: [],
+          bccAddresses: [],
+          replyToAddresses: [],
+          sentAt: null,
+          receivedAt: "2026-04-02T10:00:00.000Z",
+          direction: "INBOUND",
+          status: "RECEIVED",
+          threadId: "thread_123",
+          attachments: [
+            {
+              id: "att_123",
+              createdAt: "2026-04-02T10:00:00.000Z",
+              fileName: "report.txt",
+              contentType: "text/plain",
+              sizeInBytes: 14,
+              cid: null,
+              disposition: "attachment",
+              signedUrl,
+              expiresAt: "2026-04-02T11:00:00.000Z",
+            },
+          ],
+        },
+        organization: {
+          id: "org_123",
+          slug: "org",
+        },
+      },
+      attempt: 1,
+      timestamp: 1775124000,
+    };
+    const timestamp = "1775124000";
     const response = await client.handler()({
       method: "POST",
-      headers: {},
-      body: {
-        event: "inbound.email.received",
-        data: {
-          email: {
-            id: "email_inbound_123",
-            createdAt: "2026-04-02T10:00:00.000Z",
-            messageId: "<inbound-123@example.com>",
-            inReplyToId: null,
-            references: [],
-            subject: "Inbound",
-            text: "Hello",
-            html: null,
-            strippedText: "Hello",
-            strippedHtml: null,
-            snippet: "Hello",
-            fromName: null,
-            fromAddress: "buyer@example.net",
-            toAddresses: ["agent@example.com"],
-            ccAddresses: [],
-            bccAddresses: [],
-            replyToAddresses: [],
-            sentAt: null,
-            receivedAt: "2026-04-02T10:00:00.000Z",
-            direction: "INBOUND",
-            status: "RECEIVED",
-            threadId: "thread_123",
-            attachments: [
-              {
-                id: "att_123",
-                createdAt: "2026-04-02T10:00:00.000Z",
-                fileName: "report.txt",
-                contentType: "text/plain",
-                sizeInBytes: 14,
-                cid: null,
-                disposition: "attachment",
-                signedUrl,
-                expiresAt: "2026-04-02T11:00:00.000Z",
-              },
-            ],
-          },
-          organization: {
-            id: "org_123",
-            slug: "org",
-          },
-        },
-        attempt: 1,
-        timestamp: 1775124000,
+      headers: {
+        "x-aiinbx-timestamp": timestamp,
+        "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
       },
+      body,
     });
 
     expect(response.status).toBe(200);
@@ -357,7 +398,10 @@ describe("AIInbxDriver webhooks", () => {
   it("normalizes clicked webhooks for grouped EmailKit hooks", async () => {
     const onAll = vi.fn();
     const onClicked = vi.fn();
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
+    const driver = AIInbxDriver({
+      apiKey: "ai_test",
+      webhookSecret: testAIInbxWebhookSecret,
+    });
     const client = EmailKit({
       emailDrivers: [driver],
       hooks: {
@@ -368,23 +412,28 @@ describe("AIInbxDriver webhooks", () => {
       },
     });
 
+    const body = {
+      event: "outbound.email.clicked",
+      data: {
+        emailId: "email_123",
+        messageId: "<message-123@example.com>",
+        clickedAt: "2026-04-02T10:00:00.000Z",
+        link: "https://example.com/demo",
+        linkDomain: "example.com",
+        ipAddress: "203.0.113.10",
+        userAgent: "Mozilla/5.0",
+      },
+      attempt: 1,
+      timestamp: 1775124000,
+    };
+    const timestamp = "1775124000";
     const response = await client.handler()({
       method: "POST",
-      headers: {},
-      body: {
-        event: "outbound.email.clicked",
-        data: {
-          emailId: "email_123",
-          messageId: "<message-123@example.com>",
-          clickedAt: "2026-04-02T10:00:00.000Z",
-          link: "https://example.com/demo",
-          linkDomain: "example.com",
-          ipAddress: "203.0.113.10",
-          userAgent: "Mozilla/5.0",
-        },
-        attempt: 1,
-        timestamp: 1775124000,
+      headers: {
+        "x-aiinbx-timestamp": timestamp,
+        "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
       },
+      body,
     });
 
     expect(response.status).toBe(200);

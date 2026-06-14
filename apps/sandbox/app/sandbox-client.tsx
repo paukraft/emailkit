@@ -12,6 +12,7 @@ import { ProviderStatus } from "./components/provider-status"
 import { WebhooksPanel } from "./components/webhooks-panel"
 import { ProviderTabs } from "./components/provider-tabs"
 import { SidebarSection } from "./components/sidebar-section"
+import { SyncPanel } from "./components/sync-panel"
 import { TraceInspector } from "./components/trace-inspector"
 import { TraceList } from "./components/trace-list"
 import type { SandboxSnapshot } from "./sandbox/types"
@@ -86,6 +87,7 @@ export function SandboxClient({ initialSnapshot }: { initialSnapshot: SandboxSna
             <DomainsPanel key={`domains-${driver.id}`} driver={driver} />
             <MailboxesPanel key={`mailboxes-${driver.id}`} driver={driver} />
             <WebhooksPanel key={`webhooks-${driver.id}`} driver={driver} />
+            <SyncPanel key={`sync-${driver.id}`} driver={driver} />
           </div>
           <ProviderStatus driver={driver} />
         </aside>

@@ -600,6 +600,33 @@ describe("ResendDriver", () => {
     });
   });
 
+  it("rejects public Resend webhooks when no signing secret is configured", async () => {
+    const onClicked = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [ResendDriver({ apiKey: "re_test" })],
+      hooks: { email: { onClicked } },
+    });
+
+    const response = await client.handler()({
+      method: "POST",
+      headers: {},
+      body: {
+        type: "email.clicked",
+        created_at: "2026-02-22T23:41:12.126Z",
+        data: {
+          email_id: "email_123",
+          from: "Sender <sender@example.com>",
+          to: ["recipient@example.com"],
+          subject: "Hello",
+          created_at: "2026-02-22T23:41:11.894719+00:00",
+        },
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(onClicked).not.toHaveBeenCalled();
+  });
+
   it("normalizes Resend outbound webhooks to EmailKit webhook events", async () => {
     const driver = ResendDriver({ apiKey: "re_test" });
     const event = await driver.handleWebhook({

@@ -11,8 +11,10 @@ import type {
   EmailDriverConfig,
   ProviderFetch,
   SendEmailOptions,
+  SyncStream,
 } from "../driver";
 import type {
+  AccountSyncInput,
   AccountWebhookDeleteInput,
   AccountWebhookDeleteResult,
   AccountWebhookRefreshInput,
@@ -206,6 +208,21 @@ type ResendReceivedEmail = {
 };
 
 /**
+ * Resend Receiving API: GET /emails/receiving (newest-first, cursor pagination)
+ */
+type ResendReceivedEmailListItem = {
+  id: string;
+  created_at: string;
+  [key: string]: unknown;
+};
+
+type ResendReceivedEmailListPage = {
+  object?: string;
+  has_more?: boolean;
+  data?: ResendReceivedEmailListItem[];
+};
+
+/**
  * Resend Attachments API: GET /emails/receiving/:id/attachments
  */
 type ResendAttachmentList = {
@@ -254,6 +271,7 @@ export const RESEND_CAPABILITIES = {
     identifier: "domainId" as const,
   },
   webhooks: { account: true },
+  sync: { account: true },
   publicRoutes: { webhook: true },
   requiresSecret: false,
 } as const satisfies DriverCapabilities;
@@ -614,13 +632,14 @@ const createResendProviderFetch = (
  */
 const retrieveResendAttachments = async (
   attachmentMetadata: Attachment[],
+  signal?: AbortSignal,
 ): Promise<Attachment[]> => {
   const attachments: Attachment[] = [];
 
   for (const attachmentMeta of attachmentMetadata) {
     if (attachmentMeta.url) {
       try {
-        const res = await fetch(attachmentMeta.url);
+        const res = await fetch(attachmentMeta.url, { signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = new Uint8Array(await res.arrayBuffer());
 
@@ -634,6 +653,8 @@ const retrieveResendAttachments = async (
           isInline: attachmentMeta.isInline,
         });
       } catch (error) {
+        // Failed downloads degrade to metadata, but an abort must propagate.
+        if (signal?.aborted) throw error;
         console.error(
           `Failed to retrieve Resend attachment ${attachmentMeta.filename}:`,
           error,
@@ -655,10 +676,11 @@ const retrieveResendAttachments = async (
 const transformInboundEmail = async (
   webhookData: ResendInboundEmailWebhook["data"],
   webhookTimestamp: string,
-  rawPayload: ResendInboundEmailWebhook,
+  rawPayload: unknown,
   apiBaseUrl: string,
   apiKey: string,
   autoFetchAttachments: boolean,
+  signal?: AbortSignal,
 ): Promise<InboundEmailEvent> => {
   const parseEmailAddressList = (addresses: string[]): EmailAddress[] => {
     return addresses.map(parseEmailAddress);
@@ -678,6 +700,7 @@ const transformInboundEmail = async (
   const emailUrl = `${apiBaseUrl}/emails/receiving/${emailId}`;
   const emailRes = await fetch(emailUrl, {
     headers: { Authorization: `Bearer ${apiKey}` },
+    signal,
   });
   if (!emailRes.ok) {
     const body = await emailRes.text();
@@ -693,6 +716,7 @@ const transformInboundEmail = async (
   const attUrl = `${apiBaseUrl}/emails/receiving/${emailId}/attachments`;
   const attRes = await fetch(attUrl, {
     headers: { Authorization: `Bearer ${apiKey}` },
+    signal,
   });
   if (!attRes.ok) {
     const body = await attRes.text();
@@ -717,7 +741,7 @@ const transformInboundEmail = async (
   const attachments =
     attachmentMetadata.length > 0
       ? autoFetchAttachments
-        ? await retrieveResendAttachments(attachmentMetadata)
+        ? await retrieveResendAttachments(attachmentMetadata, signal)
         : attachmentMetadata
       : undefined;
 
@@ -1475,8 +1499,11 @@ export const ResendDriver = <const TId extends string = "resend">(
       return { type: "unknown", data: payload };
     },
 
-    verifyWebhook: config.webhookSecret
-      ? async (request: WebhookRequest): Promise<boolean> => {
+    verifyWebhook: async (request: WebhookRequest): Promise<boolean> => {
+      if (!config.webhookSecret) {
+        return false;
+      }
+
           // Resend uses Svix for webhook signing
           // Use the Svix library to verify webhooks
           try {
@@ -1510,7 +1537,7 @@ export const ResendDriver = <const TId extends string = "resend">(
             }
 
             // Create Svix Webhook instance with the secret
-            const wh = new Webhook(config.webhookSecret!);
+        const wh = new Webhook(config.webhookSecret);
 
             // Verify the webhook - throws on error, returns verified payload on success
             wh.verify(payload, headers);
@@ -1521,8 +1548,7 @@ export const ResendDriver = <const TId extends string = "resend">(
             // Verification failed
             return false;
           }
-        }
-      : undefined,
+    },
 
     webhookResponse: async (
       request: WebhookRequest,
@@ -1621,6 +1647,83 @@ export const ResendDriver = <const TId extends string = "resend">(
             raw,
           };
         },
+      },
+    },
+
+    sync: {
+      /**
+       * Replay missed inbound emails from the Receiving API.
+       *
+       * Resend exposes received emails via `GET /emails/receiving` only in
+       * newest-first order with cursor pagination and no time filters, so the
+       * lightweight list items for the window are buffered while paging back
+       * to `since`, then replayed oldest-first. The heavy work (full email +
+       * attachments per id) streams lazily at yield time. Outbound tracking
+       * events are not listable via the Resend API, so sync is inbound-only.
+       */
+      account: async function* (input: AccountSyncInput): SyncStream {
+        const since = input.since;
+        const until = input.until ?? new Date();
+
+        const windowed: ResendReceivedEmailListItem[] = [];
+        let after: string | undefined;
+
+        pagination: while (true) {
+          const url = new URL(`${baseUrl}/emails/receiving`);
+          url.searchParams.set("limit", "100");
+          if (after) url.searchParams.set("after", after);
+
+          const res = await fetch(url.toString(), {
+            headers: { Authorization: `Bearer ${config.apiKey}` },
+            signal: input.signal,
+          });
+          const contentType = res.headers.get("content-type") || "";
+          const body = contentType.includes("application/json")
+            ? await res.json()
+            : await res.text();
+
+          if (!res.ok) {
+            throw new EmailKitError(
+              typeof (body as any)?.message === "string"
+                ? (body as any).message
+                : `HTTP ${res.status}: Failed to list received emails`,
+              "resend",
+              undefined,
+              res.status,
+              undefined,
+              body,
+            );
+          }
+
+          const page = body as ResendReceivedEmailListPage;
+          const items = page.data || [];
+          for (const item of items) {
+            const createdAt = new Date(item.created_at).getTime();
+            if (Number.isNaN(createdAt)) continue;
+            // Newest-first: everything after this item is older than `since`.
+            if (createdAt < since.getTime()) break pagination;
+            if (createdAt >= until.getTime()) continue;
+            windowed.push(item);
+          }
+
+          if (!page.has_more || items.length === 0) break;
+          after = items[items.length - 1]!.id;
+        }
+
+        for (const item of windowed.reverse()) {
+          const event = await transformInboundEmail(
+            { id: item.id },
+            item.created_at,
+            item,
+            baseUrl,
+            config.apiKey,
+            config.autoFetchInboundAttachments ?? true,
+            input.signal,
+          );
+          yield { type: "inbound", data: event };
+        }
+
+        return { syncedFrom: since };
       },
     },
 
@@ -1789,6 +1892,21 @@ export const ResendDriver = <const TId extends string = "resend">(
         idOrName: string,
         patch: UpdateDomainInput,
       ): Promise<Domain> => {
+        if (patch.dkimSelector !== undefined) {
+          throw new EmailKitError(
+            "Resend does not support updating dkimSelector after domain creation.",
+            "resend",
+            "NOT_SUPPORTED",
+          );
+        }
+        if (patch.returnPathSubdomain !== undefined) {
+          throw new EmailKitError(
+            "Resend does not support updating returnPathSubdomain after domain creation.",
+            "resend",
+            "NOT_SUPPORTED",
+          );
+        }
+
         const requestBody: Record<string, unknown> = {};
 
         if (patch.tracking?.opens !== undefined) {

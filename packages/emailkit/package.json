@@ -1,6 +1,6 @@
 {
   "name": "emailkit",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Unified email API for multiple providers.",
   "type": "module",
   "license": "MIT",
@@ -55,6 +55,14 @@
   },
   "dependencies": {
     "svix": "^1.20.0"
+  },
+  "peerDependencies": {
+    "next": ">=15"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^24.9.1",

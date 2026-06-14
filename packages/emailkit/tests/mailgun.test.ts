@@ -2,11 +2,45 @@ import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import { EmailKit, EmailKitError, MailgunDriver } from "../src";
+import type { SyncStream, WebhookDriverEvent } from "../src";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
+
+const testWebhookSigningKey = "key-test-webhook-signing";
+let mailgunSignatureCounter = 0;
+
+const signedMailgunEventBody = <T extends Record<string, unknown>>(body: T): T => {
+  mailgunSignatureCounter += 1;
+  const timestamp = String(1_529_006_854 + mailgunSignatureCounter);
+  const token = `token-${mailgunSignatureCounter}`;
+  return {
+    ...body,
+    signature: {
+      timestamp,
+      token,
+      signature: createHmac("sha256", testWebhookSigningKey)
+        .update(timestamp + token)
+        .digest("hex"),
+    },
+  };
+};
+
+const signedMailgunRouteBody = <T extends Record<string, unknown>>(body: T): T => {
+  mailgunSignatureCounter += 1;
+  const timestamp = String(1_529_006_854 + mailgunSignatureCounter);
+  const token = `token-${mailgunSignatureCounter}`;
+  return {
+    ...body,
+    timestamp,
+    token,
+    signature: createHmac("sha256", testWebhookSigningKey)
+      .update(timestamp + token)
+      .digest("hex"),
+  };
+};
 
 const mailgunDomainResponse = {
   domain: {
@@ -69,6 +103,7 @@ describe("MailgunDriver core API shape", () => {
         identifier: "domain",
       },
       webhooks: { account: true, domain: true },
+      sync: { domain: true },
       publicRoutes: { webhook: true },
       requiresSecret: false,
     });
@@ -102,6 +137,29 @@ describe("MailgunDriver core API shape", () => {
     });
     expect("name" in domain).toBe(false);
     expect(domain.verification?.records).toHaveLength(2);
+  });
+
+  it("rejects unsupported Mailgun domain update fields before calling the API", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+
+    await expect(
+      driver.domains!.update!("mg.example.com", {
+        tracking: { opens: false },
+      }),
+    ).rejects.toMatchObject({
+      provider: "mailgun",
+      code: "NOT_SUPPORTED",
+    });
+    await expect(
+      driver.domains!.update!("mg.example.com", { dkimSelector: "s2" }),
+    ).rejects.toMatchObject({
+      provider: "mailgun",
+      code: "NOT_SUPPORTED",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -1206,11 +1264,39 @@ describe("MailgunDriver webhooks", () => {
     ).resolves.toBe(true);
   });
 
+  it("rejects public Mailgun webhooks when no signing key is configured", async () => {
+    const onOpened = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      hooks: { email: { onOpened } },
+    });
+
+    const response = await client.handler()({
+      method: "POST",
+      headers: {},
+      body: {
+        "event-data": {
+          id: "evt_opened",
+          event: "opened",
+          timestamp: 1529006854,
+        },
+      },
+    });
+
+    expect(response.status).toBe(401);
+    expect(onOpened).not.toHaveBeenCalled();
+  });
+
   it("feeds normalized outbound events into grouped email hooks", async () => {
     const onOpened = vi.fn();
     const onAll = vi.fn();
     const client = EmailKit({
-      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      emailDrivers: [
+        MailgunDriver({
+          apiKey: "key-test",
+          webhookSigningKey: testWebhookSigningKey,
+        }),
+      ],
       hooks: {
         email: {
           onAll,
@@ -1222,12 +1308,7 @@ describe("MailgunDriver webhooks", () => {
     const response = await client.handler()({
       method: "POST",
       headers: {},
-      body: {
-        signature: {
-          timestamp: "1529006854",
-          token: "token",
-          signature: "signature",
-        },
+      body: signedMailgunEventBody({
         "event-data": {
           id: "evt_opened",
           event: "opened",
@@ -1247,7 +1328,7 @@ describe("MailgunDriver webhooks", () => {
             },
           },
         },
-      },
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -1275,7 +1356,12 @@ describe("MailgunDriver webhooks", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = EmailKit({
-      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      emailDrivers: [
+        MailgunDriver({
+          apiKey: "key-test",
+          webhookSigningKey: testWebhookSigningKey,
+        }),
+      ],
       hooks: {
         email: {
           onAll,
@@ -1290,12 +1376,7 @@ describe("MailgunDriver webhooks", () => {
     const response = await handler({
       method: "POST",
       headers: {},
-      body: {
-        signature: {
-          timestamp: "1529006854",
-          token: "token",
-          signature: "signature",
-        },
+      body: signedMailgunEventBody({
         "event-data": {
           id: "evt_accepted_inbound",
           event: "accepted",
@@ -1316,12 +1397,12 @@ describe("MailgunDriver webhooks", () => {
             },
           },
         },
-      },
+      }),
     });
     const routeResponse = await handler({
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: {
+      body: signedMailgunRouteBody({
         "body-plain": "Route body should be delivered.",
         "body-html": "<p>Route body should be delivered.</p>",
         From: "Sender <sender@example.com>",
@@ -1329,7 +1410,7 @@ describe("MailgunDriver webhooks", () => {
         Subject: "Re: Supplier Inquiry",
         "Message-Id": "<reply@example.com>",
         recipient: "tino.heiden@ingredients-experts.de",
-      },
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -1367,7 +1448,12 @@ describe("MailgunDriver webhooks", () => {
     const onInbound = vi.fn();
     const onOutbound = vi.fn();
     const client = EmailKit({
-      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      emailDrivers: [
+        MailgunDriver({
+          apiKey: "key-test",
+          webhookSigningKey: testWebhookSigningKey,
+        }),
+      ],
       hooks: {
         email: {
           onInbound,
@@ -1379,12 +1465,7 @@ describe("MailgunDriver webhooks", () => {
     const response = await client.handler()({
       method: "POST",
       headers: {},
-      body: {
-        signature: {
-          timestamp: "1529006854",
-          token: "token",
-          signature: "signature",
-        },
+      body: signedMailgunEventBody({
         "event-data": {
           id: "evt_accepted_outbound",
           event: "accepted",
@@ -1405,7 +1486,7 @@ describe("MailgunDriver webhooks", () => {
             },
           },
         },
-      },
+      }),
     });
 
     expect(response.status).toBe(200);
@@ -1419,5 +1500,647 @@ describe("MailgunDriver webhooks", () => {
         status: "sent",
       }),
     );
+  });
+});
+
+describe("MailgunDriver sync", () => {
+  const eventsUrl = "https://api.mailgun.net/v3/mg.example.com/events";
+  const storageUrl =
+    "https://storage.mailgun.net/v3/domains/mg.example.com/messages/stored_key_1";
+
+  const jsonResponse = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+
+  const syncWindow = () => {
+    const now = Date.now();
+    return {
+      since: new Date(now - 60 * 60 * 1000),
+      until: new Date(now - 60 * 1000),
+    };
+  };
+
+  const deliveredItem = (id: string, timestamp: Date) => ({
+    id,
+    event: "delivered",
+    timestamp: timestamp.getTime() / 1000,
+    recipient: "recipient@example.com",
+    message: {
+      headers: {
+        "message-id": "<sent@example.com>",
+        from: "Sender <sender@mg.example.com>",
+        to: "recipient@example.com",
+        subject: "Hello",
+      },
+    },
+  });
+
+  const storedItem = (id: string, timestamp: Date) => ({
+    id,
+    event: "stored",
+    timestamp: timestamp.getTime() / 1000,
+    storage: { url: storageUrl, key: "stored_key_1" },
+    message: {
+      headers: {
+        "message-id": "<stored@example.com>",
+        from: "Sender <sender@example.com>",
+        to: "inbox@mg.example.com",
+        subject: "Stored message",
+      },
+    },
+  });
+
+  const inboundAcceptedItem = (id: string, timestamp: Date) => ({
+    id,
+    event: "accepted",
+    timestamp: timestamp.getTime() / 1000,
+    recipient: "inbox@mg.example.com",
+    storage: { url: storageUrl, key: "stored_key_1" },
+    message: {
+      headers: {
+        "message-id": "<stored@example.com>",
+        from: "Sender <sender@example.com>",
+        to: "inbox@mg.example.com",
+        subject: "Stored message",
+      },
+    },
+  });
+
+  const storedMessageJson = {
+    From: "Sender <sender@example.com>",
+    To: "Recipient <inbox@mg.example.com>",
+    Subject: "Stored message",
+    "Message-Id": "<stored@example.com>",
+    "body-plain": "Stored body",
+    "body-html": "<p>Stored body</p>",
+    "stripped-text": "Stored body",
+    "stripped-html": "<p>Stored body</p>",
+    "message-headers": [
+      ["Message-Id", "<stored@example.com>"],
+      ["From", "Sender <sender@example.com>"],
+      ["To", "Recipient <inbox@mg.example.com>"],
+      ["Subject", "Stored message"],
+    ],
+  };
+
+  const drainSync = async (stream: SyncStream) => {
+    const events: WebhookDriverEvent[] = [];
+    while (true) {
+      const next = await stream.next();
+      if (next.done) return { events, result: next.value };
+      events.push(next.value);
+    }
+  };
+
+  it("replays account sync across all listed domains oldest-first", async () => {
+    const { since, until } = syncWindow();
+    const alphaEventsUrl = "https://api.mailgun.net/v3/alpha.example.com/events";
+    const betaEventsUrl = "https://api.mailgun.net/v3/beta.example.com/events";
+    const alphaDeliveredAt = new Date(since.getTime() + 120_000);
+    const betaDeliveredAt = new Date(since.getTime() + 60_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith("https://api.mailgun.net/v4/domains")) {
+        const request = new URL(href);
+        expect(request.searchParams.get("limit")).toBe("100");
+        return jsonResponse({
+          items: [
+            { id: "dom_alpha", name: "alpha.example.com", state: "active" },
+            { id: "dom_beta", name: "beta.example.com", state: "active" },
+          ],
+        });
+      }
+      if (href.startsWith(`${alphaEventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_alpha", alphaDeliveredAt)],
+          paging: {},
+        });
+      }
+      if (href.startsWith(`${betaEventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_beta", betaDeliveredAt)],
+          paging: {},
+        });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.account!({ since, until }),
+    );
+
+    expect(events.map((event) => event.data.eventId)).toEqual([
+      "evt_beta",
+      "evt_alpha",
+    ]);
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("/v3/alpha.example.com/events"),
+        expect.stringContaining("/v3/beta.example.com/events"),
+      ]),
+    );
+  });
+
+  it("dispatches account sync through the top-level client API", async () => {
+    const { since, until } = syncWindow();
+    const alphaEventsUrl = "https://api.mailgun.net/v3/alpha.example.com/events";
+    const betaEventsUrl = "https://api.mailgun.net/v3/beta.example.com/events";
+    const alphaDeliveredAt = new Date(since.getTime() + 120_000);
+    const betaDeliveredAt = new Date(since.getTime() + 60_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith("https://api.mailgun.net/v4/domains")) {
+        return jsonResponse({
+          items: [
+            { id: "dom_alpha", name: "alpha.example.com", state: "active" },
+            { id: "dom_beta", name: "beta.example.com", state: "active" },
+          ],
+        });
+      }
+      if (href.startsWith(`${alphaEventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_alpha", alphaDeliveredAt)],
+          paging: {},
+        });
+      }
+      if (href.startsWith(`${betaEventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_beta", betaDeliveredAt)],
+          paging: {},
+        });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onAll = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      hooks: { email: { onAll } },
+    });
+
+    const result = await client.sync({ since, until });
+
+    expect(result).toEqual({ dispatched: 2, syncedFrom: since });
+    expect(onAll.mock.calls.map(([event]) => event.data.eventId)).toEqual([
+      "evt_beta",
+      "evt_alpha",
+    ]);
+  });
+
+  it("replays delivered and stored events oldest-first across pages", async () => {
+    const { since, until } = syncWindow();
+    const deliveredAt = new Date(since.getTime() + 60_000);
+    const storedAt = new Date(since.getTime() + 120_000);
+    const page2Url = `${eventsUrl}/page-2`;
+    const page3Url = `${eventsUrl}/page-3`;
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_delivered_1", deliveredAt)],
+          paging: { next: page2Url },
+        });
+      }
+      if (href === page2Url) {
+        return jsonResponse({
+          items: [storedItem("evt_stored_1", storedAt)],
+          paging: { next: page3Url },
+        });
+      }
+      if (href === page3Url) {
+        return jsonResponse({ items: [], paging: {} });
+      }
+      if (href === storageUrl) {
+        return jsonResponse(storedMessageJson);
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    const firstRequest = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(firstRequest.pathname).toBe("/v3/mg.example.com/events");
+    expect(firstRequest.searchParams.get("begin")).toBe(
+      String(Math.floor(since.getTime() / 1000)),
+    );
+    expect(firstRequest.searchParams.get("end")).toBe(
+      String(Math.floor(until.getTime() / 1000)),
+    );
+    expect(firstRequest.searchParams.get("ascending")).toBe("yes");
+    expect(firstRequest.searchParams.get("limit")).toBe("300");
+
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      type: "delivered",
+      data: {
+        eventId: "evt_delivered_1",
+        messageId: "<sent@example.com>",
+        recipient: "recipient@example.com",
+        status: "delivered",
+      },
+    });
+    expect((events[0].data as { timestamp: Date }).timestamp.getTime()).toBe(
+      deliveredAt.getTime(),
+    );
+    expect(events[1]).toMatchObject({
+      type: "inbound",
+      data: {
+        eventId: "evt_stored_1",
+        messageId: "<stored@example.com>",
+        subject: "Stored message",
+        text: "Stored body",
+        html: "<p>Stored body</p>",
+      },
+    });
+    expect((events[1].data as { timestamp: Date }).timestamp.getTime()).toBe(
+      storedAt.getTime(),
+    );
+
+    const storageCall = fetchMock.mock.calls.find(
+      ([url]) => String(url) === storageUrl,
+    );
+    expect(storageCall?.[1]?.headers).toMatchObject({
+      Authorization: expect.stringContaining("Basic "),
+    });
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+  });
+
+  it("dedupes repeated stored events for the same stored message", async () => {
+    const { since, until } = syncWindow();
+    const storedAt = new Date(since.getTime() + 120_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [
+            storedItem("evt_stored_1", storedAt),
+            storedItem("evt_stored_2", new Date(storedAt.getTime() + 2)),
+            storedItem("evt_stored_3", new Date(storedAt.getTime() + 4)),
+          ],
+          paging: {},
+        });
+      }
+      if (href === storageUrl) {
+        return jsonResponse(storedMessageJson);
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "inbound",
+      data: {
+        eventId: "evt_stored_1",
+        messageId: "<stored@example.com>",
+        subject: "Stored message",
+      },
+    });
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url) === storageUrl),
+    ).toHaveLength(1);
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+  });
+
+  it("does not replay inbound accepted lifecycle events as outbound", async () => {
+    const { since, until } = syncWindow();
+    const acceptedAt = new Date(since.getTime() + 60_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [inboundAcceptedItem("evt_accepted_inbound", acceptedAt)],
+          paging: {},
+        });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "unknown",
+      data: {
+        reason: "mailgun.inbound_accepted_lifecycle",
+        event: "accepted",
+        eventId: "evt_accepted_inbound",
+        messageId: "<stored@example.com>",
+        providerId: "stored_key_1",
+      },
+    });
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+  });
+
+  it("skips events from earlier in the same second as a millisecond since", async () => {
+    const { until } = syncWindow();
+    // `begin` floors to whole seconds, so the API also returns beforeSince.
+    const since = new Date(until.getTime() - 60_000 + 500);
+    const beforeSince = new Date(since.getTime() - 200);
+    const afterSince = new Date(since.getTime() + 200);
+
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        items: [
+          deliveredItem("evt_before_since", beforeSince),
+          deliveredItem("evt_after_since", afterSince),
+        ],
+        paging: {},
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0].data).toMatchObject({ eventId: "evt_after_since" });
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+  });
+
+  it("reports truncated coverage when since is past Mailgun retention", async () => {
+    const now = Date.now();
+    const since = new Date(now - 10 * 24 * 60 * 60 * 1000);
+    const deliveredAt = new Date(now - 2 * 60 * 60 * 1000);
+
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        items: [deliveredItem("evt_delivered_old", deliveredAt)],
+        paging: {},
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(result.syncedFrom.getTime()).toBe(deliveredAt.getTime());
+    expect(result.syncedFrom.getTime()).toBeGreaterThan(since.getTime());
+  });
+
+  it("honors configured eventsRetentionDays as the coverage floor", async () => {
+    const now = Date.now();
+    const since = new Date(now - 10 * 24 * 60 * 60 * 1000);
+
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test", eventsRetentionDays: 30 });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since }),
+    );
+
+    expect(events).toHaveLength(0);
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+  });
+
+  it("reports zero coverage for empty windows fully past retention", async () => {
+    const now = Date.now();
+    const since = new Date(now - 10 * 24 * 60 * 60 * 1000);
+    const until = new Date(now - 5 * 24 * 60 * 60 * 1000);
+
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    expect(events).toHaveLength(0);
+    expect(result.syncedFrom.getTime()).toBe(until.getTime());
+  });
+
+  it("reports lost coverage when stored messages are past storage retention", async () => {
+    const { since, until } = syncWindow();
+    const storedAt = new Date(since.getTime() + 60_000);
+    const deliveredAt = new Date(since.getTime() + 120_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [
+            storedItem("evt_stored_expired", storedAt),
+            deliveredItem("evt_delivered_1", deliveredAt),
+          ],
+          paging: {},
+        });
+      }
+      if (href === storageUrl) {
+        return new Response("Message not found", { status: 404 });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const { events, result } = await drainSync(
+      driver.sync!.domain!({ domain: "mg.example.com", since, until }),
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "delivered",
+      data: { eventId: "evt_delivered_1" },
+    });
+    // The expired stored message could not be replayed, so the reported
+    // coverage starts just after it instead of claiming the full window.
+    expect(result.syncedFrom.getTime()).toBe(storedAt.getTime() + 1);
+  });
+
+  it("rejects the next page fetch when the sync is aborted", async () => {
+    const { since, until } = syncWindow();
+    const deliveredAt = new Date(since.getTime() + 60_000);
+    const page2Url = `${eventsUrl}/page-2`;
+
+    const fetchMock = vi.fn(
+      async (_url: string | URL, init?: RequestInit) => {
+        // Real fetch rejects when called with an already-aborted signal.
+        if (init?.signal?.aborted) {
+          throw new DOMException("This operation was aborted", "AbortError");
+        }
+        return jsonResponse({
+          items: [deliveredItem("evt_delivered_1", deliveredAt)],
+          paging: { next: page2Url },
+        });
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const controller = new AbortController();
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const stream = driver.sync!.domain!({
+      domain: "mg.example.com",
+      since,
+      until,
+      signal: controller.signal,
+    });
+
+    const first = await stream.next();
+    expect(first.done).toBe(false);
+    controller.abort();
+
+    await expect(stream.next()).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("dispatches replayed events through hooks via domains.sync", async () => {
+    const { since, until } = syncWindow();
+    const deliveredAt = new Date(since.getTime() + 60_000);
+    const storedAt = new Date(since.getTime() + 120_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [
+            deliveredItem("evt_delivered_1", deliveredAt),
+            storedItem("evt_stored_1", storedAt),
+          ],
+          paging: {},
+        });
+      }
+      if (href === storageUrl) {
+        return jsonResponse(storedMessageJson);
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onAll = vi.fn();
+    const onInbound = vi.fn();
+    const onDelivered = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      hooks: {
+        email: { onAll, onInbound, onDelivered },
+      },
+    });
+
+    const result = await client.domains.sync({
+      domain: "mg.example.com",
+      since,
+      until,
+      context: { runId: "replay-1" },
+    });
+
+    expect(result.dispatched).toBe(2);
+    expect(result.syncedFrom.getTime()).toBe(since.getTime());
+    expect(onDelivered).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: "evt_delivered_1",
+        messageId: "<sent@example.com>",
+        status: "delivered",
+      }),
+    );
+    expect(onInbound).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: "evt_stored_1",
+        messageId: "<stored@example.com>",
+        subject: "Stored message",
+      }),
+    );
+    expect(onAll).toHaveBeenCalledTimes(2);
+    expect(onAll).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "delivered",
+        context: { runId: "replay-1" },
+      }),
+    );
+    expect(onAll).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "inbound",
+        context: { runId: "replay-1" },
+      }),
+    );
+  });
+
+  it("resolves a domainId to the domain name for domains.sync", async () => {
+    const { since, until } = syncWindow();
+    const deliveredAt = new Date(since.getTime() + 60_000);
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith("https://api.mailgun.net/v4/domains")) {
+        return jsonResponse({
+          items: [{ id: "dom_123", name: "mg.example.com", state: "active" }],
+        });
+      }
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [deliveredItem("evt_delivered_1", deliveredAt)],
+          paging: {},
+        });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onDelivered = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+      hooks: { email: { onDelivered } },
+    });
+
+    const result = await client.domains.sync({
+      domainId: "dom_123",
+      since,
+      until,
+    });
+
+    expect(result.dispatched).toBe(1);
+    expect(onDelivered).toHaveBeenCalledWith(
+      expect.objectContaining({ eventId: "evt_delivered_1" }),
+    );
+    // The events API was queried by domain name, never by the provider id.
+    const eventCalls = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((href) => href.includes("/events"));
+    expect(eventCalls).toHaveLength(1);
+    expect(eventCalls[0]).toContain("/v3/mg.example.com/events");
+  });
+
+  it("throws NOT_FOUND when domains.sync gets an unknown domainId", async () => {
+    const { since } = syncWindow();
+    const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = EmailKit({
+      emailDrivers: [MailgunDriver({ apiKey: "key-test" })],
+    });
+
+    await expect(
+      client.domains.sync({ domainId: "dom_missing", since }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });

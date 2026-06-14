@@ -2,11 +2,17 @@ import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
   EmailKit,
+  EmailKitError,
   OUTLOOK_CAPABILITIES,
+  OUTLOOK_DRAFT_CAPABILITIES,
   OutlookDriver,
   type ConnectMailboxInput,
+  type OutlookDriverConfig,
   type OutlookMailboxAuth,
+  type OutlookSendEmailMode,
   type OutlookSendEmailResult,
+  type SyncStream,
+  type WebhookDriverEvent,
 } from "../src";
 
 afterEach(() => {
@@ -34,8 +40,10 @@ const createDriver = () =>
     autoSubscribeInbound: false,
   });
 
-const createDriverWith = (
-  overrides: Partial<Parameters<typeof OutlookDriver>[0]>,
+const createDriverWith = <
+  const TSendEmailMode extends OutlookSendEmailMode = "sendMail",
+>(
+  overrides: Partial<OutlookDriverConfig<"outlook", TSendEmailMode>>,
 ) =>
   OutlookDriver({
     clientId: "client_123",
@@ -45,6 +53,17 @@ const createDriverWith = (
     autoSubscribeInbound: false,
     ...overrides,
   });
+
+const drainSyncStream = async (
+  stream: SyncStream,
+): Promise<{ events: WebhookDriverEvent[]; result: { syncedFrom: Date } }> => {
+  const events: WebhookDriverEvent[] = [];
+  while (true) {
+    const next = await stream.next();
+    if (next.done) return { events, result: next.value };
+    events.push(next.value);
+  }
+};
 
 describe("OutlookDriver", () => {
   it("defaults to the outlook literal id and preserves custom literal ids", () => {
@@ -86,6 +105,9 @@ describe("OutlookDriver", () => {
       webhooks: {
         mailbox: true,
       },
+      sync: {
+        mailbox: true,
+      },
       publicRoutes: {
         webhook: true,
         lifecycleWebhook: true,
@@ -99,6 +121,9 @@ describe("OutlookDriver", () => {
     expect(driver.capabilities.senderAuth).toBe(true);
     expect(driver.capabilities.senderMailbox).toBe(true);
     expect(driver.capabilities.replyTo).toBe(true);
+    expect(
+      (driver.capabilities as Record<string, unknown>).nativeReplyThreading,
+    ).toBeUndefined();
     expect(driver.capabilities.replyHeaders).toBeUndefined();
     expect(driver.capabilities.replyThreadId).toBeUndefined();
     expect(driver.capabilities.sendTracking).toBeUndefined();
@@ -110,6 +135,8 @@ describe("OutlookDriver", () => {
     expect(driver.capabilities.sandbox).toBeUndefined();
     expect(driver.capabilities.sendIdempotency).toBeUndefined();
     expect(driver.capabilities.webhooks?.mailbox).toBe(true);
+    expect(driver.capabilities.sync?.mailbox).toBe(true);
+    expect(driver.sync?.mailbox).toBeTypeOf("function");
     expect(driver.capabilities.mailboxList).toBeUndefined();
     expect(driver.capabilities.mailboxGet).toBeUndefined();
     expect(driver.capabilities.mailboxCreate).toBeUndefined();
@@ -127,6 +154,23 @@ describe("OutlookDriver", () => {
     });
     expect(emailkit.mailboxes.webhooks.setup).toBeTypeOf("function");
     expectTypeOf(emailkit.mailboxes.webhooks.setup).toBeFunction();
+  });
+
+  it("derives the nativeReplyThreading capability from the configured send mode", () => {
+    const draftDriver = createDriverWith({ sendEmailMode: "draft" });
+    const sendMailDriver = createDriverWith({ sendEmailMode: "sendMail" });
+
+    expect(OUTLOOK_DRAFT_CAPABILITIES).toEqual({
+      ...OUTLOOK_CAPABILITIES,
+      nativeReplyThreading: true,
+    });
+    expect(draftDriver.capabilities).toBe(OUTLOOK_DRAFT_CAPABILITIES);
+    expect(draftDriver.capabilities.nativeReplyThreading).toBe(true);
+    expectTypeOf(
+      draftDriver.capabilities.nativeReplyThreading,
+    ).toEqualTypeOf<true>();
+    expect(sendMailDriver.capabilities).toBe(OUTLOOK_CAPABILITIES);
+    expect(createDriver().capabilities).toBe(OUTLOOK_CAPABILITIES);
   });
 
   it("builds a Microsoft OAuth authorization URL with encrypted state and context", async () => {
@@ -301,7 +345,7 @@ describe("OutlookDriver", () => {
           JSON.stringify({
             id: "subscription_123",
             changeType: "created",
-            resource: "me/mailFolders('Inbox')/messages",
+            resource: "me/messages",
             notificationUrl: WEBHOOK_URL,
             expirationDateTime: "2026-05-24T10:00:00.000Z",
             clientState: "state_123",
@@ -344,7 +388,7 @@ describe("OutlookDriver", () => {
       changeType: "created",
       notificationUrl: WEBHOOK_URL,
       lifecycleNotificationUrl: WEBHOOK_URL,
-      resource: "me/mailFolders('Inbox')/messages",
+      resource: "me/messages",
       expirationDateTime: "2026-05-24T10:00:00.000Z",
       clientState: "state_123",
       latestSupportedTlsVersion: "v1_2",
@@ -368,7 +412,7 @@ describe("OutlookDriver", () => {
     expect(callback.raw).toMatchObject({
       inboundSubscription: {
         id: "subscription_123",
-        resource: "me/mailFolders('Inbox')/messages",
+        resource: "me/messages",
       },
     });
   });
@@ -381,7 +425,7 @@ describe("OutlookDriver", () => {
         JSON.stringify({
           id: "subscription_123",
           changeType: "created",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
           notificationUrl: WEBHOOK_URL,
           lifecycleNotificationUrl: LIFECYCLE_URL,
           expirationDateTime: "2026-05-24T10:00:00.000Z",
@@ -412,7 +456,7 @@ describe("OutlookDriver", () => {
       changeType: "created",
       notificationUrl: WEBHOOK_URL,
       lifecycleNotificationUrl: LIFECYCLE_URL,
-      resource: "me/mailFolders('Inbox')/messages",
+      resource: "me/messages",
       expirationDateTime: "2026-05-24T10:00:00.000Z",
       clientState: "state_123",
       latestSupportedTlsVersion: "v1_2",
@@ -433,7 +477,7 @@ describe("OutlookDriver", () => {
         JSON.stringify({
           id: "subscription_123",
           changeType: "created",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
           notificationUrl: WEBHOOK_URL,
           expirationDateTime: "2026-05-24T10:00:00.000Z",
           clientState: "state_123",
@@ -460,7 +504,7 @@ describe("OutlookDriver", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body))).toEqual({
       changeType: "created",
       notificationUrl: WEBHOOK_URL,
-      resource: "me/mailFolders('Inbox')/messages",
+      resource: "me/messages",
       expirationDateTime: "2026-05-24T10:00:00.000Z",
       clientState: "state_123",
       latestSupportedTlsVersion: "v1_2",
@@ -475,7 +519,7 @@ describe("OutlookDriver", () => {
         JSON.stringify({
           id: "subscription_123",
           changeType: "created",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
           notificationUrl: INBOUND_URL,
           expirationDateTime: "2026-05-24T10:00:00.000Z",
           clientState: "state_123",
@@ -516,7 +560,7 @@ describe("OutlookDriver", () => {
       changeType: "created",
       notificationUrl: INBOUND_URL,
       lifecycleNotificationUrl: INBOUND_URL,
-      resource: "me/mailFolders('Inbox')/messages",
+      resource: "me/messages",
       expirationDateTime: "2026-05-24T10:00:00.000Z",
       clientState: "state_123",
       latestSupportedTlsVersion: "v1_2",
@@ -535,7 +579,7 @@ describe("OutlookDriver", () => {
       raw: {
         inboundSubscription: {
           id: "subscription_123",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
         },
       },
     });
@@ -687,7 +731,7 @@ describe("OutlookDriver", () => {
         JSON.stringify({
           id: "subscription_123",
           changeType: "created",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
           notificationUrl: "https://app.example.com/api/email/outlook",
           expirationDateTime: "2026-05-24T10:00:00.000Z",
         }),
@@ -1258,6 +1302,620 @@ describe("OutlookDriver", () => {
     expect(sendInit!.body).toBeUndefined();
   });
 
+  it("threads draft replies natively through Graph createReply when the source message is found", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "source_message_123",
+                internetMessageId: "<previous@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "reply_draft_123",
+            conversationId: "conversation_123",
+            isDraft: true,
+          }),
+          { status: 201, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "reply_draft_123" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(undefined, {
+          status: 202,
+          headers: { "request-id": "send_req_123" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    const result = (await driver.sendEmail(
+      {
+        from: { email: "support@example.com" },
+        to: { email: "recipient@example.com" },
+        cc: { email: "copy@example.com" },
+        subject: "Re: Hello",
+        html: "<p>Reply</p>",
+        reply: { messageId: "previous@example.com" },
+      },
+      {
+        auth: {
+          accessToken: "access_123",
+          expiresAt: Date.now() + 120_000,
+        } satisfies OutlookMailboxAuth,
+      },
+    )) as OutlookSendEmailResult;
+
+    expect(result).toMatchObject({
+      messageId: "reply_draft_123",
+      provider: "outlook",
+      providerId: "reply_draft_123",
+      threadId: "conversation_123",
+      replyThreading: "applied",
+      requestId: "send_req_123",
+      receiptId: "send_req_123",
+    });
+    expect(result.raw?.messageIdKind).toBe("graphMessageId");
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const [lookupUrl, lookupInit] = fetchMock.mock.calls[0]!;
+    expect(lookupUrl).toBe(
+      `https://graph.microsoft.com/v1.0/me/messages?$filter=${encodeURIComponent(
+        "internetMessageId eq '<previous@example.com>'",
+      )}&$select=id,internetMessageId`,
+    );
+    expect(lookupInit!.method).toBe("GET");
+    expect(lookupInit!.headers).toMatchObject({
+      Authorization: "Bearer access_123",
+      Prefer: 'IdType="ImmutableId"',
+    });
+
+    const [createReplyUrl, createReplyInit] = fetchMock.mock.calls[1]!;
+    expect(createReplyUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/source_message_123/createReply",
+    );
+    expect(createReplyInit!.method).toBe("POST");
+    expect(createReplyInit!.headers).toMatchObject({
+      Authorization: "Bearer access_123",
+      Prefer: 'IdType="ImmutableId"',
+    });
+    expect(createReplyInit!.body).toBeUndefined();
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[2]!;
+    expect(patchUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123",
+    );
+    expect(patchInit!.method).toBe("PATCH");
+    expect(JSON.parse(String(patchInit!.body))).toMatchObject({
+      subject: "Re: Hello",
+      from: { emailAddress: { address: "support@example.com" } },
+      body: { contentType: "HTML", content: "<p>Reply</p>" },
+      toRecipients: [{ emailAddress: { address: "recipient@example.com" } }],
+      ccRecipients: [{ emailAddress: { address: "copy@example.com" } }],
+    });
+
+    const [sendUrl, sendInit] = fetchMock.mock.calls[3]!;
+    expect(sendUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123/send",
+    );
+    expect(sendInit!.method).toBe("POST");
+  });
+
+  it("uploads reply draft attachments individually because Graph PATCH rejects attachments", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "source_message_123",
+                internetMessageId: "<previous@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "reply_draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(undefined, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "attachment_1" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "attachment_2" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(undefined, {
+          status: 202,
+          headers: { "request-id": "send_req_123" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    const result = await driver.sendEmail(
+      {
+        from: { email: "support@example.com" },
+        to: { email: "recipient@example.com" },
+        subject: "Re: Hello",
+        text: "Reply",
+        reply: { messageId: "<previous@example.com>" },
+        attachments: [
+          { filename: "first.txt", content: "one", contentType: "text/plain" },
+          { filename: "second.txt", content: "two", contentType: "text/plain" },
+        ],
+      },
+      {
+        auth: {
+          accessToken: "access_123",
+          expiresAt: Date.now() + 120_000,
+        } satisfies OutlookMailboxAuth,
+      },
+    );
+
+    expect(result.replyThreading).toBe("applied");
+    expect(fetchMock).toHaveBeenCalledTimes(6);
+
+    const patchBody = JSON.parse(String(fetchMock.mock.calls[2]![1]!.body));
+    expect(patchBody).not.toHaveProperty("attachments");
+
+    const [firstAttachmentUrl, firstAttachmentInit] = fetchMock.mock.calls[3]!;
+    expect(firstAttachmentUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123/attachments",
+    );
+    expect(firstAttachmentInit!.method).toBe("POST");
+    expect(JSON.parse(String(firstAttachmentInit!.body))).toMatchObject({
+      "@odata.type": "#microsoft.graph.fileAttachment",
+      name: "first.txt",
+      contentType: "text/plain",
+      contentBytes: "b25l",
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[4]![1]!.body))).toMatchObject(
+      { name: "second.txt", contentBytes: "dHdv" },
+    );
+
+    const [sendUrl] = fetchMock.mock.calls[5]!;
+    expect(sendUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123/send",
+    );
+  });
+
+  it("falls back to an unthreaded draft send when the reply source lookup does not verifiably match", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "unrelated_message_123",
+                internetMessageId: "<unrelated@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(undefined, {
+          status: 202,
+          headers: { "request-id": "send_req_123" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    const result = await driver.sendEmail(
+      {
+        from: { email: "support@example.com" },
+        to: { email: "recipient@example.com" },
+        subject: "Re: Hello",
+        text: "Reply",
+        reply: { messageId: "<previous@example.com>" },
+      },
+      {
+        auth: {
+          accessToken: "access_123",
+          expiresAt: Date.now() + 120_000,
+        } satisfies OutlookMailboxAuth,
+      },
+    );
+
+    expect(result).toMatchObject({
+      messageId: "draft_123",
+      providerId: "draft_123",
+      replyThreading: "skipped",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [createUrl, createInit] = fetchMock.mock.calls[1]!;
+    expect(createUrl).toBe("https://graph.microsoft.com/v1.0/me/messages");
+    expect(JSON.parse(String(createInit!.body))).toMatchObject({
+      subject: "Re: Hello",
+      toRecipients: [{ emailAddress: { address: "recipient@example.com" } }],
+    });
+    const [sendUrl] = fetchMock.mock.calls[2]!;
+    expect(sendUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/draft_123/send",
+    );
+  });
+
+  it("rejects custom headers combined with native reply threading because Graph createReply cannot carry them", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Re: Hello",
+          text: "Reply",
+          reply: { messageId: "<previous@example.com>" },
+          headers: {
+            "X-Correlation-Id": "send_123",
+            "X-Campaign": "welcome",
+          },
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "NOT_SUPPORTED",
+      message:
+        "Outlook cannot combine custom headers with native reply threading: Microsoft Graph createReply does not accept internetMessageHeaders. Send without reply.messageId or without headers.",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the reply draft when the send itself fails because the message may already be out", async () => {
+    const errorBody = {
+      error: { code: "ErrorSendAsDenied", message: "Send denied" },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "source_message_123",
+                internetMessageId: "<previous@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "reply_draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(undefined, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(errorBody), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Re: Hello",
+          text: "Reply",
+          reply: { messageId: "<previous@example.com>" },
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "Send denied",
+      httpStatus: 403,
+      raw: errorBody,
+    });
+
+    // No DELETE after a /send attempt: an ambiguous send failure may still
+    // have delivered the message, and the draft id would then point at the
+    // Sent Items copy.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE"),
+    ).toBe(false);
+  });
+
+  it("deletes the reply draft when the PATCH fails before the send attempt", async () => {
+    const errorBody = {
+      error: { code: "ErrorInvalidRequest", message: "Patch rejected" },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "source_message_123",
+                internetMessageId: "<previous@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "reply_draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(errorBody), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockRejectedValueOnce(new Error("cleanup network error"));
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Re: Hello",
+          text: "Reply",
+          reply: { messageId: "<previous@example.com>" },
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "Patch rejected",
+      httpStatus: 400,
+      raw: errorBody,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[3]!;
+    expect(deleteUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123",
+    );
+    expect(deleteInit!.method).toBe("DELETE");
+    expect(deleteInit!.headers).toMatchObject({
+      Authorization: "Bearer access_123",
+      Prefer: 'IdType="ImmutableId"',
+    });
+  });
+
+  it("deletes the reply draft when an attachment upload fails before the send attempt", async () => {
+    const errorBody = {
+      error: { code: "ErrorAttachmentSizeLimit", message: "Attachment denied" },
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "source_message_123",
+                internetMessageId: "<previous@example.com>",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "reply_draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(undefined, { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(errorBody), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(new Response(undefined, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Re: Hello",
+          text: "Reply",
+          reply: { messageId: "<previous@example.com>" },
+          attachments: [
+            {
+              filename: "first.txt",
+              content: "one",
+              contentType: "text/plain",
+            },
+          ],
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({
+      message: "Attachment denied",
+      httpStatus: 403,
+      raw: errorBody,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    const [deleteUrl, deleteInit] = fetchMock.mock.calls[4]!;
+    expect(deleteUrl).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages/reply_draft_123",
+    );
+    expect(deleteInit!.method).toBe("DELETE");
+    expect(deleteInit!.headers).toMatchObject({
+      Authorization: "Bearer access_123",
+      Prefer: 'IdType="ImmutableId"',
+    });
+  });
+
+  it("keeps the plain draft when a non-reply draft send fails", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "draft_123" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: "Send failed" } }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Hello",
+          text: "Hello",
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({ message: "Send failed", httpStatus: 500 });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE"),
+    ).toBe(false);
+  });
+
+  it("rejects reply.references and reply.threadId even in draft send mode", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({ sendEmailMode: "draft" });
+    const auth = {
+      accessToken: "access_123",
+      expiresAt: Date.now() + 120_000,
+    } satisfies OutlookMailboxAuth;
+
+    for (const reply of [
+      { references: ["<previous@example.com>"] },
+      { threadId: "conversation_123" },
+    ]) {
+      await expect(
+        driver.sendEmail(
+          {
+            from: { email: "support@example.com" },
+            to: { email: "recipient@example.com" },
+            subject: "Re: Hello",
+            text: "Reply",
+            reply,
+          } as Parameters<typeof driver.sendEmail>[0],
+          { auth },
+        ),
+      ).rejects.toMatchObject({ code: "NOT_SUPPORTED" });
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects reply.messageId in sendMail mode because Graph cannot thread without the draft flow", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriver();
+
+    await expect(
+      driver.sendEmail(
+        {
+          from: { email: "support@example.com" },
+          to: { email: "recipient@example.com" },
+          subject: "Re: Hello",
+          text: "Reply",
+          reply: { messageId: "<previous@example.com>" },
+        },
+        {
+          auth: {
+            accessToken: "access_123",
+            expiresAt: Date.now() + 120_000,
+          } satisfies OutlookMailboxAuth,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "NOT_SUPPORTED",
+      message:
+        'Outlook native reply threading via reply.messageId requires draft send mode. Configure sendEmailMode: "draft" (Mail.ReadWrite) to send threaded replies.',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("propagates Microsoft Graph error bodies", async () => {
     const errorBody = {
       error: {
@@ -1736,7 +2394,7 @@ describe("OutlookDriver", () => {
             subscriptionId: "sub_123",
             clientState: "state_123",
             changeType: "created",
-            resource: "me/mailFolders('Inbox')/messages/message_123",
+            resource: "me/messages/message_123",
             tenantId: "tenant_123",
             resourceData: {
               "@odata.type": "#Microsoft.Graph.Message",
@@ -2120,7 +2778,7 @@ describe("OutlookDriver", () => {
         JSON.stringify({
           id: "sub_reauth",
           changeType: "created",
-          resource: "me/mailFolders('Inbox')/messages",
+          resource: "me/messages",
           notificationUrl: "https://app.example.com/api/email/outlook",
           lifecycleNotificationUrl: "https://app.example.com/api/email/outlook",
           expirationDateTime: "2026-05-24T10:00:00.000Z",
@@ -2360,6 +3018,22 @@ describe("OutlookDriver", () => {
     expect(headers.get("Accept")).toBe("application/octet-stream");
   });
 
+  it("rejects external providerFetch URLs before adding Graph auth", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriverWith({
+      webhookAuth: { accessToken: "access_123", tokenType: "Bearer" },
+    });
+
+    await expect(
+      driver.providerFetch!("https://example.com/collect"),
+    ).rejects.toMatchObject({
+      provider: "outlook",
+      code: "INVALID_PROVIDER_FETCH_URL",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("fetches Graph attachment URLs through the webhook auth resolver", async () => {
     const fetchMock = vi
       .fn()
@@ -2438,5 +3112,382 @@ describe("OutlookDriver", () => {
     expect(attachmentHeaders.get("Authorization")).toBe(
       "Bearer resolved_access",
     );
+  });
+
+  it("syncs mailbox messages through Graph list pagination oldest-first", async () => {
+    const since = new Date("2026-06-01T00:00:00.000Z");
+    const until = new Date("2026-06-03T00:00:00.000Z");
+    const nextLink =
+      "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=page2";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "message_1",
+                internetMessageId: "<message_1@example.com>",
+                subject: "First",
+                body: { contentType: "html", content: "<p>First</p>" },
+                bodyPreview: "First",
+                from: {
+                  emailAddress: {
+                    address: "first@example.com",
+                    name: "First Sender",
+                  },
+                },
+                toRecipients: [
+                  { emailAddress: { address: "support@example.com" } },
+                ],
+                receivedDateTime: "2026-06-01T10:00:00Z",
+                conversationId: "thread_1",
+                attachments: [
+                  {
+                    id: "attachment_1",
+                    name: "invoice.pdf",
+                    contentType: "application/pdf",
+                    size: 1234,
+                  },
+                ],
+              },
+            ],
+            "@odata.nextLink": nextLink,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "message_2",
+                internetMessageId: "<message_2@example.com>",
+                subject: "Second",
+                body: { contentType: "text", content: "Second body" },
+                from: { emailAddress: { address: "second@example.com" } },
+                toRecipients: [
+                  { emailAddress: { address: "support@example.com" } },
+                ],
+                receivedDateTime: "2026-06-02T10:00:00Z",
+              },
+              {
+                id: "sent_message",
+                internetMessageId: "<sent_message@example.com>",
+                subject: "Sent message",
+                body: { contentType: "text", content: "Sent body" },
+                from: { emailAddress: { address: "support@example.com" } },
+                toRecipients: [
+                  { emailAddress: { address: "customer@example.com" } },
+                ],
+                receivedDateTime: "2026-06-02T12:00:00Z",
+              },
+              {
+                id: "sent_alias_message",
+                internetMessageId: "<sent_alias_message@example.com>",
+                subject: "Sent alias message",
+                body: { contentType: "text", content: "Sent alias body" },
+                from: { emailAddress: { address: "alias@example.com" } },
+                toRecipients: [
+                  { emailAddress: { address: "customer@example.com" } },
+                ],
+                receivedDateTime: "2026-06-02T13:00:00Z",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriver();
+
+    const { events, result } = await drainSyncStream(
+      driver.sync!.mailbox!(
+        {
+          mailbox: {
+            id: "mailbox_123",
+            email: "support@example.com",
+            raw: { user: { mail: "alias@example.com" } },
+          },
+          since,
+          until,
+        },
+        { auth: { accessToken: "access_123", tokenType: "Bearer" } },
+      ),
+    );
+
+    expect(result).toEqual({ syncedFrom: since });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const listUrl = new URL(String(fetchMock.mock.calls[0]![0]));
+    expect(`${listUrl.origin}${listUrl.pathname}`).toBe(
+      "https://graph.microsoft.com/v1.0/me/messages",
+    );
+    expect(listUrl.searchParams.get("$filter")).toBe(
+      "receivedDateTime ge 2026-06-01T00:00:00.000Z and receivedDateTime lt 2026-06-03T00:00:00.000Z",
+    );
+    expect(listUrl.searchParams.get("$orderby")).toBe("receivedDateTime asc");
+    expect(listUrl.searchParams.get("$top")).toBe("50");
+    expect(listUrl.searchParams.get("$select")).toContain("internetMessageId");
+    expect(listUrl.searchParams.get("$expand")).toBe(
+      "attachments($select=id,name,contentType,size,isInline)",
+    );
+    expect(fetchMock.mock.calls[0]![1]).toMatchObject({
+      headers: {
+        Authorization: "Bearer access_123",
+        Accept: "application/json",
+      },
+    });
+    expect(fetchMock.mock.calls[1]![0]).toBe(nextLink);
+
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({
+      type: "inbound",
+      data: {
+        schemaVersion: "1",
+        eventId: "sync:message_1",
+        messageId: "<message_1@example.com>",
+        providerId: "message_1",
+        from: { email: "first@example.com", name: "First Sender" },
+        to: [{ email: "support@example.com" }],
+        reply: { threadId: "thread_1" },
+        subject: "First",
+        html: "<p>First</p>",
+        timestamp: new Date("2026-06-01T10:00:00Z"),
+        attachments: [
+          {
+            filename: "invoice.pdf",
+            contentType: "application/pdf",
+            size: 1234,
+            url: "https://graph.microsoft.com/v1.0/me/messages/message_1/attachments/attachment_1/$value",
+            provider: { outlook: {} },
+          },
+        ],
+      },
+    });
+    expect(events[1]).toMatchObject({
+      type: "inbound",
+      data: {
+        eventId: "sync:message_2",
+        messageId: "<message_2@example.com>",
+        subject: "Second",
+        text: "Second body",
+        timestamp: new Date("2026-06-02T10:00:00Z"),
+      },
+    });
+  });
+
+  it("refreshes expired mailbox auth before syncing and reports the new auth", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-04T10:00:00.000Z"));
+    const onAuthUpdated = vi.fn();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: "access_new",
+            refresh_token: "refresh_new",
+            expires_in: 7200,
+            scope: "offline_access User.Read Mail.Send Mail.Read",
+            token_type: "Bearer",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ value: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriver();
+
+    const { events, result } = await drainSyncStream(
+      driver.sync!.mailbox!(
+        {
+          mailbox: { id: "user_123", email: "support@example.com" },
+          since: new Date("2026-06-01T00:00:00.000Z"),
+          until: new Date("2026-06-04T00:00:00.000Z"),
+        },
+        {
+          auth: {
+            accessToken: "access_old",
+            refreshToken: "refresh_old",
+            expiresAt: Date.parse("2026-06-04T09:59:00.000Z"),
+            scopes: ["offline_access", "User.Read", "Mail.Send", "Mail.Read"],
+            tokenType: "Bearer",
+          } satisfies OutlookMailboxAuth,
+          onAuthUpdated,
+        },
+      ),
+    );
+
+    expect(events).toEqual([]);
+    expect(result).toEqual({
+      syncedFrom: new Date("2026-06-01T00:00:00.000Z"),
+    });
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    );
+    const refreshBody = fetchMock.mock.calls[0]![1]!.body as URLSearchParams;
+    expect(refreshBody.get("grant_type")).toBe("refresh_token");
+    expect(refreshBody.get("refresh_token")).toBe("refresh_old");
+    expect(fetchMock.mock.calls[1]![1]).toMatchObject({
+      headers: { Authorization: "Bearer access_new" },
+    });
+    expect(onAuthUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        auth: expect.objectContaining({
+          accessToken: "access_new",
+          refreshToken: "refresh_new",
+        }),
+        previousAuth: expect.objectContaining({ accessToken: "access_old" }),
+        mailbox: { id: "user_123", email: "support@example.com" },
+      }),
+    );
+  });
+
+  it("wraps Graph sync listing failures in EmailKitError", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          error: { code: "ErrorAccessDenied", message: "Access is denied" },
+        }),
+        { status: 403, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const driver = createDriver();
+
+    const stream = driver.sync!.mailbox!(
+      { email: "support@example.com", since: new Date("2026-06-01T00:00:00.000Z") },
+      { auth: { accessToken: "access_123" } },
+    );
+
+    const error = await stream.next().catch((caught) => caught);
+    expect(error).toBeInstanceOf(EmailKitError);
+    expect(error).toMatchObject({
+      provider: "outlook",
+      httpStatus: 403,
+      message: "Access is denied",
+    });
+  });
+
+  it("replays synced Outlook messages through EmailKit inbound hooks with sync context", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          value: [
+            {
+              id: "message_1",
+              internetMessageId: "<message_1@example.com>",
+              subject: "First",
+              body: { contentType: "text", content: "First body" },
+              from: { emailAddress: { address: "first@example.com" } },
+              toRecipients: [
+                { emailAddress: { address: "support@example.com" } },
+              ],
+              receivedDateTime: "2026-06-01T10:00:00Z",
+            },
+            {
+              id: "message_2",
+              internetMessageId: "<message_2@example.com>",
+              subject: "Second",
+              body: { contentType: "text", content: "Second body" },
+              from: { emailAddress: { address: "second@example.com" } },
+              toRecipients: [
+                { emailAddress: { address: "support@example.com" } },
+              ],
+              receivedDateTime: "2026-06-02T10:00:00Z",
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const onInbound = vi.fn();
+    const onAll = vi.fn();
+    const emailkit = EmailKit({
+      emailDrivers: [createDriver()],
+      hooks: { email: { onInbound, onAll } },
+      secret: "emailkit-secret",
+    });
+
+    const since = new Date("2026-06-01T00:00:00.000Z");
+    const result = await emailkit.mailboxes.sync({
+      email: "support@example.com",
+      auth: { accessToken: "access_123" },
+      since,
+      until: new Date("2026-06-03T00:00:00.000Z"),
+      context: { tenantId: "tenant_123" },
+    });
+
+    expect(result).toEqual({ dispatched: 2, syncedFrom: since });
+    expect(onInbound).toHaveBeenCalledTimes(2);
+    expect(onInbound.mock.calls.map(([event]) => event.subject)).toEqual([
+      "First",
+      "Second",
+    ]);
+    expect(onInbound.mock.calls[0]![0]).toMatchObject({
+      emailDriver: "outlook",
+      messageId: "<message_1@example.com>",
+    });
+    expect(onAll).toHaveBeenCalledTimes(2);
+    expect(onAll.mock.calls[0]![0]).toMatchObject({
+      emailDriver: "outlook",
+      type: "inbound",
+      context: { tenantId: "tenant_123" },
+    });
+  });
+
+  it("rejects the next page fetch when the abort signal fires between pages", async () => {
+    const fetchMock = vi.fn(
+      async (_url: string | URL, init?: RequestInit) => {
+        // Real fetch rejects when called with an already-aborted signal.
+        if (init?.signal?.aborted) {
+          throw new DOMException("This operation was aborted", "AbortError");
+        }
+        return new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "message_1",
+                subject: "First",
+                body: { contentType: "text", content: "First body" },
+                from: { emailAddress: { address: "first@example.com" } },
+                toRecipients: [
+                  { emailAddress: { address: "support@example.com" } },
+                ],
+                receivedDateTime: "2026-06-01T10:00:00Z",
+              },
+            ],
+            "@odata.nextLink":
+              "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=page2",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const driver = createDriver();
+
+    const stream = driver.sync!.mailbox!(
+      {
+        email: "support@example.com",
+        since: new Date("2026-06-01T00:00:00.000Z"),
+        signal: controller.signal,
+      },
+      { auth: { accessToken: "access_123" } },
+    );
+
+    const first = await stream.next();
+    expect(first.done).toBe(false);
+    controller.abort();
+    await expect(stream.next()).rejects.toMatchObject({ name: "AbortError" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

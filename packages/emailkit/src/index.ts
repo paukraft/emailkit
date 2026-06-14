@@ -53,6 +53,7 @@ export const EmailKit = <const TDrivers extends EmailDriverTuple>(
 // Export types
 export type {
   AllEventsHook,
+  AccountSyncInput,
   AccountWebhookDeleteInput,
   AccountWebhookDeleteResult,
   AccountWebhookRefreshInput,
@@ -71,6 +72,7 @@ export type {
   DomainIdentifierType,
   DomainOperationInput,
   DomainStatus,
+  DomainSyncInput,
   DomainVerification,
   DomainWebhookDeleteInput,
   DomainWebhookDeleteResult,
@@ -84,6 +86,7 @@ export type {
   DriverPublicRoutes,
   DriverPublicRouteCapabilities,
   DriverSendTrackingCapabilities,
+  DriverSyncCapabilities,
   DriverWebhookCapabilities,
   EmailTag,
   EmailDriverSelector,
@@ -101,6 +104,7 @@ export type {
   MailboxAuthUpdatedHookEvent,
   MailboxConnectionResult,
   MailboxDeleteResult,
+  MailboxSyncInput,
   MailboxWebhookDeleteInput,
   MailboxWebhookDeleteResult,
   MailboxWebhookRefreshInput,
@@ -129,6 +133,8 @@ export type {
   PublicRoutesConfig,
   PublicRouteTemplate,
   SendEmailResult,
+  SyncInput,
+  SyncResult,
   TrackConfig,
   UnknownEventHook,
   UnsubscribeConfig,
@@ -173,6 +179,7 @@ export type {
   DriverId,
   DriverMailboxesAPI,
   DriverMailboxWebhooksAPI,
+  DriverSyncAPI,
   DriverWebhookScopeAPI,
   DriverWebhooksAPI,
   EmailDriver,
@@ -182,6 +189,7 @@ export type {
   ProviderFetchParamValue,
   ProviderFetchSearchParams,
   SendEmailOptions,
+  SyncStream,
 } from "./driver";
 
 export type {
@@ -201,10 +209,10 @@ export type {
   SendEmailMessage,
 } from "./client";
 
-export { EmailKitError } from "./types";
+export { EmailKitError, EmailKitSyncError } from "./types";
 
 // Export package version constant (keep in sync with package.json)
-export const VERSION = "2.0.0";
+export const VERSION = "2.0.1";
 
 // Export drivers
 export {
@@ -224,11 +232,18 @@ export type { AIInbxCapabilities, AIInbxDriverConfig } from "./drivers/aiinbx";
 export { RESEND_CAPABILITIES, ResendDriver } from "./drivers/resend";
 export type { ResendCapabilities, ResendDriverConfig } from "./drivers/resend";
 
-export { OUTLOOK_CAPABILITIES, OutlookDriver } from "./drivers/outlook";
+export {
+  OUTLOOK_CAPABILITIES,
+  OUTLOOK_DRAFT_CAPABILITIES,
+  OutlookDriver,
+} from "./drivers/outlook";
 export type {
   OutlookCapabilities,
+  OutlookCapabilitiesForSendMode,
+  OutlookDraftCapabilities,
   OutlookDriverConfig,
   OutlookMailboxAuth,
+  OutlookSendEmailMode,
   OutlookSendEmailResult,
 } from "./drivers/outlook";
 

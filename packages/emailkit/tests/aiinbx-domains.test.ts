@@ -51,6 +51,48 @@ describe("AIInbxDriver domains", () => {
     expect(driver.mailboxes).toBeUndefined();
   });
 
+  it("scopes providerFetch to the versioned AIINBX API base", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = AIInbxDriver({
+      apiKey: "ai_test",
+      apiBase: "https://api.example.com",
+    });
+
+    await driver.providerFetch!("/domains");
+    await driver.providerFetch!("https://api.example.com/api/v1/domains");
+    await driver.providerFetch!("https://files.example.com/report.txt");
+
+    const [relativeUrl, relativeInit] = fetchMock.mock.calls[0] as [
+      URL,
+      RequestInit,
+    ];
+    const [absoluteApiUrl, absoluteApiInit] = fetchMock.mock.calls[1] as [
+      URL,
+      RequestInit,
+    ];
+    const [externalUrl, externalInit] = fetchMock.mock.calls[2] as [
+      string | URL,
+      RequestInit,
+    ];
+
+    expect(relativeUrl.toString()).toBe("https://api.example.com/api/v1/domains");
+    expect(absoluteApiUrl.toString()).toBe(
+      "https://api.example.com/api/v1/domains",
+    );
+    expect(new Headers(relativeInit.headers).get("authorization")).toBe(
+      "Bearer ai_test",
+    );
+    expect(new Headers(absoluteApiInit.headers).get("authorization")).toBe(
+      "Bearer ai_test",
+    );
+    expect(externalUrl.toString()).toBe("https://files.example.com/report.txt");
+    expect(new Headers(externalInit.headers).get("authorization")).toBeNull();
+  });
+
   it("maps list responses that expose DNS records as records", async () => {
     vi.stubGlobal(
       "fetch",

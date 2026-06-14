@@ -13,9 +13,11 @@ import type {
   ProviderFetch,
   ProviderFetchInit,
   SendEmailOptions,
+  SyncStream,
 } from "../driver";
 import type { DriverDomainsAPI } from "../driver";
 import type {
+  AccountSyncInput,
   Attachment,
   DriverCapabilities,
   EmailAddress,
@@ -129,6 +131,27 @@ interface AIInbxEmail {
     signedUrl: string;
     expiresAt: string;
   }>;
+}
+
+/**
+ * AIInbx POST /threads/search response (from OpenAPI spec)
+ */
+interface AIInbxThreadSearchResponse {
+  threads: Array<{ id: string }>;
+  pagination: {
+    total: number;
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+  };
+}
+
+/**
+ * AIInbx GET /threads/{threadId} response (from OpenAPI spec)
+ */
+interface AIInbxThreadResponse {
+  id: string;
+  emails: AIInbxEmail[];
 }
 
 /**
@@ -274,6 +297,7 @@ export const AIINBX_CAPABILITIES = {
     delete: true,
     identifier: "domainId" as const,
   },
+  sync: { account: true },
 } as const satisfies DriverCapabilities;
 
 /**
@@ -338,13 +362,14 @@ const createAIInbxProviderFetch = (
  */
 const retrieveAIInbxAttachments = async (
   attachmentMetadata: Attachment[],
+  signal?: AbortSignal,
 ): Promise<Attachment[]> => {
   const attachments: Attachment[] = [];
 
   for (const attachmentMeta of attachmentMetadata) {
     if (attachmentMeta.url) {
       try {
-        const res = await fetch(attachmentMeta.url);
+        const res = await fetch(attachmentMeta.url, { signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = new Uint8Array(await res.arrayBuffer());
 
@@ -358,6 +383,8 @@ const retrieveAIInbxAttachments = async (
           isInline: attachmentMeta.isInline,
         });
       } catch (error) {
+        // Failed downloads degrade to metadata, but an abort must propagate.
+        if (signal?.aborted) throw error;
         console.error(
           `Failed to retrieve AIInbx attachment ${attachmentMeta.filename}:`,
           error,
@@ -379,8 +406,9 @@ const retrieveAIInbxAttachments = async (
 const transformInboundEmail = async (
   email: AIInbxEmail,
   timestamp: number,
-  rawPayload: AIInbxWebhookEvent,
+  rawPayload: unknown,
   autoFetchAttachments: boolean,
+  signal?: AbortSignal,
 ): Promise<InboundEmailEvent> => {
   const parseEmailAddressList = (addresses: string[]): EmailAddress[] => {
     return addresses.map((addr) => parseEmailAddress(addr));
@@ -423,7 +451,7 @@ const transformInboundEmail = async (
 
   // Optionally fetch attachment content from signed URLs
   const attachments = autoFetchAttachments
-    ? await retrieveAIInbxAttachments(attachmentMetadata)
+    ? await retrieveAIInbxAttachments(attachmentMetadata, signal)
     : attachmentMetadata;
 
   const event: InboundEmailEvent = {
@@ -690,8 +718,19 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
     };
   };
 
-  const listDomainPayloads = async (): Promise<any[]> => {
-    const res = await fetch(`${baseUrl}/domains`, { headers: authHeader });
+  const requestApi = async (
+    path: string,
+    init: RequestInit,
+    action: string,
+  ): Promise<unknown> => {
+    const res = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: {
+        ...authHeader,
+        ...(init.body ? { "Content-Type": "application/json" } : {}),
+        ...init.headers,
+      },
+    });
     const contentType = res.headers.get("content-type") || "";
     const body = contentType.includes("application/json")
       ? await res.json()
@@ -700,7 +739,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       throw new EmailKitError(
         typeof (body as any)?.message === "string"
           ? (body as any).message
-          : `HTTP ${res.status}: Failed to list domains`,
+          : `HTTP ${res.status}: Failed to ${action}`,
         "aiinbx",
         undefined,
         res.status,
@@ -708,6 +747,11 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
         body,
       );
     }
+    return body;
+  };
+
+  const listDomainPayloads = async (): Promise<any[]> => {
+    const body = await requestApi("/domains", { method: "GET" }, "list domains");
     return ((body as any)?.domains || []) as any[];
   };
 
@@ -733,7 +777,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
     id: driverId,
     name: "aiinbx",
     capabilities: AIINBX_CAPABILITIES,
-    providerFetch: createAIInbxProviderFetch(apiBase, config.apiKey),
+    providerFetch: createAIInbxProviderFetch(baseUrl, config.apiKey),
 
     sendEmail: async (
       message: EmailMessage<typeof AIINBX_CAPABILITIES>,
@@ -1055,8 +1099,11 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       return { type: "unknown", data: payload };
     },
 
-    verifyWebhook: config.webhookSecret
-      ? async (request: WebhookRequest): Promise<boolean> => {
+    verifyWebhook: async (request: WebhookRequest): Promise<boolean> => {
+      if (!config.webhookSecret) {
+        return false;
+      }
+
           // AIInbx uses HMAC SHA-256 signature verification
           // Signature format: sha256=HMAC_SHA256(timestamp.body, webhookSecret)
           // Note: Uses a dot (.) between timestamp and body, not concatenation
@@ -1081,7 +1128,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
             const payload = `${timestampHeader}.${bodyString}`;
             const expectedSignature =
               "sha256=" +
-              createHmac("sha256", config.webhookSecret!)
+              createHmac("sha256", config.webhookSecret)
                 .update(payload)
                 .digest("hex");
 
@@ -1101,8 +1148,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
           } catch {
             return false;
           }
-        }
-      : undefined,
+    },
 
     webhookResponse: async (
       request: WebhookRequest,
@@ -1114,6 +1160,86 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       };
     },
 
+    sync: {
+      /**
+       * Replay missed inbound emails from the threads API.
+       *
+       * AIInbx has no flat list-emails endpoint; `POST /threads/search`
+       * filters by `lastEmailAfter` (ascending by lastEmailAt, offset
+       * pagination) and `GET /threads/{id}` returns each thread's full
+       * emails. Threads order by their latest email, so emails interleave
+       * across threads; the windowed inbound emails are buffered and sorted
+       * ascending before replay, with attachment fetching deferred to yield
+       * time. Outbound tracking events are not listable via the AIInbx API,
+       * so sync is inbound-only.
+       */
+      account: async function* (input: AccountSyncInput): SyncStream {
+        const since = input.since;
+        const until = input.until ?? new Date();
+
+        const threadIds: string[] = [];
+        let offset = 0;
+        while (true) {
+          const page = (await requestApi(
+            "/threads/search",
+            {
+              method: "POST",
+              signal: input.signal,
+              body: JSON.stringify({
+                // 1ms earlier so boundary emails survive either
+                // inclusive/exclusive "after" semantics.
+                lastEmailAfter: new Date(since.getTime() - 1).toISOString(),
+                sortBy: "lastEmailAt",
+                sortOrder: "asc",
+                limit: 100,
+                offset,
+              }),
+            },
+            "search threads",
+          )) as AIInbxThreadSearchResponse;
+
+          const threads = page.threads || [];
+          threadIds.push(...threads.map((thread) => thread.id));
+          if (!page.pagination?.hasMore || threads.length === 0) break;
+          offset += threads.length;
+        }
+
+        const windowed: Array<{ email: AIInbxEmail; receivedAt: number }> = [];
+        for (const threadId of threadIds) {
+          const thread = (await requestApi(
+            `/threads/${encodeURIComponent(threadId)}`,
+            { method: "GET", signal: input.signal },
+            "get thread",
+          )) as AIInbxThreadResponse;
+
+          for (const email of thread.emails || []) {
+            if (email.direction !== "INBOUND") continue;
+            const receivedAt = new Date(
+              email.receivedAt || email.createdAt,
+            ).getTime();
+            if (Number.isNaN(receivedAt)) continue;
+            if (receivedAt < since.getTime() || receivedAt >= until.getTime())
+              continue;
+            windowed.push({ email, receivedAt });
+          }
+        }
+        windowed.sort((a, b) => a.receivedAt - b.receivedAt);
+
+        for (const { email, receivedAt } of windowed) {
+          const event = await transformInboundEmail(
+            email,
+            receivedAt / 1000,
+            email,
+            config.autoFetchInboundAttachments ?? true,
+            input.signal,
+          );
+          yield { type: "inbound", data: event };
+        }
+
+        return { syncedFrom: since };
+      },
+    },
+
     // Domains API (partial)
     domains: {
       list: async (): Promise<Domain[]> => {
@@ -1121,28 +1247,11 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       },
 
       create: async (input): Promise<Domain> => {
-        const url = `${baseUrl}/domains`;
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { ...authHeader, "Content-Type": "application/json" },
-          body: JSON.stringify({ domain: input.domain }),
-        });
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to create domain`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
+        const body = await requestApi(
+          "/domains",
+          { method: "POST", body: JSON.stringify({ domain: input.domain }) },
+          "create domain",
+        );
         const domainId = (body as any)?.domainId as string;
         const recs = ((body as any)?.records || []) as any[];
         const records = recs.map(mapDnsRecord);
@@ -1159,51 +1268,21 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
       get: async (idOrName: string): Promise<Domain> => {
         const id = await resolveDomainId(idOrName);
-        const url = `${baseUrl}/domains/${id}`;
-        const res = await fetch(url, { headers: authHeader });
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to get domain`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
+        const body = await requestApi(
+          `/domains/${id}`,
+          { method: "GET" },
+          "get domain",
+        );
         return normalizeDomain(body);
       },
 
       verify: async (idOrName: string): Promise<DomainVerification> => {
         const id = await resolveDomainId(idOrName);
-        const url = `${baseUrl}/domains/${id}/verify`;
-        const res = await fetch(url, {
-          method: "POST",
-          headers: { ...authHeader, "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        });
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to verify domain`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
+        const body = await requestApi(
+          `/domains/${id}/verify`,
+          { method: "POST", body: JSON.stringify({}) },
+          "verify domain",
+        );
         const domainObj = ((body as any)?.domain ?? body) as any;
         const status = mapDomainStatus(domainObj?.status);
         const recs = extractDnsRecords(domainObj) ?? [];
@@ -1218,26 +1297,8 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
       delete: async (idOrName: string): Promise<{ deleted: boolean }> => {
         const id = await resolveDomainId(idOrName);
-        const url = `${baseUrl}/domains/${id}`;
-        const res = await fetch(url, { method: "DELETE", headers: authHeader });
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-        if (!res.ok) {
-          throw new EmailKitError(
-            typeof (body as any)?.message === "string"
-              ? (body as any).message
-              : `HTTP ${res.status}: Failed to delete domain`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
-        const success = Boolean((body as any)?.success === true || res.ok);
-        return { deleted: success };
+        await requestApi(`/domains/${id}`, { method: "DELETE" }, "delete domain");
+        return { deleted: true };
       },
     },
   };

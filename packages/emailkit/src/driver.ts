@@ -84,10 +84,13 @@
  */
 
 import type {
+  AccountSyncInput,
+  DomainSyncInput,
   DriverCapabilities,
   EmailMessage,
   DriverPublicRoutes,
   Mailbox,
+  MailboxSyncInput,
   MailboxIdentity,
   MailboxConnectionResult,
   MailboxDeleteResult,
@@ -113,6 +116,7 @@ import type {
   MailboxWebhookSetupInput,
   MailboxWebhookSetupResult,
   SendEmailResult,
+  WebhookDriverEvent,
   WebhookEventResult,
   WebhookRequest,
   WebhookResponse,
@@ -275,6 +279,12 @@ export interface EmailDriver<
   webhooks?: Partial<DriverWebhooksAPI<TCapabilities>>;
 
   /**
+   * Optional sync/replay API grouped by normalized scope.
+   * Implement scopes your provider supports; unsupported scopes can be omitted.
+   */
+  sync?: Partial<DriverSyncAPI<TCapabilities>>;
+
+  /**
    * Optional OAuth/callback handler for GET requests routed through `handler()`.
    */
   handleCallback?: (
@@ -428,4 +438,34 @@ export interface DriverWebhooksAPI<
   account: Partial<DriverAccountWebhooksAPI<TCapabilities>>;
   mailbox: Partial<DriverMailboxWebhooksAPI<TCapabilities>>;
   domain: Partial<DriverDomainWebhooksAPI<TCapabilities>>;
+}
+
+/**
+ * Stream of replayed events produced by a driver sync operation.
+ * Events are yielded oldest-first; the generator must return the earliest
+ * covered time.
+ */
+export type SyncStream = AsyncGenerator<
+  WebhookDriverEvent,
+  { syncedFrom: Date }
+>;
+
+/**
+ * Standardized sync (replay of missed events) operations a driver may implement.
+ */
+export interface DriverSyncAPI<
+  TCapabilities extends DriverCapabilities = DriverCapabilities,
+> {
+  account: (
+    input: AccountSyncInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => SyncStream;
+  mailbox: (
+    input: MailboxSyncInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => SyncStream;
+  domain: (
+    input: DomainSyncInput,
+    options?: EmailDriverOperationOptions<TCapabilities>,
+  ) => SyncStream;
 }

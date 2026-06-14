@@ -10,6 +10,7 @@ const EVENT_LABEL_MAP: [string, string][] = [
   ["send", "Sent"],
   ["inbound", "Inbound"],
   ["outbound", "Accepted"],
+  ["sync", "Sync"],
   ["webhook", "Webhook"],
   ["domain", "Domain"],
   ["mailbox", "Mailbox"],
