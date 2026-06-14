@@ -1,6 +1,6 @@
 {
   "name": "emailkit",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Unified email API for multiple providers.",
   "type": "module",
   "license": "MIT",

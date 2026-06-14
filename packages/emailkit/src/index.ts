@@ -212,7 +212,7 @@ export type {
 export { EmailKitError, EmailKitSyncError } from "./types";
 
 // Export package version constant (keep in sync with package.json)
-export const VERSION = "2.0.1";
+export const VERSION = "2.0.2";
 
 // Export drivers
 export {
