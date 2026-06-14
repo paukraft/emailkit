@@ -170,6 +170,86 @@ describe("ResendDriver sync", () => {
     expect(detailIds).toEqual(["email_1", "email_2", "email_3"]);
   });
 
+  it("replays received attachments with webhook-compatible shape and lazy content retrieval", async () => {
+    const downloadUrl =
+      "https://resend-attachments.example.com/email_1/report.txt";
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = new URL(input.toString());
+
+      if (url.pathname === "/emails/receiving") {
+        return jsonResponse({
+          object: "list",
+          has_more: false,
+          data: [listItem("email_1", CREATED_AT.email_1!)],
+        });
+      }
+
+      if (url.pathname === "/emails/receiving/email_1") {
+        return jsonResponse(receivedEmail("email_1"));
+      }
+
+      if (url.pathname === "/emails/receiving/email_1/attachments") {
+        return jsonResponse({
+          object: "list",
+          has_more: false,
+          data: [
+            {
+              id: "att_1",
+              filename: "report.txt",
+              size: 14,
+              content_type: "text/plain",
+              content_disposition: "attachment",
+              content_id: null,
+              download_url: downloadUrl,
+              expires_at: "2026-06-02T11:00:00.000Z",
+            },
+          ],
+        });
+      }
+
+      if (input.toString() === downloadUrl) {
+        return new Response("resend content", { status: 200 });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onInbound = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [
+        ResendDriver({
+          id: "support-resend",
+          apiKey: "re_test",
+          autoFetchInboundAttachments: false,
+        }),
+      ],
+      hooks: { email: { onInbound } },
+    });
+
+    await client.sync({ since: SINCE, until: UNTIL });
+
+    const inbound = onInbound.mock.calls[0]![0];
+    expect(inbound.attachments).toEqual([
+      {
+        filename: "report.txt",
+        contentType: "text/plain",
+        size: 14,
+        contentId: undefined,
+        isInline: false,
+        url: downloadUrl,
+        emailDriver: "support-resend",
+      },
+    ]);
+
+    const content = await client.attachments.getContent(inbound.attachments[0]);
+    expect(new TextDecoder().decode(content as Uint8Array)).toBe(
+      "resend content",
+    );
+    const [, init] = fetchMock.mock.calls.at(-1)!;
+    expect(new Headers(init?.headers).get("authorization")).toBeNull();
+  });
+
   it("rejects in-flight hydration when the sync signal aborts", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(

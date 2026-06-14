@@ -1778,6 +1778,89 @@ describe("MailgunDriver sync", () => {
     expect(result.syncedFrom.getTime()).toBe(since.getTime());
   });
 
+  it("replays stored inbound attachments with webhook-compatible lazy retrieval", async () => {
+    const { since, until } = syncWindow();
+    const storedAt = new Date(since.getTime() + 120_000);
+    const attachmentUrl =
+      "https://storage.mailgun.net/v3/domains/mg.example.com/messages/stored_key_1/attachments/0";
+    const storedMessageWithAttachment = {
+      ...storedMessageJson,
+      attachments: [
+        {
+          filename: "invoice.pdf",
+          url: attachmentUrl,
+          "content-type": "application/pdf",
+          size: 42,
+        },
+      ],
+    };
+
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [storedItem("evt_stored_1", storedAt)],
+          paging: {},
+        });
+      }
+      if (href === storageUrl) {
+        return jsonResponse(storedMessageWithAttachment);
+      }
+      if (href === attachmentUrl) {
+        return new Response("mailgun content", { status: 200 });
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onInbound = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [
+        MailgunDriver({
+          id: "support-mailgun",
+          apiKey: "key-test",
+          autoFetchInboundAttachments: false,
+        }),
+      ],
+      hooks: { email: { onInbound } },
+    });
+
+    await client.domains.sync({
+      emailDriver: "support-mailgun",
+      domain: "mg.example.com",
+      since,
+      until,
+    });
+
+    const inbound = onInbound.mock.calls[0]![0];
+    expect(inbound.attachments).toHaveLength(1);
+    expect(inbound.attachments[0]).toMatchObject({
+      filename: "invoice.pdf",
+      contentType: "application/pdf",
+      size: 42,
+      emailDriver: "support-mailgun",
+      provider: {
+        mailgun: {
+          kind: "stored-inbound-attachment",
+          storageUrl,
+          storageKey: "stored_key_1",
+          attachmentUrl,
+          filename: "invoice.pdf",
+          index: 0,
+        },
+      },
+    });
+
+    const content = await client.attachments.getContent(inbound.attachments[0]);
+    expect(new TextDecoder().decode(content as Uint8Array)).toBe(
+      "mailgun content",
+    );
+    const [, init] = fetchMock.mock.calls.at(-1)!;
+    expect(new Headers(init?.headers).get("authorization")).toMatch(
+      /^Basic /,
+    );
+  });
+
   it("dedupes repeated stored events for the same stored message", async () => {
     const { since, until } = syncWindow();
     const storedAt = new Date(since.getTime() + 120_000);

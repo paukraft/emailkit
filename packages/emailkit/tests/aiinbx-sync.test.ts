@@ -179,6 +179,87 @@ describe("AIInbxDriver sync", () => {
     });
   });
 
+  it("replays inbound attachments with webhook-compatible shape and lazy content retrieval", async () => {
+    const signedUrl =
+      "https://signed-bucket.s3.amazonaws.com/report.txt?X-Amz-Signature=abc";
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(input.toString());
+
+      if (url.pathname === "/api/v1/threads/search") {
+        return jsonResponse({
+          threads: [{ id: "t1" }],
+          pagination: { total: 1, limit: 100, offset: 0, hasMore: false },
+        });
+      }
+
+      if (url.pathname === "/api/v1/threads/t1") {
+        return jsonResponse({
+          id: "t1",
+          createdAt: "2026-06-02T10:00:00.000Z",
+          subject: "Thread t1",
+          emails: [
+            inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z", {
+              attachments: [
+                {
+                  id: "att_1",
+                  createdAt: "2026-06-02T10:00:00.000Z",
+                  fileName: "report.txt",
+                  contentType: "text/plain",
+                  sizeInBytes: 14,
+                  cid: null,
+                  disposition: "attachment",
+                  signedUrl,
+                  expiresAt: "2026-06-02T11:00:00.000Z",
+                },
+              ],
+            }),
+          ],
+        });
+      }
+
+      if (input.toString() === signedUrl) {
+        return new Response("aiinbx content", { status: 200 });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onInbound = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [
+        AIInbxDriver({
+          id: "support-aiinbx",
+          apiKey: "ai_test",
+          autoFetchInboundAttachments: false,
+        }),
+      ],
+      hooks: { email: { onInbound } },
+    });
+
+    await client.sync({ since: SINCE, until: UNTIL });
+
+    const inbound = onInbound.mock.calls[0]![0];
+    expect(inbound.attachments).toEqual([
+      {
+        filename: "report.txt",
+        contentType: "text/plain",
+        size: 14,
+        contentId: undefined,
+        isInline: false,
+        url: signedUrl,
+        emailDriver: "support-aiinbx",
+      },
+    ]);
+
+    const content = await client.attachments.getContent(inbound.attachments[0]);
+    expect(new TextDecoder().decode(content as Uint8Array)).toBe(
+      "aiinbx content",
+    );
+    const [, init] = fetchMock.mock.calls.at(-1)!;
+    expect(new Headers(init?.headers).get("authorization")).toBeNull();
+  });
+
   it("rejects the next request when the sync signal aborts", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(
