@@ -12,7 +12,10 @@ import {
   type OutlookMailboxAuth,
 } from "emailkit"
 
-import { findPersistedOutlookMailboxForWebhook } from "./persistence/mailboxes"
+import {
+  findPersistedMailbox,
+  findPersistedOutlookMailboxForWebhook,
+} from "./persistence/mailboxes"
 import { findOutlookMailboxIdForSubscription } from "./persistence/webhooks"
 import type { SandboxDriverInfo } from "./types"
 
@@ -140,7 +143,7 @@ const definitions: DriverDefinition[] = [
         scopes: outlookScopes(),
         autoSubscribeInbound: outlookAutoSubscribeInbound(),
         webhookClientState: env("OUTLOOK_WEBHOOK_CLIENT_STATE") || undefined,
-        webhookAuthResolver: async ({ notification }) => {
+        webhookAuthResolver: async ({ mailboxEmail, notification }) => {
           const asOutlookAuth = (
             auth: unknown
           ): OutlookMailboxAuth | undefined =>
@@ -150,6 +153,11 @@ const definitions: DriverDefinition[] = [
               ? (auth as OutlookMailboxAuth)
               : undefined
 
+          if (mailboxEmail) {
+            const mailbox = await findPersistedMailbox(mailboxEmail, "outlook")
+            const auth = asOutlookAuth(mailbox?.auth)
+            if (auth) return auth
+          }
           if (notification.subscriptionId) {
             const mailbox = await findOutlookMailboxIdForSubscription(
               notification.subscriptionId

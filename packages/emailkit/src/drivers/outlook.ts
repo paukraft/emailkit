@@ -369,6 +369,9 @@ export interface OutlookWebhookAuthResolverContext {
   query?: Record<string, string>;
   subscriptionId?: string;
   clientState?: string;
+  mailboxEmail?: string;
+  mailboxId?: string;
+  messageId?: string;
 }
 
 export type OutlookWebhookAuthResolver = (
@@ -424,6 +427,9 @@ interface GraphAttachment {
 interface OutlookAttachmentProviderMetadata {
   notification?: GraphChangeNotification;
   query?: Record<string, string>;
+  mailboxEmail?: string;
+  mailboxId?: string;
+  messageId?: string;
 }
 
 const createCodeVerifier = (): string => randomBytes(32).toString("base64url");
@@ -805,12 +811,20 @@ const webhookAuthFromConfig = async (
   notification: GraphChangeNotification,
 ): Promise<OutlookMailboxAuth | undefined> => {
   if (config.webhookAuthResolver) {
+    const metadata = notification as GraphChangeNotification & {
+      mailboxEmail?: string;
+      mailboxId?: string;
+      messageId?: string;
+    };
     const resolved = await config.webhookAuthResolver({
       notification,
       request,
       query: request.query,
       subscriptionId: notification.subscriptionId,
       clientState: notification.clientState,
+      mailboxEmail: metadata.mailboxEmail,
+      mailboxId: metadata.mailboxId,
+      messageId: metadata.messageId,
     });
     if (isOutlookAuth(resolved)) return resolved;
   }
@@ -1219,6 +1233,23 @@ const normalizedMailboxEmails = (input: MailboxSyncInput): Set<string> => {
   return emails;
 };
 
+const mailboxProviderMetadata = (
+  input: MailboxSyncInput,
+): Pick<
+  OutlookAttachmentProviderMetadata,
+  "mailboxEmail" | "mailboxId"
+> => {
+  const mailbox =
+    input.mailbox && typeof input.mailbox === "object" && !Array.isArray(input.mailbox)
+      ? input.mailbox
+      : undefined;
+  return {
+    mailboxEmail:
+      nonEmptyString(input.email) || nonEmptyString(mailbox?.email),
+    mailboxId: nonEmptyString(input.mailboxId) || nonEmptyString(mailbox?.id),
+  };
+};
+
 const isMessageFromMailbox = (
   message: GraphMessage,
   mailboxEmails: Set<string>,
@@ -1233,6 +1264,7 @@ const transformGraphMessage = (
   notification: GraphChangeNotification | undefined,
   messageUrl: string,
   request?: WebhookRequest,
+  attachmentProvider?: OutlookAttachmentProviderMetadata,
 ): InboundEmailEvent => {
   const headers = normalizeHeaders(message.internetMessageHeaders);
   const replyTo = graphRecipientsToEmailAddresses(message.replyTo);
@@ -1266,6 +1298,12 @@ const transformGraphMessage = (
           outlook: {
             ...(notification ? { notification } : {}),
             ...(request?.query ? { query: request.query } : {}),
+            ...(attachmentProvider
+              ? {
+                  ...attachmentProvider,
+                  ...(message.id ? { messageId: message.id } : {}),
+                }
+              : {}),
           },
         },
       }),
@@ -1834,6 +1872,33 @@ export const OutlookDriver = <
           ...(metadata.query ? { query: metadata.query } : {}),
         },
         metadata.notification,
+      );
+      if (resolved) return resolved;
+    }
+    if (metadata?.mailboxEmail || metadata?.mailboxId || metadata?.messageId) {
+      const resolved = await webhookAuthFromConfig(
+        config,
+        {
+          method: "GET",
+          headers: {},
+          body: null,
+          ...(metadata.query ? { query: metadata.query } : {}),
+        },
+        {
+          resource: metadata.mailboxId
+            ? `users/${encodeURIComponent(metadata.mailboxId)}/messages/${
+                metadata.messageId
+                  ? encodeURIComponent(metadata.messageId)
+                  : ""
+              }`
+            : metadata.messageId
+              ? `me/messages/${encodeURIComponent(metadata.messageId)}`
+              : undefined,
+          resourceData: metadata.messageId ? { id: metadata.messageId } : undefined,
+          mailboxEmail: metadata.mailboxEmail,
+          mailboxId: metadata.mailboxId,
+          messageId: metadata.messageId,
+        },
       );
       if (resolved) return resolved;
     }
@@ -2687,6 +2752,7 @@ export const OutlookDriver = <
         );
         const until = input.until || new Date();
         const mailboxEmails = normalizedMailboxEmails(input);
+        const attachmentProvider = mailboxProviderMetadata(input);
         const resource = config.inboundResource || DEFAULT_INBOUND_RESOURCE;
         const listUrl = new URL(`${graphBase}/${resource}`);
         listUrl.searchParams.set(
@@ -2735,6 +2801,8 @@ export const OutlookDriver = <
                 `${graphBase}/${resource}/${encodeURIComponent(
                   message.id || "",
                 )}`,
+                undefined,
+                attachmentProvider,
               ),
             };
           }

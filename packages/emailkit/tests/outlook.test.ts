@@ -3260,7 +3260,13 @@ describe("OutlookDriver", () => {
             contentType: "application/pdf",
             size: 1234,
             url: "https://graph.microsoft.com/v1.0/me/messages/message_1/attachments/attachment_1/$value",
-            provider: { outlook: {} },
+            provider: {
+              outlook: {
+                mailboxEmail: "support@example.com",
+                mailboxId: "mailbox_123",
+                messageId: "message_1",
+              },
+            },
           },
         ],
       },
@@ -3275,6 +3281,90 @@ describe("OutlookDriver", () => {
         timestamp: new Date("2026-06-02T10:00:00Z"),
       },
     });
+  });
+
+  it("fetches synced Graph attachment URLs through mailbox resolver metadata", async () => {
+    const since = new Date("2026-06-01T00:00:00.000Z");
+    const until = new Date("2026-06-03T00:00:00.000Z");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            value: [
+              {
+                id: "message_1",
+                internetMessageId: "<message_1@example.com>",
+                subject: "With attachment",
+                body: { contentType: "text", content: "Body" },
+                from: { emailAddress: { address: "sender@example.com" } },
+                toRecipients: [
+                  { emailAddress: { address: "support@example.com" } },
+                ],
+                receivedDateTime: "2026-06-01T10:00:00Z",
+                attachments: [
+                  {
+                    id: "attachment_1",
+                    name: "report.txt",
+                    contentType: "text/plain",
+                    size: 6,
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response("report", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const resolver = vi.fn().mockResolvedValue({
+      accessToken: "resolved_access",
+      tokenType: "Bearer",
+    });
+    const onInbound = vi.fn();
+    const emailkit = EmailKit({
+      emailDrivers: [createDriverWith({ webhookAuthResolver: resolver })],
+      hooks: { email: { onInbound } },
+      secret: "emailkit-secret",
+    });
+
+    await emailkit.mailboxes.sync({
+      mailbox: { id: "mailbox_123", email: "support@example.com" },
+      auth: { accessToken: "sync_access", tokenType: "Bearer" },
+      since,
+      until,
+    });
+
+    const inbound = onInbound.mock.calls[0]![0];
+    expect(inbound.attachments[0]).toMatchObject({
+      filename: "report.txt",
+      emailDriver: "outlook",
+      provider: {
+        outlook: {
+          mailboxEmail: "support@example.com",
+          mailboxId: "mailbox_123",
+          messageId: "message_1",
+        },
+      },
+    });
+
+    const content = await emailkit.attachments.getContent(
+      inbound.attachments[0],
+    );
+
+    expect(new TextDecoder().decode(content as Uint8Array)).toBe("report");
+    expect(resolver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mailboxEmail: "support@example.com",
+        mailboxId: "mailbox_123",
+        messageId: "message_1",
+      }),
+    );
+    const attachmentHeaders = fetchMock.mock.calls[1]![1]!.headers as Headers;
+    expect(attachmentHeaders.get("Authorization")).toBe(
+      "Bearer resolved_access",
+    );
   });
 
   it("refreshes expired mailbox auth before syncing and reports the new auth", async () => {
