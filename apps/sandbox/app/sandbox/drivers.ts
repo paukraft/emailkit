@@ -1,6 +1,8 @@
 import {
   AIINBX_CAPABILITIES,
   AIInbxDriver,
+  GMAIL_CAPABILITIES,
+  GmailDriver,
   MAILGUN_CAPABILITIES,
   MailgunDriver,
   OUTLOOK_CAPABILITIES,
@@ -9,12 +11,14 @@ import {
   ResendDriver,
   type DriverCapabilities,
   type EmailDriverTuple,
+  type GmailMailboxAuth,
   type OutlookMailboxAuth,
 } from "emailkit"
 
 import {
   findPersistedMailbox,
   findPersistedOutlookMailboxForWebhook,
+  persistMailbox,
 } from "./persistence/mailboxes"
 import { findOutlookMailboxIdForSubscription } from "./persistence/webhooks"
 import type { SandboxDriverInfo } from "./types"
@@ -113,6 +117,64 @@ const definitions: DriverDefinition[] = [
         apiKey: env("AI_INBX_API_KEY"),
         webhookSecret: env("AI_INBX_SECRET") || undefined,
       }),
+  },
+  {
+    id: "gmail",
+    label: "Gmail",
+    family: "gmail",
+    capabilities: GMAIL_CAPABILITIES,
+    requiredEnv: ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "EMAILKIT_SECRET"],
+    optionalEnv: [
+      "GMAIL_PUBSUB_TOPIC",
+      "GMAIL_AUTO_SUBSCRIBE_INBOUND",
+      "GMAIL_WEBHOOK_TOKEN",
+      "GMAIL_SCOPES",
+      "PUBLIC_BASE_URL",
+      "APP_URL",
+      "FROM_EMAIL_ADDRESS",
+      "TO_EMAIL_ADDRESS",
+    ],
+    create: () => {
+      const asGmailAuth = (auth: unknown): GmailMailboxAuth | undefined =>
+        auth &&
+        typeof auth === "object" &&
+        typeof (auth as { accessToken?: unknown }).accessToken === "string"
+          ? (auth as GmailMailboxAuth)
+          : undefined
+
+      return GmailDriver({
+        id: "gmail",
+        clientId: env("GMAIL_CLIENT_ID"),
+        clientSecret: env("GMAIL_CLIENT_SECRET"),
+        pubsubTopic: env("GMAIL_PUBSUB_TOPIC") || undefined,
+        scopes: listEnv("GMAIL_SCOPES").length
+          ? listEnv("GMAIL_SCOPES")
+          : undefined,
+        autoSubscribeInbound: env("GMAIL_AUTO_SUBSCRIBE_INBOUND") !== "false",
+        verificationToken: env("GMAIL_WEBHOOK_TOKEN") || undefined,
+        webhookAuthResolver: async ({ mailboxEmail }) => {
+          if (!mailboxEmail) return undefined
+          const mailbox = await findPersistedMailbox(mailboxEmail, "gmail")
+          return asGmailAuth(mailbox?.auth)
+        },
+        onAuthUpdated: async ({ auth, mailbox }) => {
+          const email = mailbox?.email
+          if (!email) return
+          const existing = (await findPersistedMailbox(email, "gmail"))
+            ?.mailbox
+          await persistMailbox(
+            "gmail",
+            {
+              ...existing,
+              id: existing?.id ?? mailbox?.id ?? email,
+              email,
+              status: existing?.status ?? "connected",
+            },
+            auth
+          )
+        },
+      })
+    },
   },
   {
     id: "outlook",

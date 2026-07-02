@@ -232,6 +232,19 @@ export type { AIInbxCapabilities, AIInbxDriverConfig } from "./drivers/aiinbx";
 export { RESEND_CAPABILITIES, ResendDriver } from "./drivers/resend";
 export type { ResendCapabilities, ResendDriverConfig } from "./drivers/resend";
 
+export { GMAIL_CAPABILITIES, GmailDriver } from "./drivers/gmail";
+export type {
+  GmailAuthUpdate,
+  GmailCapabilities,
+  GmailDriverConfig,
+  GmailMailboxAuth,
+  GmailNotification,
+  GmailSendEmailResult,
+  GmailWatch,
+  GmailWebhookAuthResolver,
+  GmailWebhookAuthResolverContext,
+} from "./drivers/gmail";
+
 export {
   OUTLOOK_CAPABILITIES,
   OUTLOOK_DRAFT_CAPABILITIES,

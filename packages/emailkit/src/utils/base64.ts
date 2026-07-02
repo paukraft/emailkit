@@ -28,6 +28,18 @@ export const stringToBase64 = (str: string): string => {
   return bytesToBase64(te.encode(str))
 }
 
+export const bytesToBase64Url = (bytes: Uint8Array): string =>
+  bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+export const stringToBase64Url = (str: string): string =>
+  stringToBase64(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+
+export const base64UrlToBytes = (b64url: string): Uint8Array =>
+  base64ToBytes(b64url.replace(/-/g, '+').replace(/_/g, '/'))
+
+export const base64UrlToString = (b64url: string): string =>
+  new TextDecoder().decode(base64UrlToBytes(b64url))
+
 export const base64ToBytes = (b64: string): Uint8Array => {
   if (hasBuffer) {
     const buf = bufferFrom(b64, 'base64')

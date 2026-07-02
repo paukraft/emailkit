@@ -7,12 +7,7 @@
  * - https://learn.microsoft.com/graph/api/user-sendmail
  */
 
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-} from "crypto";
+import { createHash } from "crypto";
 import type {
   EmailDriver,
   EmailDriverConfig,
@@ -48,6 +43,15 @@ import type {
 } from "../types";
 import { EmailKitError } from "../types";
 import { bytesToBase64, stringToBase64 } from "../utils/base64";
+import {
+  OAUTH_STATE_VERSION,
+  createCodeChallenge,
+  createCodeVerifier,
+  createStateNonce,
+  decodeOAuthState,
+  encodeOAuthState,
+  type OAuthStatePayload,
+} from "../utils/oauth-state";
 import {
   buildReplyContext,
   hasReplyData,
@@ -261,27 +265,16 @@ const DEFAULT_SCOPES = [
   "Mail.Read",
 ];
 const PROVIDER = "outlook";
-const STATE_VERSION = 1;
 const TOKEN_REFRESH_LEEWAY_MS = 60_000;
-const STATE_MAX_AGE_MS = 10 * 60 * 1000;
-const STATE_ENCRYPTION_ALGORITHM = "aes-256-gcm";
 const DEFAULT_INBOUND_RESOURCE = "me/messages";
 const DEFAULT_INBOUND_SUBSCRIPTION_MINUTES = 60 * 24 * 3;
 const WEBHOOK_RENEWAL_BUFFER_MS = 60 * 60 * 1000;
 const IMMUTABLE_ID_PREFER_HEADER = 'IdType="ImmutableId"';
 
-interface OutlookStatePayload {
-  v: typeof STATE_VERSION;
+interface OutlookStatePayload extends OAuthStatePayload {
   provider: typeof PROVIDER;
-  nonce: string;
-  issuedAt: number;
-  callbackUrl: string;
   webhookUrl?: string;
   lifecycleNotificationUrl?: string;
-  scopes: string[];
-  codeVerifier: string;
-  email?: string;
-  context?: unknown;
 }
 
 type OutlookPublicRoutes = NonNullable<
@@ -432,100 +425,11 @@ interface OutlookAttachmentProviderMetadata {
   messageId?: string;
 }
 
-const createCodeVerifier = (): string => randomBytes(32).toString("base64url");
-
-const createCodeChallenge = (verifier: string): string =>
-  createHash("sha256").update(verifier).digest("base64url");
-
-const stateEncryptionKey = (secret: string): Buffer =>
-  createHash("sha256").update(secret).digest();
-
-const encodeState = (payload: OutlookStatePayload, secret: string): string => {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv(
-    STATE_ENCRYPTION_ALGORITHM,
-    stateEncryptionKey(secret),
-    iv,
-  );
-  const encrypted = Buffer.concat([
-    cipher.update(JSON.stringify(payload), "utf8"),
-    cipher.final(),
-  ]);
-  const tag = cipher.getAuthTag();
-  return [iv, encrypted, tag]
-    .map((part) => part.toString("base64url"))
-    .join(".");
-};
-
-const decodeState = (state: string, secret: string): OutlookStatePayload => {
-  const [ivPart, encryptedPart, tagPart, extra] = state.split(".");
-  if (!ivPart || !encryptedPart || !tagPart || extra !== undefined) {
-    throw new EmailKitError(
-      "Invalid Outlook OAuth state",
-      PROVIDER,
-      "INVALID_STATE",
-    );
-  }
-
-  let parsed: OutlookStatePayload;
-  try {
-    const decipher = createDecipheriv(
-      STATE_ENCRYPTION_ALGORITHM,
-      stateEncryptionKey(secret),
-      Buffer.from(ivPart, "base64url"),
-    );
-    decipher.setAuthTag(Buffer.from(tagPart, "base64url"));
-    const decrypted = Buffer.concat([
-      decipher.update(Buffer.from(encryptedPart, "base64url")),
-      decipher.final(),
-    ]).toString("utf8");
-    parsed = JSON.parse(decrypted) as OutlookStatePayload;
-  } catch (error) {
-    throw new EmailKitError(
-      "Invalid Outlook OAuth state payload",
-      PROVIDER,
-      "INVALID_STATE",
-      undefined,
-      error,
-    );
-  }
-  if (parsed.v !== STATE_VERSION || parsed.provider !== PROVIDER) {
-    throw new EmailKitError(
-      "Unsupported Outlook OAuth state",
-      PROVIDER,
-      "INVALID_STATE",
-    );
-  }
-  if (typeof parsed.issuedAt !== "number") {
-    throw new EmailKitError(
-      "Outlook OAuth state is missing an issuedAt timestamp",
-      PROVIDER,
-      "INVALID_STATE",
-    );
-  }
-  if (Date.now() - parsed.issuedAt > STATE_MAX_AGE_MS) {
-    throw new EmailKitError(
-      "Outlook OAuth state has expired; please reconnect the mailbox",
-      PROVIDER,
-      "EXPIRED_STATE",
-    );
-  }
-  if (!parsed.codeVerifier) {
-    throw new EmailKitError(
-      "Outlook OAuth state is missing PKCE verifier",
-      PROVIDER,
-      "INVALID_STATE",
-    );
-  }
-  if (!parsed.callbackUrl) {
-    throw new EmailKitError(
-      "Outlook OAuth state is missing callbackUrl",
-      PROVIDER,
-      "INVALID_STATE",
-    );
-  }
-  return parsed;
-};
+const decodeState = (state: string, secret: string): OutlookStatePayload =>
+  decodeOAuthState<OutlookStatePayload>(state, secret, {
+    provider: PROVIDER,
+    label: "Outlook",
+  });
 
 const requireSecret = (
   secret: string | undefined,
@@ -2611,11 +2515,11 @@ export const OutlookDriver = <
         );
         const codeVerifier = createCodeVerifier();
         const codeChallenge = createCodeChallenge(codeVerifier);
-        const state = encodeState(
+        const state = encodeOAuthState(
           {
-            v: STATE_VERSION,
+            v: OAUTH_STATE_VERSION,
             provider: PROVIDER,
-            nonce: randomBytes(16).toString("hex"),
+            nonce: createStateNonce(),
             issuedAt: Date.now(),
             callbackUrl,
             ...(webhookUrl ? { webhookUrl } : {}),

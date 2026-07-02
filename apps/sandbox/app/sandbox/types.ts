@@ -19,7 +19,7 @@ export type SandboxDriverId = string
 export type SandboxDriverInfo = {
   id: SandboxDriverId
   label: string
-  family: "resend" | "mailgun" | "aiinbx" | "outlook"
+  family: "resend" | "mailgun" | "aiinbx" | "outlook" | "gmail"
   publicWebhookUrl: string
   requiredEnv: string[]
   optionalEnv: string[]

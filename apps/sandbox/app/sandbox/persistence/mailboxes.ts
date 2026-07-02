@@ -5,6 +5,9 @@ import { prisma } from "./prisma"
 
 const OUTLOOK_DRIVER = "outlook"
 
+/** Drivers with mailbox auth material worth persisting across restarts. */
+const MAILBOX_AUTH_DRIVERS = new Set([OUTLOOK_DRIVER, "gmail"])
+
 const isMailboxStatus = (status: string | null): status is NonNullable<Mailbox["status"]> =>
   status === "connected" || status === "pending" || status === "disabled" || status === "unknown"
 
@@ -54,12 +57,12 @@ const toRecord = (
   auth: record.auth ?? undefined,
 })
 
-export const persistOutlookMailbox = async (
+export const persistMailbox = async (
   emailDriver: string,
   mailbox: Mailbox,
   auth?: unknown,
 ) => {
-  if (emailDriver !== OUTLOOK_DRIVER) return
+  if (!MAILBOX_AUTH_DRIVERS.has(emailDriver)) return
 
   const email = mailbox.email.toLowerCase()
   await prisma.connectedMailbox.upsert({

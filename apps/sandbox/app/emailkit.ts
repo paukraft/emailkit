@@ -12,7 +12,7 @@ import {
 } from "./sandbox/drivers"
 import {
   findPersistedMailbox,
-  persistOutlookMailbox,
+  persistMailbox,
 } from "./sandbox/persistence/mailboxes"
 import {
   deleteWebhookByProviderId,
@@ -87,7 +87,7 @@ const hooks: EmailKitHooks = {
   mailbox: {
     onConnected: async ({ emailDriver, mailbox, auth }) => {
       rememberMailbox(emailDriver, mailbox, auth)
-      await persistOutlookMailbox(emailDriver, mailbox, auth)
+      await persistMailbox(emailDriver, mailbox, auth)
       recordSandboxEvent({
         driver: emailDriver,
         category: "mailbox",
@@ -133,7 +133,7 @@ const hooks: EmailKitHooks = {
       }
 
       rememberMailbox(emailDriver, updatedMailbox, auth)
-      await persistOutlookMailbox(emailDriver, updatedMailbox, auth)
+      await persistMailbox(emailDriver, updatedMailbox, auth)
       recordSandboxEvent({
         driver: emailDriver,
         category: "mailbox",
