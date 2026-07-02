@@ -10,6 +10,8 @@ afterEach(() => {
 
 const testAIInbxWebhookSecret = "aiinbx-webhook-secret";
 
+const currentUnixTimestamp = () => String(Math.floor(Date.now() / 1000));
+
 const signAIInbxWebhookBody = (body: unknown, timestamp: string) =>
   `sha256=${createHmac("sha256", testAIInbxWebhookSecret)
     .update(`${timestamp}.${JSON.stringify(body)}`)
@@ -308,7 +310,7 @@ describe("AIInbxDriver webhooks", () => {
     });
 
     const body = { event: "outbound.email.clicked", attempt: 1 };
-    const timestamp = "1775124000";
+    const timestamp = currentUnixTimestamp();
 
     await expect(
       driver.verifyWebhook!({
@@ -320,6 +322,28 @@ describe("AIInbxDriver webhooks", () => {
         body,
       }),
     ).rejects.toMatchObject({ code: "MISSING_RAW_BODY" });
+  });
+
+  it("rejects stale AIInbx webhook timestamps", async () => {
+    const driver = AIInbxDriver({
+      apiKey: "ai_test",
+      webhookSecret: testAIInbxWebhookSecret,
+    });
+
+    const body = { event: "outbound.email.clicked", attempt: 1 };
+    const timestamp = String(Math.floor(Date.now() / 1000) - 301);
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: {
+          "x-aiinbx-timestamp": timestamp,
+          "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
+        },
+        body,
+        rawBody: JSON.stringify(body),
+      }),
+    ).resolves.toBe(false);
   });
 
   it("fetches stored signed attachment URLs without AIInbx bearer auth", async () => {
@@ -394,7 +418,7 @@ describe("AIInbxDriver webhooks", () => {
       attempt: 1,
       timestamp: 1775124000,
     };
-    const timestamp = "1775124000";
+    const timestamp = currentUnixTimestamp();
     const response = await client.handler()({
       method: "POST",
       headers: {
@@ -448,7 +472,7 @@ describe("AIInbxDriver webhooks", () => {
       attempt: 1,
       timestamp: 1775124000,
     };
-    const timestamp = "1775124000";
+    const timestamp = currentUnixTimestamp();
     const response = await client.handler()({
       method: "POST",
       headers: {

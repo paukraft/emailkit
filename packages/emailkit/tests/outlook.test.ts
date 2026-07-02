@@ -361,7 +361,7 @@ describe("OutlookDriver", () => {
     });
     const connect = await driver.mailboxes!.connect!(connectInput(), {
       secret: "emailkit-secret",
-      publicRoutes: { webhookUrl: WEBHOOK_URL },
+      publicRoutes: { webhook: { url: WEBHOOK_URL } },
     });
     const callback = await driver.handleCallback!(
       {
@@ -448,7 +448,7 @@ describe("OutlookDriver", () => {
       },
       {
         secret: "emailkit-secret",
-        publicRoutes: { lifecycleWebhookUrl: LIFECYCLE_URL },
+        publicRoutes: { webhook: { lifecycleNotificationUrl: LIFECYCLE_URL } },
       },
     );
 
@@ -1115,7 +1115,7 @@ describe("OutlookDriver", () => {
         { secret: "emailkit-secret" },
       ),
     ).rejects.toMatchObject({
-      message: "Authorization code is invalid or expired",
+      message: "invalid_grant: Authorization code is invalid or expired",
       httpStatus: 400,
       raw: errorBody,
     });
@@ -2499,7 +2499,10 @@ describe("OutlookDriver", () => {
     const resolver = vi
       .fn()
       .mockResolvedValue({ accessToken: "resolved_access" });
-    const driver = createDriverWith({ webhookAuthResolver: resolver });
+    const driver = createDriverWith({
+      webhookAuthResolver: resolver,
+      webhookClientState: "mailbox_123",
+    });
     const notification = {
       subscriptionId: "sub_resolved",
       clientState: "mailbox_123",
@@ -2569,6 +2572,26 @@ describe("OutlookDriver", () => {
       httpStatus: 401,
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a webhookAuthResolver without autoSubscribeInbound or webhookClientState at construction", () => {
+    // Subscriptions are created outside the driver in this mode, so the
+    // derived default clientState cannot be assumed for verification.
+    expect(() =>
+      createDriverWith({
+        webhookAuthResolver: async () => undefined,
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "MISSING_WEBHOOK_CLIENT_STATE" }),
+    );
+    expect(() =>
+      createDriverWith({
+        webhookAuthResolver: async () => undefined,
+        webhookClientState: [],
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: "MISSING_WEBHOOK_CLIENT_STATE" }),
+    );
   });
 
   it("rejects absolute non-Graph message resource URLs before sending auth", async () => {
@@ -3064,7 +3087,10 @@ describe("OutlookDriver", () => {
     const resolver = vi
       .fn()
       .mockResolvedValue({ accessToken: "resolved_access" });
-    const driver = createDriverWith({ webhookAuthResolver: resolver });
+    const driver = createDriverWith({
+      webhookAuthResolver: resolver,
+      webhookClientState: "mailbox_123",
+    });
     const emailkit = EmailKit({
       emailDrivers: [driver],
       secret: "emailkit-secret",
@@ -3324,7 +3350,12 @@ describe("OutlookDriver", () => {
     });
     const onInbound = vi.fn();
     const emailkit = EmailKit({
-      emailDrivers: [createDriverWith({ webhookAuthResolver: resolver })],
+      emailDrivers: [
+        createDriverWith({
+          webhookAuthResolver: resolver,
+          webhookClientState: "mailbox_123",
+        }),
+      ],
       hooks: { email: { onInbound } },
       secret: "emailkit-secret",
     });

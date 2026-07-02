@@ -49,6 +49,7 @@ import type {
 import { EmailKitError } from "../types";
 import { bytesToBase64, stringToBase64 } from "../utils/base64";
 import { createProviderFetch } from "../utils/provider-fetch";
+import { getHeader, requireRawBody } from "../utils/webhook";
 import {
   buildReplyContext,
   hasReplyData,
@@ -992,7 +993,7 @@ const transformOutboundEvent = (
 
 export const ResendDriver = <const TId extends string = "resend">(
   config: ResendDriverConfig<TId>,
-): EmailDriver<ResendDriverConfig<TId>, typeof RESEND_CAPABILITIES, TId> => {
+): EmailDriver<typeof RESEND_CAPABILITIES, TId> => {
   const apiBase = config.apiBase || "https://api.resend.com";
   const baseUrl = `${apiBase}`;
   const driverId = (config.id || "resend") as TId;
@@ -1504,64 +1505,33 @@ export const ResendDriver = <const TId extends string = "resend">(
         return false;
       }
 
-      // Signatures are computed over the exact raw request bytes; a
-      // re-stringified parsed body cannot reproduce them.
-      if (request.rawBody === undefined) {
-        throw new EmailKitError(
-          "Webhook signature verification requires the raw request body. Pass rawBody on WebhookRequest (the unparsed request text).",
-          "resend",
-          "MISSING_RAW_BODY",
-          500,
-        );
+      // Resend signs webhooks with Svix. Reject requests without the Svix
+      // headers before the rawBody check so unauthenticated garbage gets a
+      // 401, not a 500.
+      const svixId = getHeader(request.headers, "svix-id");
+      const svixTimestamp = getHeader(request.headers, "svix-timestamp");
+      const svixSignature = getHeader(request.headers, "svix-signature");
+      if (!svixId || !svixTimestamp || !svixSignature) {
+        return false;
       }
 
-          // Resend uses Svix for webhook signing
-          // Use the Svix library to verify webhooks
-          try {
-            const payload = request.rawBody;
+      const payload = requireRawBody(request, "resend");
 
-            // Extract Svix headers
-            const headers = {
-              "svix-id":
-                request.headers["svix-id"] ||
-                request.headers["Svix-Id"] ||
-                request.headers["SVIX-ID"],
-              "svix-timestamp":
-                request.headers["svix-timestamp"] ||
-                request.headers["Svix-Timestamp"] ||
-                request.headers["SVIX-TIMESTAMP"],
-              "svix-signature":
-                request.headers["svix-signature"] ||
-                request.headers["Svix-Signature"] ||
-                request.headers["SVIX-SIGNATURE"],
-            };
-
-            // Check if all required headers are present
-            if (
-              !headers["svix-id"] ||
-              !headers["svix-timestamp"] ||
-              !headers["svix-signature"]
-            ) {
-              return false;
-            }
-
-            // Create Svix Webhook instance with the secret
-        const wh = new Webhook(config.webhookSecret);
-
-            // Verify the webhook - throws on error, returns verified payload on success
-            wh.verify(payload, headers);
-
-            // If we get here, verification succeeded
-            return true;
-          } catch {
-            // Verification failed
-            return false;
-          }
+      try {
+        new Webhook(config.webhookSecret).verify(payload, {
+          "svix-id": svixId,
+          "svix-timestamp": svixTimestamp,
+          "svix-signature": svixSignature,
+        });
+        return true;
+      } catch {
+        return false;
+      }
     },
 
     webhookResponse: async (
-      request: WebhookRequest,
-      handled: boolean,
+      _request: WebhookRequest,
+      _handled: boolean,
     ): Promise<WebhookResponse> => {
       return {
         status: 200,

@@ -58,13 +58,36 @@ import type {
 } from "../types";
 import { EmailKitError } from "../types";
 import { base64UrlToBytes, base64UrlToString, stringToBase64Url } from "../utils/base64";
-import { buildMimeMessage, parseAddressListHeader } from "../utils/mime";
+import { buildMimeMessage, isValidHeaderName, parseAddressListHeader } from "../utils/mime";
+import { mapWithConcurrency } from "../utils/concurrency";
+import {
+  type OAuthMailboxAuth,
+  authorizationHeader,
+  createOAuthMailboxKit,
+  formatScopes,
+  isOAuthMailboxAuth,
+  mailboxProviderMetadata,
+  nonEmptyString,
+  normalizeBaseUrl,
+  normalizedMailboxEmails,
+  oauthErrorMessage,
+  readJsonResponse,
+  resolveProviderFetchUrl,
+  resolvePublicWebhookUrl,
+  sanitizeTokenResponse,
+  uniqueScopes,
+  unsupportedOAuthMailboxSendFields,
+} from "../utils/oauth-mailbox";
+import {
+  parseWebhookBody,
+  webhookEvents,
+  webhookRenewAfter,
+} from "../utils/webhook";
 import {
   OAUTH_STATE_VERSION,
   createCodeChallenge,
   createCodeVerifier,
   createStateNonce,
-  decodeOAuthState,
   encodeOAuthState,
   type OAuthStatePayload,
 } from "../utils/oauth-state";
@@ -75,7 +98,7 @@ import {
   resolveMessageReplyContext,
 } from "../utils/reply";
 
-export interface GmailDriverConfig<TId extends string = "gmail">
+export interface GmailDriverConfigBase<TId extends string = "gmail">
   extends EmailDriverConfig {
   /**
    * EmailKit driver id. Override when configuring multiple Gmail drivers.
@@ -83,14 +106,6 @@ export interface GmailDriverConfig<TId extends string = "gmail">
   id?: TId;
   clientId: string;
   clientSecret: string;
-  /**
-   * Cloud Pub/Sub topic Gmail publishes watch notifications to, e.g.
-   * "projects/my-project/topics/emailkit-gmail". Required for inbound
-   * webhooks; sending and sync work without it. The topic must grant
-   * gmail-api-push@system.gserviceaccount.com the Pub/Sub Publisher role and
-   * have a push subscription pointing at the EmailKit webhook route.
-   */
-  pubsubTopic?: string;
   scopes?: string[];
   /**
    * Gmail label ids that count as inbound. Used as the watch filter and to
@@ -113,6 +128,44 @@ export interface GmailDriverConfig<TId extends string = "gmail">
    */
   gmailBase?: string;
   /**
+   * Persistence callback for auth material updated outside facade operations
+   * (webhook hydration refreshes tokens, advances the history cursor, and
+   * renews watches). Mirrors the per-operation onAuthUpdated option; wire it
+   * to the same store.
+   */
+  onAuthUpdated?: (event: GmailAuthUpdate) => Promise<void> | void;
+}
+
+/**
+ * Gmail driver without inbound webhooks: sending, sync, and OAuth connect
+ * only. No verificationToken needed because no Pub/Sub pushes are processed.
+ */
+export interface GmailSendOnlyDriverConfig<TId extends string = "gmail">
+  extends GmailDriverConfigBase<TId> {
+  pubsubTopic?: undefined;
+  autoSubscribeInbound?: undefined;
+  autoRenewOnNotification?: undefined;
+  verificationToken?: undefined;
+  webhookAuth?: undefined;
+  webhookAuthResolver?: undefined;
+}
+
+/**
+ * Gmail driver with inbound webhooks. Requires verificationToken: webhook
+ * POSTs are only accepted when the Pub/Sub push subscription endpoint carries
+ * a matching `?token=` query parameter.
+ */
+export interface GmailInboundDriverConfig<TId extends string = "gmail">
+  extends GmailDriverConfigBase<TId> {
+  /**
+   * Cloud Pub/Sub topic Gmail publishes watch notifications to, e.g.
+   * "projects/my-project/topics/emailkit-gmail". Required for inbound
+   * webhooks; sending and sync work without it. The topic must grant
+   * gmail-api-push@system.gserviceaccount.com the Pub/Sub Publisher role and
+   * have a push subscription pointing at the EmailKit webhook route.
+   */
+  pubsubTopic?: string;
+  /**
    * Start a Gmail watch immediately after a mailbox is connected. Requires
    * pubsubTopic. Defaults to false.
    */
@@ -126,12 +179,14 @@ export interface GmailDriverConfig<TId extends string = "gmail">
   autoRenewOnNotification?: boolean;
   /**
    * Shared token(s) expected as a `?token=` query parameter on the Pub/Sub
-   * push endpoint URL. Configure the push subscription endpoint as
+   * push endpoint URL. Required for inbound webhooks: configure the push
+   * subscription endpoint as
    * `https://app.example.com/api/email/gmail?token=<value>` and set the same
-   * value here to reject forged notifications. Enforced only when set,
-   * because the push subscription is provisioned outside this driver.
+   * value here. Webhook POSTs without a matching token are rejected with 401.
+   * The push subscription is provisioned in Google Cloud, outside this
+   * driver, so the endpoint URL must be updated there.
    */
-  verificationToken?: string | string[];
+  verificationToken: string | string[];
   /**
    * Mailbox auth used to hydrate Gmail push notifications. Notifications only
    * include the mailbox email and new history id, so inbound normalization
@@ -143,21 +198,13 @@ export interface GmailDriverConfig<TId extends string = "gmail">
    * webhook endpoint receives notifications for multiple mailboxes.
    */
   webhookAuthResolver?: GmailWebhookAuthResolver;
-  /**
-   * Persistence callback for auth material updated outside facade operations
-   * (webhook hydration refreshes tokens, advances the history cursor, and
-   * renews watches). Mirrors the per-operation onAuthUpdated option; wire it
-   * to the same store.
-   */
-  onAuthUpdated?: (event: GmailAuthUpdate) => Promise<void> | void;
 }
 
-export interface GmailMailboxAuth {
-  accessToken: string;
-  refreshToken?: string;
-  expiresAt?: number;
-  scopes?: string[];
-  tokenType?: string;
+export type GmailDriverConfig<TId extends string = "gmail"> =
+  | GmailSendOnlyDriverConfig<TId>
+  | GmailInboundDriverConfig<TId>;
+
+export interface GmailMailboxAuth extends OAuthMailboxAuth {
   /**
    * Gmail history cursor used to hydrate push notifications. Seeded on
    * connect/watch and advanced through onAuthUpdated as notifications are
@@ -259,42 +306,14 @@ const DEFAULT_SCOPES = [
   "https://www.googleapis.com/auth/gmail.send",
 ];
 const DEFAULT_LABEL_IDS = ["INBOX"];
-const TOKEN_REFRESH_LEEWAY_MS = 60_000;
 const WATCH_RENEWAL_BUFFER_MS = 24 * 60 * 60 * 1000;
 const HISTORY_PAGE_SIZE = 500;
 const SYNC_PAGE_SIZE = 100;
+const MESSAGE_FETCH_CONCURRENCY = 8;
 
 interface GmailStatePayload extends OAuthStatePayload {
   provider: typeof PROVIDER;
   webhookUrl?: string;
-}
-
-type GmailPublicRoutes = NonNullable<
-  EmailDriverOperationOptions["publicRoutes"]
-> & {
-  callback?: {
-    url?: unknown;
-    callbackUrl?: unknown;
-  };
-  webhook?: {
-    url?: unknown;
-  };
-};
-
-interface GmailPublicRouteOptions {
-  callbackUrl?: unknown;
-  publicRoutes?: GmailPublicRoutes;
-}
-
-interface GoogleTokenResponse {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  scope?: string;
-  token_type?: string;
-  error?: string;
-  error_description?: string;
-  [key: string]: unknown;
 }
 
 interface GmailProfileResponse {
@@ -407,70 +426,6 @@ interface GmailAttachmentProviderMetadata {
   attachmentId?: string;
 }
 
-const requireSecret = (
-  secret: string | undefined,
-  operation: string,
-): string => {
-  if (!secret) {
-    throw new EmailKitError(
-      `EmailKit secret is required for Gmail ${operation}`,
-      PROVIDER,
-      "MISSING_SECRET",
-    );
-  }
-  return secret;
-};
-
-const nonEmptyString = (value: unknown): string | undefined =>
-  typeof value === "string" && value.trim() ? value : undefined;
-
-const gmailRouteOptions = (
-  options?: EmailDriverOperationOptions,
-): GmailPublicRouteOptions =>
-  (options || {}) as EmailDriverOperationOptions & GmailPublicRouteOptions;
-
-const resolveMailboxConnectCallbackUrl = (
-  input: { provider?: Record<string, unknown> },
-  options?: EmailDriverOperationOptions,
-): string => {
-  const routeOptions = gmailRouteOptions(options);
-  const callbackUrl =
-    nonEmptyString((input as { callbackUrl?: unknown }).callbackUrl) ||
-    nonEmptyString(routeOptions.callbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.connectCallbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.callback?.callbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.callback?.url);
-
-  if (!callbackUrl) {
-    throw new EmailKitError(
-      "Gmail mailbox connect requires callbackUrl from EmailKit public routes",
-      PROVIDER,
-      "MISSING_CALLBACK_URL",
-    );
-  }
-
-  return callbackUrl;
-};
-
-const resolvePublicWebhookUrl = (
-  options?: EmailDriverOperationOptions,
-): string | undefined =>
-  nonEmptyString(gmailRouteOptions(options).publicRoutes?.webhookUrl) ||
-  nonEmptyString(gmailRouteOptions(options).publicRoutes?.webhook?.url);
-
-const normalizeBaseUrl = (url: string): string => url.replace(/\/+$/, "");
-
-const formatScopes = (scopes: string[]): string => scopes.join(" ");
-
-const uniqueScopes = (scopes: string[]): string[] => {
-  const seen = new Set<string>();
-  return scopes.filter((scope) => {
-    if (seen.has(scope)) return false;
-    seen.add(scope);
-    return true;
-  });
-};
-
 const normalizeHistoryId = (value: unknown): string | undefined => {
   if (typeof value === "string" && /^\d+$/.test(value)) return value;
   if (typeof value === "number" && Number.isFinite(value)) {
@@ -493,89 +448,8 @@ const maxHistoryId = (
   return max;
 };
 
-// Gmail returns some 204s (e.g. users.stop) with a JSON content-type but an
-// empty body, so parse from text instead of trusting the header.
-const readJsonResponse = async (response: Response): Promise<unknown> => {
-  const text = await response.text();
-  if (!text) return undefined;
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
-  }
-  return text;
-};
-
-const googleErrorMessage = (body: unknown, fallback: string): string => {
-  if (typeof body === "object" && body !== null) {
-    const record = body as Record<string, unknown>;
-    const googleError = record.error;
-    if (typeof googleError === "object" && googleError !== null) {
-      const message = (googleError as Record<string, unknown>).message;
-      if (typeof message === "string") return message;
-    }
-    if (typeof googleError === "string" && googleError) {
-      const description = record.error_description;
-      return typeof description === "string" && description
-        ? `${googleError}: ${description}`
-        : googleError;
-    }
-    if (typeof record.message === "string") return record.message;
-  }
-  if (typeof body === "string" && body) return body;
-  return fallback;
-};
-
-const sanitizeTokenResponse = (token: GoogleTokenResponse) => ({
-  expiresIn: token.expires_in,
-  scopes:
-    typeof token.scope === "string"
-      ? token.scope.split(/\s+/).filter(Boolean)
-      : undefined,
-  tokenType: token.token_type,
-});
-
-const toAuth = (
-  token: GoogleTokenResponse,
-  previous?: GmailMailboxAuth,
-): GmailMailboxAuth => {
-  if (!token.access_token) {
-    throw new EmailKitError(
-      "Google token response did not include an access token",
-      PROVIDER,
-      "INVALID_TOKEN_RESPONSE",
-      undefined,
-      undefined,
-      token,
-    );
-  }
-
-  return {
-    accessToken: token.access_token,
-    refreshToken: token.refresh_token || previous?.refreshToken,
-    expiresAt:
-      typeof token.expires_in === "number"
-        ? Date.now() + token.expires_in * 1000
-        : previous?.expiresAt,
-    scopes:
-      typeof token.scope === "string"
-        ? token.scope.split(/\s+/).filter(Boolean)
-        : previous?.scopes,
-    tokenType: token.token_type || previous?.tokenType || "Bearer",
-    ...(previous?.historyId ? { historyId: previous.historyId } : {}),
-    ...(previous?.watchExpiresAt
-      ? { watchExpiresAt: previous.watchExpiresAt }
-      : {}),
-  };
-};
-
-const isGmailAuth = (auth: unknown): auth is GmailMailboxAuth =>
-  typeof auth === "object" &&
-  auth !== null &&
-  typeof (auth as GmailMailboxAuth).accessToken === "string";
+export const isGmailAuth = (auth: unknown): auth is GmailMailboxAuth =>
+  isOAuthMailboxAuth(auth);
 
 const authsEqual = (a: GmailMailboxAuth, b: GmailMailboxAuth): boolean =>
   a.accessToken === b.accessToken &&
@@ -597,21 +471,19 @@ const verifyWebhookToken = (
   request: WebhookRequest,
 ): boolean => {
   const allowed = webhookVerificationTokens(config);
-  if (allowed.length === 0) return true;
-
   const token = request.query?.token;
-  return Boolean(token && allowed.includes(token));
-};
+  if (allowed.length > 0 && token && allowed.includes(token)) return true;
 
-const parseWebhookBody = (request: WebhookRequest): unknown => {
-  if (typeof request.body === "string") {
-    try {
-      return JSON.parse(request.body);
-    } catch {
-      return request.body;
-    }
-  }
-  return request.body;
+  // The HTTP response stays a generic 401; the actionable detail is
+  // operator-only and goes to the server log.
+  console.warn(
+    allowed.length === 0
+      ? "[emailkit] Gmail webhook POST rejected: no verificationToken configured on the driver."
+      : token
+        ? "[emailkit] Gmail webhook POST rejected: ?token= does not match verificationToken."
+        : "[emailkit] Gmail webhook POST rejected: missing ?token= query parameter. Configure the Pub/Sub push subscription endpoint as <webhook-url>?token=<verificationToken>.",
+  );
+  return false;
 };
 
 const isPubSubPayload = (payload: unknown): payload is PubSubPushPayload =>
@@ -653,27 +525,6 @@ const webhookAuthFromConfig = async (
   return undefined;
 };
 
-const watchRenewAfter = (expiresAt: Date | undefined): Date | undefined => {
-  const expiresTime = expiresAt?.getTime();
-  if (!expiresTime || Number.isNaN(expiresTime)) return undefined;
-
-  const remainingMs = expiresTime - Date.now();
-  if (remainingMs <= 1) return new Date(expiresTime - 1);
-
-  const bufferMs = Math.min(
-    WATCH_RENEWAL_BUFFER_MS,
-    Math.max(1, Math.floor(remainingMs / 2)),
-  );
-  return new Date(expiresTime - bufferMs);
-};
-
-const webhookEvents = (
-  events: MailboxWebhookSetupInput["events"],
-): NonNullable<Webhook["events"]> => {
-  if (events === "all") return ["inbound"];
-  return events && events.length > 0 ? events : ["inbound"];
-};
-
 const normalizeWatch = (
   watch: GmailWatch,
   input: {
@@ -698,7 +549,7 @@ const normalizeWatch = (
     status: "active",
     providerId: id,
     expiresAt,
-    renewAfter: watchRenewAfter(expiresAt),
+    renewAfter: webhookRenewAfter(expiresAt, WATCH_RENEWAL_BUFFER_MS),
     provider: {
       topicName: watch.topicName,
       labelIds: watch.labelIds,
@@ -762,47 +613,20 @@ const contentIdFromHeaders = (
   return raw.trim().replace(/^</, "").replace(/>$/, "") || undefined;
 };
 
-const addNormalizedMailboxEmail = (
-  emails: Set<string>,
-  value: unknown,
-): void => {
-  if (typeof value === "string" && value.trim()) {
-    emails.add(value.trim().toLowerCase());
-  }
-};
-
-const normalizedMailboxEmails = (input: MailboxSyncInput): Set<string> => {
-  const emails = new Set<string>();
-  addNormalizedMailboxEmail(emails, input.email);
-  if (
-    input.mailbox &&
-    typeof input.mailbox === "object" &&
-    !Array.isArray(input.mailbox)
-  ) {
-    addNormalizedMailboxEmail(emails, input.mailbox.email);
-  }
-  return emails;
-};
-
-const mailboxProviderMetadata = (
-  input: MailboxSyncInput,
-): Pick<GmailAttachmentProviderMetadata, "mailboxEmail" | "mailboxId"> => {
-  const mailbox =
-    input.mailbox &&
-    typeof input.mailbox === "object" &&
-    !Array.isArray(input.mailbox)
-      ? input.mailbox
-      : undefined;
-  return {
-    mailboxEmail: nonEmptyString(input.email) || nonEmptyString(mailbox?.email),
-    mailboxId: nonEmptyString(input.mailboxId) || nonEmptyString(mailbox?.id),
-  };
-};
-
 export const GmailDriver = <const TId extends string = "gmail">(
   config: GmailDriverConfig<TId>,
-): EmailDriver<GmailDriverConfig<TId>, typeof GMAIL_CAPABILITIES, TId> => {
+): EmailDriver<typeof GMAIL_CAPABILITIES, TId> => {
   const driverId = (config.id || "gmail") as TId;
+  const inboundConfigured = Boolean(
+    config.pubsubTopic || config.webhookAuth || config.webhookAuthResolver,
+  );
+  if (inboundConfigured && webhookVerificationTokens(config).length === 0) {
+    throw new EmailKitError(
+      "Gmail inbound webhooks require a verificationToken. Set verificationToken in the driver config and configure the Pub/Sub push subscription endpoint as <webhook-url>?token=<verificationToken>.",
+      PROVIDER,
+      "MISSING_VERIFICATION_TOKEN",
+    );
+  }
   const authorizationEndpoint =
     config.authorizationEndpoint || DEFAULT_AUTHORIZATION_ENDPOINT;
   const tokenEndpoint = config.tokenEndpoint || DEFAULT_TOKEN_ENDPOINT;
@@ -815,6 +639,30 @@ export const GmailDriver = <const TId extends string = "gmail">(
     config.labelIds && config.labelIds.length > 0
       ? config.labelIds
       : DEFAULT_LABEL_IDS;
+  const {
+    requireSecret,
+    resolveConnectCallbackUrl: resolveMailboxConnectCallbackUrl,
+    parseCallbackRequest,
+    decodeState,
+    fetchToken,
+    toAuth,
+    refreshAuthIfNeeded,
+    resolveMailboxOperationAuth,
+  } = createOAuthMailboxKit<GmailMailboxAuth>({
+    provider: PROVIDER,
+    label: "Gmail",
+    issuer: "Google",
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    tokenEndpoint,
+    mergeAuth: (auth, previous) => ({
+      ...auth,
+      ...(previous?.historyId ? { historyId: previous.historyId } : {}),
+      ...(previous?.watchExpiresAt
+        ? { watchExpiresAt: previous.watchExpiresAt }
+        : {}),
+    }),
+  });
 
   const requirePubSubTopic = (operation: string): string => {
     const topic = nonEmptyString(config.pubsubTopic);
@@ -827,55 +675,6 @@ export const GmailDriver = <const TId extends string = "gmail">(
     }
     return topic;
   };
-
-  const fetchToken = async (
-    form: URLSearchParams,
-    signal?: AbortSignal,
-  ): Promise<GoogleTokenResponse> => {
-    const response = await fetch(tokenEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form,
-      signal,
-    });
-    const body = await readJsonResponse(response);
-    if (!response.ok) {
-      throw new EmailKitError(
-        googleErrorMessage(body, "Google token request failed"),
-        PROVIDER,
-        undefined,
-        response.status,
-        undefined,
-        body,
-      );
-    }
-    return body as GoogleTokenResponse;
-  };
-
-  const refreshAuth = async (
-    auth: GmailMailboxAuth,
-    signal?: AbortSignal,
-  ): Promise<GmailMailboxAuth> => {
-    if (!auth.refreshToken) {
-      throw new EmailKitError(
-        "Gmail access token is expired and no refresh token was provided",
-        PROVIDER,
-        "MISSING_REFRESH_TOKEN",
-      );
-    }
-
-    const form = new URLSearchParams({
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: auth.refreshToken,
-    });
-    const token = await fetchToken(form, signal);
-    return toAuth(token, auth);
-  };
-
-  const authorization = (auth: GmailMailboxAuth): string =>
-    `${auth.tokenType || "Bearer"} ${auth.accessToken}`;
 
   const gmailFetch = async (
     auth: GmailMailboxAuth,
@@ -899,7 +698,7 @@ export const GmailDriver = <const TId extends string = "gmail">(
     const response = await fetch(url, {
       method: init?.method || "GET",
       headers: {
-        Authorization: authorization(auth),
+        Authorization: authorizationHeader(auth),
         Accept: "application/json",
         ...(init?.body !== undefined
           ? { "Content-Type": "application/json" }
@@ -911,7 +710,7 @@ export const GmailDriver = <const TId extends string = "gmail">(
     const body = await readJsonResponse(response);
     if (!response.ok) {
       throw new EmailKitError(
-        googleErrorMessage(body, fallbackError),
+        oauthErrorMessage(body, fallbackError),
         PROVIDER,
         undefined,
         response.status,
@@ -981,40 +780,6 @@ export const GmailDriver = <const TId extends string = "gmail">(
       "Gmail watch stop request failed",
     );
 
-  const resolveMailboxOperationAuth = async (
-    operation: string,
-    input: { auth?: unknown; mailbox?: MailboxIdentity | Mailbox },
-    options?: EmailDriverOperationOptions,
-    signal?: AbortSignal,
-  ): Promise<GmailMailboxAuth> => {
-    const inputAuth = isGmailAuth(input.auth) ? input.auth : undefined;
-    const optionsAuth = isGmailAuth(options?.auth) ? options.auth : undefined;
-    let auth = inputAuth || optionsAuth;
-    if (!auth) {
-      throw new EmailKitError(
-        `Gmail ${operation} requires mailbox auth with an accessToken`,
-        PROVIDER,
-        "MISSING_AUTH",
-      );
-    }
-
-    if (
-      typeof auth.expiresAt === "number" &&
-      auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
-    ) {
-      const previousAuth = auth;
-      auth = await refreshAuth(auth, signal);
-      await options?.onAuthUpdated?.({
-        auth,
-        previousAuth,
-        mailbox: "mailbox" in input ? input.mailbox : options?.mailbox,
-        context: options?.context,
-      });
-    }
-
-    return auth;
-  };
-
   const lookupThreadId = async (
     auth: GmailMailboxAuth,
     replyMessageId: string,
@@ -1048,6 +813,21 @@ export const GmailDriver = <const TId extends string = "gmail">(
       { searchParams: { format: "full" }, signal },
       "Gmail message fetch failed",
     )) as GmailMessage;
+
+  const getMessageIfPresent = async (
+    auth: GmailMailboxAuth,
+    messageId: string,
+    signal?: AbortSignal,
+  ): Promise<GmailMessage | undefined> => {
+    try {
+      return await getMessage(auth, messageId, signal);
+    } catch (error) {
+      if (error instanceof EmailKitError && error.httpStatus === 404) {
+        return undefined;
+      }
+      throw error;
+    }
+  };
 
   const transformGmailMessage = (
     message: GmailMessage,
@@ -1234,47 +1014,11 @@ export const GmailDriver = <const TId extends string = "gmail">(
     return undefined;
   };
 
-  const resolveGmailUrl = (
-    path: string | URL,
-    init?: ProviderFetchInit,
-  ): URL => {
-    const value = path instanceof URL ? path.toString() : path;
-    const url = /^https?:\/\//i.test(value)
-      ? new URL(value)
-      : new URL(value.replace(/^\/+/, ""), `${gmailBase}/`);
-    const gmailBaseUrl = new URL(`${gmailBase}/`);
-    if (
-      url.origin !== gmailBaseUrl.origin ||
-      !url.pathname.startsWith(gmailBaseUrl.pathname)
-    ) {
-      throw new EmailKitError(
-        "Invalid Gmail providerFetch URL",
-        PROVIDER,
-        "INVALID_PROVIDER_FETCH_URL",
-        400,
-      );
-    }
-
-    if (init?.searchParams) {
-      const params =
-        init.searchParams instanceof URLSearchParams
-          ? Array.from(init.searchParams.entries())
-          : Object.entries(init.searchParams).flatMap(([key, value]) => {
-              if (value === undefined || value === null) return [];
-              if (Array.isArray(value)) {
-                return value
-                  .filter((entry) => entry !== undefined && entry !== null)
-                  .map((entry) => [key, String(entry)] as const);
-              }
-              return [[key, String(value)] as const];
-            });
-
-      for (const [key] of params) url.searchParams.delete(key);
-      for (const [key, value] of params) url.searchParams.append(key, value);
-    }
-
-    return url;
-  };
+  const resolveGmailUrl = (path: string | URL, init?: ProviderFetchInit): URL =>
+    resolveProviderFetchUrl(gmailBase, path, init, {
+      provider: PROVIDER,
+      message: "Invalid Gmail providerFetch URL",
+    });
 
   const isAttachmentPath = (url: URL): boolean =>
     /\/users\/[^/]+\/messages\/[^/]+\/attachments\/[^/]+$/.test(url.pathname);
@@ -1363,31 +1107,7 @@ export const GmailDriver = <const TId extends string = "gmail">(
         );
       }
 
-      const unsupportedSendFields = [
-        ...((message as { track?: unknown }).track !== undefined
-          ? ["track"]
-          : []),
-        ...((message as { tags?: unknown }).tags !== undefined ? ["tags"] : []),
-        ...((message as { metadata?: unknown }).metadata !== undefined
-          ? ["metadata"]
-          : []),
-        ...((message as { sendAt?: unknown }).sendAt !== undefined
-          ? ["sendAt"]
-          : []),
-        ...((message as { templateId?: unknown }).templateId !== undefined
-          ? ["templateId"]
-          : []),
-        ...((message as { templateData?: unknown }).templateData !== undefined
-          ? ["templateData"]
-          : []),
-        ...((message as { sandbox?: unknown }).sandbox !== undefined
-          ? ["sandbox"]
-          : []),
-        ...((message as { idempotencyKey?: unknown }).idempotencyKey !==
-        undefined
-          ? ["idempotencyKey"]
-          : []),
-      ];
+      const unsupportedSendFields = unsupportedOAuthMailboxSendFields(message);
       if (unsupportedSendFields.length > 0) {
         throw new EmailKitError(
           `Gmail sendEmail does not support these EmailKit send fields: ${unsupportedSendFields.join(
@@ -1438,22 +1158,12 @@ export const GmailDriver = <const TId extends string = "gmail">(
         );
       }
 
-      let auth = options.auth;
-      if (
-        typeof auth.expiresAt === "number" &&
-        auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
-      ) {
-        const previousAuth = auth;
-        auth = await refreshAuth(auth, options.signal);
-        await options.onAuthUpdated?.({
-          auth,
-          previousAuth,
-          ...(options.mailbox ? { mailbox: options.mailbox } : {}),
-          ...(options.context !== undefined
-            ? { context: options.context }
-            : {}),
-        });
-      }
+      const auth = await resolveMailboxOperationAuth(
+        "sendEmail",
+        { auth: options.auth, mailbox: options.mailbox },
+        options,
+        options.signal,
+      );
 
       const reply = resolveMessageReplyContext(message);
       const replyTo = hasReplyData(reply)
@@ -1491,6 +1201,17 @@ export const GmailDriver = <const TId extends string = "gmail">(
             `Gmail attachment ${attachment.filename} must include content; URL-only attachments are not supported`,
             PROVIDER,
             "INVALID_ATTACHMENT",
+          );
+        }
+      }
+
+      for (const name of Object.keys(message.headers || {})) {
+        if (!isValidHeaderName(name)) {
+          throw new EmailKitError(
+            `Invalid custom header name ${JSON.stringify(name)}; header names must be printable ASCII without spaces or colons`,
+            PROVIDER,
+            "INVALID_HEADER",
+            400,
           );
         }
       }
@@ -1589,7 +1310,7 @@ export const GmailDriver = <const TId extends string = "gmail">(
       } = init ?? {};
       const headers = new Headers(initHeaders);
       if (!headers.has("Authorization")) {
-        headers.set("Authorization", authorization(auth));
+        headers.set("Authorization", authorizationHeader(auth));
       }
 
       const url = resolveGmailUrl(path, init);
@@ -1641,13 +1362,7 @@ export const GmailDriver = <const TId extends string = "gmail">(
         return { type: "unknown", data: payload };
       }
 
-      let auth = resolvedAuth;
-      if (
-        typeof auth.expiresAt === "number" &&
-        auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
-      ) {
-        auth = await refreshAuth(auth);
-      }
+      const auth = (await refreshAuthIfNeeded(resolvedAuth)) || resolvedAuth;
 
       const mailbox: MailboxIdentity = { email: notification.emailAddress };
       const finishAuth = async (nextAuth: GmailMailboxAuth, raw?: unknown) => {
@@ -1699,25 +1414,25 @@ export const GmailDriver = <const TId extends string = "gmail">(
         throw error;
       }
 
-      const events: WebhookDriverEvent[] = [];
-      for (const messageId of history.messageIds) {
-        let message: GmailMessage;
-        try {
-          message = await getMessage(auth, messageId);
-        } catch (error) {
-          if (error instanceof EmailKitError && error.httpStatus === 404) {
-            continue;
-          }
-          throw error;
-        }
-        events.push({
-          type: "inbound",
-          data: transformGmailMessage(message, {
-            eventId: `${notification.emailAddress}:${messageId}:added`,
-            notification,
-          }),
-        });
-      }
+      // Transform inside the mapper so raw payloads are dropped as soon as
+      // each message is converted.
+      const events = (
+        await mapWithConcurrency(
+          history.messageIds,
+          MESSAGE_FETCH_CONCURRENCY,
+          async (messageId): Promise<WebhookDriverEvent | undefined> => {
+            const message = await getMessageIfPresent(auth, messageId);
+            if (!message) return undefined;
+            return {
+              type: "inbound",
+              data: transformGmailMessage(message, {
+                eventId: `${notification.emailAddress}:${messageId}:added`,
+                notification,
+              }),
+            };
+          },
+        )
+      ).filter((event) => event !== undefined);
 
       let nextAuth: GmailMailboxAuth = {
         ...auth,
@@ -1794,36 +1509,8 @@ export const GmailDriver = <const TId extends string = "gmail">(
       options,
     ): Promise<MailboxConnectionResult> => {
       const secret = requireSecret(options?.secret, "callback handling");
-      const queryError = request.query?.error;
-      if (queryError) {
-        throw new EmailKitError(
-          request.query?.error_description || queryError,
-          PROVIDER,
-          queryError,
-        );
-      }
-
-      const code = request.query?.code;
-      const stateValue = request.query?.state;
-      if (!code) {
-        throw new EmailKitError(
-          "Missing Gmail OAuth code",
-          PROVIDER,
-          "MISSING_CODE",
-        );
-      }
-      if (!stateValue) {
-        throw new EmailKitError(
-          "Missing Gmail OAuth state",
-          PROVIDER,
-          "MISSING_STATE",
-        );
-      }
-
-      const state = decodeOAuthState<GmailStatePayload>(stateValue, secret, {
-        provider: PROVIDER,
-        label: "Gmail",
-      });
+      const { code, state: stateValue } = parseCallbackRequest(request);
+      const state = decodeState<GmailStatePayload>(stateValue, secret);
       const token = await fetchToken(
         new URLSearchParams({
           client_id: config.clientId,
@@ -2069,45 +1756,53 @@ export const GmailDriver = <const TId extends string = "gmail">(
         // messages.list returns newest-first; sync must yield oldest-first.
         messageIds.reverse();
 
-        for (const messageId of messageIds) {
-          let message: GmailMessage;
-          try {
-            message = await getMessage(auth, messageId, input.signal);
-          } catch (error) {
-            if (error instanceof EmailKitError && error.httpStatus === 404) {
-              continue;
-            }
-            throw error;
-          }
+        // Fetch in small parallel batches and yield per batch: only one
+        // batch of full payloads is in memory at a time, the first event
+        // arrives after one batch, and abandoning the stream stops fetching.
+        for (
+          let offset = 0;
+          offset < messageIds.length;
+          offset += MESSAGE_FETCH_CONCURRENCY
+        ) {
+          const batch = await Promise.all(
+            messageIds
+              .slice(offset, offset + MESSAGE_FETCH_CONCURRENCY)
+              .map((messageId) =>
+                getMessageIfPresent(auth, messageId, input.signal),
+              ),
+          );
 
-          if (
-            labelIds.length !== 1 &&
-            !matchesConfiguredLabels(message.labelIds)
-          ) {
-            continue;
-          }
-
-          const internalDate = Number(message.internalDate);
-          if (Number.isFinite(internalDate) && internalDate > 0) {
+          for (const message of batch) {
+            if (!message) continue;
             if (
-              internalDate < input.since.getTime() ||
-              internalDate >= until.getTime()
+              labelIds.length !== 1 &&
+              !matchesConfiguredLabels(message.labelIds)
             ) {
               continue;
             }
+
+            const internalDate = Number(message.internalDate);
+            if (Number.isFinite(internalDate) && internalDate > 0) {
+              if (
+                internalDate < input.since.getTime() ||
+                internalDate >= until.getTime()
+              ) {
+                continue;
+              }
+            }
+
+            const headers = headersToMap(message.payload?.headers);
+            const from = parseAddressListHeader(headers.from)[0]?.email;
+            if (from && mailboxEmails.has(from.toLowerCase())) continue;
+
+            yield {
+              type: "inbound",
+              data: transformGmailMessage(message, {
+                eventId: message.id ? `sync:${message.id}` : undefined,
+                attachmentProvider,
+              }),
+            };
           }
-
-          const headers = headersToMap(message.payload?.headers);
-          const from = parseAddressListHeader(headers.from)[0]?.email;
-          if (from && mailboxEmails.has(from.toLowerCase())) continue;
-
-          yield {
-            type: "inbound",
-            data: transformGmailMessage(message, {
-              eventId: message.id ? `sync:${message.id}` : undefined,
-              attachmentProvider,
-            }),
-          };
         }
 
         return { syncedFrom: input.since };

@@ -1,6 +1,6 @@
 {
   "name": "emailkit",
-  "version": "2.0.2",
+  "version": "3.0.0",
   "description": "Unified email API for multiple providers.",
   "type": "module",
   "license": "MIT",
@@ -39,15 +39,20 @@
     "email",
     "sdk",
     "emailkit",
+    "gmail",
+    "google",
     "mailgun",
     "resend",
     "aiinbx",
+    "oauth",
+    "pubsub",
     "webhooks",
     "nextjs"
   ],
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown && tsdown --watch src --ignore-watch '**/.turbo/**' --ignore-watch '.turbo/**' --ignore-watch '**/dist/**' --ignore-watch 'dist/**' --ignore-watch '**/node_modules/**' --ignore-watch 'node_modules/**'",
+    "lint": "eslint src tests tsdown.config.ts --max-warnings=0",
     "prepublishOnly": "npm run build",
     "test": "vitest",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.type-tests.json",
@@ -67,7 +72,9 @@
   "devDependencies": {
     "@types/node": "^24.9.1",
     "bumpp": "^10.3.1",
+    "eslint": "^9.39.4",
     "tsdown": "^0.15.9",
+    "typescript-eslint": "^8.59.4",
     "typescript": "^5.9.3",
     "vitest": "^4.0.1"
   }

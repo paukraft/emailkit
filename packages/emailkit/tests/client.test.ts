@@ -37,8 +37,8 @@ const makeDomain = (overrides: Partial<Domain> = {}): Domain => ({
   ...overrides,
 });
 
-const createTestClient = (overrides: Partial<EmailDriver<any, any>> = {}) => {
-  const driver: EmailDriver<any, any> = {
+const createTestClient = (overrides: Partial<EmailDriver<any>> = {}) => {
+  const driver: EmailDriver<any> = {
     id: "test-provider",
     name: "test-provider",
     capabilities: {
@@ -91,7 +91,7 @@ const createTestClient = (overrides: Partial<EmailDriver<any, any>> = {}) => {
 const createDomainDriver = <const TId extends string>(
   id: TId,
   domains: Partial<NonNullable<EmailDriver["domains"]>>,
-): EmailDriver<any, any, TId> => {
+): EmailDriver<any, TId> => {
   const capabilities = {
     identifier: "both" as const,
     ...(domains.list ? { list: true as const } : {}),
@@ -117,7 +117,7 @@ const createDomainDriver = <const TId extends string>(
 const createMailboxDriver = <const TId extends string>(
   id: TId,
   mailboxes: Partial<NonNullable<EmailDriver["mailboxes"]>>,
-): EmailDriver<any, { mailboxGet: true; mailboxDelete: true }, TId> => ({
+): EmailDriver<{ mailboxGet: true; mailboxDelete: true }, TId> => ({
   id,
   name: id,
   capabilities: {
@@ -133,7 +133,7 @@ const createMailboxDriver = <const TId extends string>(
 
 const createPlainDriver = <const TId extends string>(
   id: TId,
-): EmailDriver<any, {}, TId> => ({
+): EmailDriver<{}, TId> => ({
   id,
   name: id,
   capabilities: {},
@@ -210,37 +210,49 @@ describe("EmailKit client helpers", () => {
 
   it("narrows driver public routes by declared route capabilities", () => {
     const resendRoutes: DriverPublicRoutes<typeof RESEND_CAPABILITIES> = {
-      webhookUrl: "https://app.example.com/api/email/resend",
+      webhook: { url: "https://app.example.com/api/email/resend" },
     };
     const outlookRoutes: DriverPublicRoutes<typeof OUTLOOK_CAPABILITIES> = {
-      webhookUrl: "https://app.example.com/api/email/outlook",
-      lifecycleWebhookUrl: "https://app.example.com/api/email/outlook",
-      connectCallbackUrl: "https://app.example.com/api/email/outlook",
+      webhook: {
+        url: "https://app.example.com/api/email/outlook",
+        lifecycleNotificationUrl: "https://app.example.com/api/email/outlook",
+      },
+      callback: { url: "https://app.example.com/api/email/outlook" },
       connectLandingUrl: "https://app.example.com/connected",
       connectFailureUrl: "https://app.example.com/failed",
     };
 
     if (false) {
       const badResendRoutes: DriverPublicRoutes<typeof RESEND_CAPABILITIES> = {
-        webhookUrl: "https://app.example.com/api/email/resend",
+        webhook: { url: "https://app.example.com/api/email/resend" },
         // @ts-expect-error Resend does not consume mailbox callback routes.
-        connectCallbackUrl: "https://app.example.com/api/email/resend",
+        callback: { url: "https://app.example.com/api/email/resend" },
       };
       expect(badResendRoutes).toBeDefined();
+
+      const badResendNestedRoutes: DriverPublicRoutes<
+        typeof RESEND_CAPABILITIES
+      > = {
+        webhook: {
+          url: "https://app.example.com/api/email/resend",
+          // @ts-expect-error Resend does not consume lifecycle webhook routes.
+          lifecycleNotificationUrl: "https://app.example.com/api/email/resend",
+        },
+        // @ts-expect-error Resend does not consume mailbox callback routes.
+        callback: { url: "https://app.example.com/api/email/resend" },
+      };
+      expect(badResendNestedRoutes).toBeDefined();
     }
 
-    expect(resendRoutes.webhookUrl).toContain("/resend");
-    expect(outlookRoutes.connectCallbackUrl).toContain("/outlook");
+    expect(resendRoutes.webhook?.url).toContain("/resend");
+    expect(outlookRoutes.callback?.url).toContain("/outlook");
   });
 
   it("narrows mailbox connect route inputs by selected driver", () => {
-    const callbackDriver: EmailDriver<
-      any,
-      {
+    const callbackDriver: EmailDriver<{
         mailboxConnect: true;
         publicRoutes: { connectCallback: true; connectLanding: true };
-      },
-      "oauth"
+      }, "oauth"
     > = {
       ...createPlainDriver("oauth"),
       capabilities: {
@@ -250,7 +262,7 @@ describe("EmailKit client helpers", () => {
       mailboxes: { connect: vi.fn() },
       handleCallback: vi.fn(),
     };
-    const apiDriver: EmailDriver<any, { mailboxConnect: true }, "api"> = {
+    const apiDriver: EmailDriver<{ mailboxConnect: true }, "api"> = {
       ...createPlainDriver("api"),
       capabilities: { mailboxConnect: true },
       mailboxes: { connect: vi.fn() },
@@ -277,7 +289,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("requires callback handlers to declare callback route support", () => {
-    const driver: EmailDriver<any, { mailboxConnect: true }, "implicit-oauth"> =
+    const driver: EmailDriver<{ mailboxConnect: true }, "implicit-oauth"> =
       {
         ...createPlainDriver("implicit-oauth"),
         capabilities: { mailboxConnect: true },
@@ -297,10 +309,7 @@ describe("EmailKit client helpers", () => {
     const providerFetch = vi
       .fn()
       .mockResolvedValue(new Response("ok", { status: 200 }));
-    const fetchDriver: EmailDriver<
-      any,
-      { providerFetch: true },
-      "fetch-driver"
+    const fetchDriver: EmailDriver<{ providerFetch: true }, "fetch-driver"
     > = {
       ...createPlainDriver("fetch-driver"),
       capabilities: { providerFetch: true },
@@ -331,15 +340,12 @@ describe("EmailKit client helpers", () => {
   });
 
   it("validates providerFetch capabilities against implementation", () => {
-    const declaredMissing: EmailDriver<
-      any,
-      { providerFetch: true },
-      "declared-missing"
+    const declaredMissing: EmailDriver<{ providerFetch: true }, "declared-missing"
     > = {
       ...createPlainDriver("declared-missing"),
       capabilities: { providerFetch: true },
     };
-    const implementedUndeclared: EmailDriver<any, {}, "implemented-missing"> = {
+    const implementedUndeclared: EmailDriver<{}, "implemented-missing"> = {
       ...createPlainDriver("implemented-missing"),
       capabilities: {},
       providerFetch: vi.fn(),
@@ -354,10 +360,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("narrows send-only features by selected email driver", async () => {
-    const scheduledDriver: EmailDriver<
-      any,
-      { scheduling: true; sendIdempotency: true },
-      "scheduled"
+    const scheduledDriver: EmailDriver<{ scheduling: true; sendIdempotency: true }, "scheduled"
     > = {
       ...createPlainDriver("scheduled"),
       capabilities: {
@@ -437,10 +440,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("gates sender auth and mailbox overrides by selected driver capabilities", async () => {
-    const authDriver: EmailDriver<
-      any,
-      { senderAuth: true; senderMailbox: true },
-      "auth-driver"
+    const authDriver: EmailDriver<{ senderAuth: true; senderMailbox: true }, "auth-driver"
     > = {
       ...createPlainDriver("auth-driver"),
       capabilities: { senderAuth: true, senderMailbox: true },
@@ -661,13 +661,10 @@ describe("EmailKit client helpers", () => {
   });
 
   it("separates send-time tracking controls from tracking events", async () => {
-    const eventOnlyDriver: EmailDriver<
-      any,
-      {
+    const eventOnlyDriver: EmailDriver<{
         eventTracking: { opens: true; clicks: true };
         webhooks: { account: { setup: true } };
-      },
-      "event-only"
+      }, "event-only"
     > = {
       ...createPlainDriver("event-only"),
       capabilities: {
@@ -676,10 +673,7 @@ describe("EmailKit client helpers", () => {
       },
       webhooks: { account: { setup: vi.fn() } },
     };
-    const trackingControlDriver: EmailDriver<
-      any,
-      { sendTracking: { opens: true; clicks: true } },
-      "tracking-controls"
+    const trackingControlDriver: EmailDriver<{ sendTracking: { opens: true; clicks: true } }, "tracking-controls"
     > = {
       ...createPlainDriver("tracking-controls"),
       capabilities: {
@@ -723,10 +717,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("separates reply-to addresses, RFC reply headers, and native thread ids", () => {
-    const rfcReplyDriver: EmailDriver<
-      any,
-      { replyTo: true; replyHeaders: true },
-      "rfc-reply"
+    const rfcReplyDriver: EmailDriver<{ replyTo: true; replyHeaders: true }, "rfc-reply"
     > = {
       ...createPlainDriver("rfc-reply"),
       capabilities: {
@@ -734,10 +725,7 @@ describe("EmailKit client helpers", () => {
         replyHeaders: true,
       },
     };
-    const nativeThreadDriver: EmailDriver<
-      any,
-      { replyThreadId: true },
-      "native-thread"
+    const nativeThreadDriver: EmailDriver<{ replyThreadId: true }, "native-thread"
     > = {
       ...createPlainDriver("native-thread"),
       capabilities: {
@@ -794,10 +782,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("allows string and key-value tags while keeping metadata as string values", () => {
-    const taggedDriver: EmailDriver<
-      any,
-      { tags: true; metadata: true },
-      "tags"
+    const taggedDriver: EmailDriver<{ tags: true; metadata: true }, "tags"
     > = {
       ...createPlainDriver("tags"),
       capabilities: {
@@ -1192,10 +1177,7 @@ describe("EmailKit client helpers", () => {
 
   it("gates domain methods with method-level domain capabilities", async () => {
     const domain = makeDomain();
-    const driver: EmailDriver<
-      any,
-      { domains: { get: true; identifier: "both" } },
-      "get-only"
+    const driver: EmailDriver<{ domains: { get: true; identifier: "both" } }, "get-only"
     > = {
       ...createPlainDriver("get-only"),
       capabilities: {
@@ -1232,10 +1214,7 @@ describe("EmailKit client helpers", () => {
   });
 
   it("validates object domain capabilities against implemented methods", () => {
-    const driver: EmailDriver<
-      any,
-      { domains: { update: true; identifier: "both" } },
-      "invalid-domain-driver"
+    const driver: EmailDriver<{ domains: { update: true; identifier: "both" } }, "invalid-domain-driver"
     > = {
       ...createPlainDriver("invalid-domain-driver"),
       capabilities: {
@@ -1330,6 +1309,29 @@ describe("EmailKit client helpers", () => {
     expect(providerFetch).toHaveBeenCalledWith(
       "https://files.example.com/invoice.pdf",
       undefined,
+    );
+  });
+
+  it("passes attachment getContent signals to providerFetch", async () => {
+    const providerFetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(new Uint8Array([4, 5, 6]), { status: 200 }),
+      );
+    const { client } = createTestClient({ providerFetch });
+    const controller = new AbortController();
+
+    await client.attachments.getContent(
+      {
+        filename: "invoice.pdf",
+        url: "https://files.example.com/invoice.pdf",
+      },
+      { signal: controller.signal },
+    );
+
+    expect(providerFetch).toHaveBeenCalledWith(
+      "https://files.example.com/invoice.pdf",
+      { signal: controller.signal },
     );
   });
 
@@ -1515,6 +1517,7 @@ describe("EmailKit client helpers", () => {
       emailDrivers: [resend, agentmail],
       resolveEmailDriver: ({ operation, input }) => {
         expect(operation).toBe("domains.get");
+        expect(input).toEqual({ domain: "customer.com" });
         return "agentmail";
       },
     });
@@ -1572,10 +1575,7 @@ describe("EmailKit client helpers", () => {
       get: vi.fn().mockResolvedValue(mailbox),
       delete: vi.fn(),
     });
-    const connectOnly: EmailDriver<
-      any,
-      { mailboxConnect: true },
-      "connect-only"
+    const connectOnly: EmailDriver<{ mailboxConnect: true }, "connect-only"
     > = {
       ...createPlainDriver("connect-only"),
       capabilities: { mailboxConnect: true },
@@ -1629,16 +1629,13 @@ describe("EmailKit client helpers", () => {
   });
 
   it("validates mailbox capabilities against implemented methods", () => {
-    const declaredMissing: EmailDriver<
-      any,
-      { mailboxGet: true },
-      "declared-missing"
+    const declaredMissing: EmailDriver<{ mailboxGet: true }, "declared-missing"
     > = {
       ...createPlainDriver("declared-missing"),
       capabilities: { mailboxGet: true },
       mailboxes: {},
     };
-    const implementedUndeclared: EmailDriver<any, {}, "implemented-missing"> = {
+    const implementedUndeclared: EmailDriver<{}, "implemented-missing"> = {
       ...createPlainDriver("implemented-missing"),
       capabilities: {},
       mailboxes: {
@@ -1659,7 +1656,7 @@ describe("EmailKit client helpers", () => {
       redirectUrl: "https://auth.example.com/start",
       state: "signed-state",
     });
-    const driver: EmailDriver<any, { mailboxConnect: true }, "gmail"> = {
+    const driver: EmailDriver<{ mailboxConnect: true }, "gmail"> = {
       id: "gmail",
       name: "gmail",
       capabilities: { mailboxConnect: true },
@@ -1690,7 +1687,7 @@ describe("EmailKit client helpers", () => {
       redirectUrl: "https://auth.example.com/start",
       state: "signed-state",
     });
-    const driver: EmailDriver<any, { mailboxConnect: true }, "gmail"> = {
+    const driver: EmailDriver<{ mailboxConnect: true }, "gmail"> = {
       id: "gmail",
       name: "gmail",
       capabilities: { mailboxConnect: true },
@@ -1720,7 +1717,7 @@ describe("EmailKit client helpers", () => {
       redirectUrl: "https://auth.example.com/start",
       state: "signed-state",
     });
-    const driver: EmailDriver<any, { mailboxConnect: true }, "gmail"> = {
+    const driver: EmailDriver<{ mailboxConnect: true }, "gmail"> = {
       id: "gmail",
       name: "gmail",
       capabilities: { mailboxConnect: true },
@@ -1758,10 +1755,7 @@ describe("EmailKit client helpers", () => {
       context: { flow: "oauth" },
     });
     const onConnected = vi.fn();
-    const driver: EmailDriver<
-      any,
-      { mailboxConnect: true; requiresSecret: true },
-      "gmail"
+    const driver: EmailDriver<{ mailboxConnect: true; requiresSecret: true }, "gmail"
     > = {
       id: "gmail",
       name: "gmail",
@@ -2003,28 +1997,19 @@ describe("EmailKit client helpers", () => {
       },
     });
 
-    const accountDriver: EmailDriver<
-      any,
-      { webhooks: { account: { setup: true } } },
-      "account-driver"
+    const accountDriver: EmailDriver<{ webhooks: { account: { setup: true } } }, "account-driver"
     > = {
       ...createPlainDriver("account-driver"),
       capabilities: { webhooks: { account: { setup: true } } },
       webhooks: { account: { setup: accountSetup } },
     };
-    const mailboxDriver: EmailDriver<
-      any,
-      { webhooks: { mailbox: { setup: true } } },
-      "mailbox-driver"
+    const mailboxDriver: EmailDriver<{ webhooks: { mailbox: { setup: true } } }, "mailbox-driver"
     > = {
       ...createPlainDriver("mailbox-driver"),
       capabilities: { webhooks: { mailbox: { setup: true } } },
       webhooks: { mailbox: { setup: mailboxSetup } },
     };
-    const domainDriver: EmailDriver<
-      any,
-      { webhooks: { domain: { setup: true } } },
-      "domain-driver"
+    const domainDriver: EmailDriver<{ webhooks: { domain: { setup: true } } }, "domain-driver"
     > = {
       ...createPlainDriver("domain-driver"),
       capabilities: { webhooks: { domain: { setup: true } } },
@@ -2132,17 +2117,14 @@ describe("EmailKit client helpers", () => {
         },
       }),
     );
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         webhooks: {
           account: { setup: true };
           mailbox: { setup: true };
           domain: { setup: true };
         };
         publicRoutes: { webhook: true; lifecycleWebhook: true };
-      },
-      "route-driver"
+      }, "route-driver"
     > = {
       ...createPlainDriver("route-driver"),
       capabilities: {
@@ -2190,8 +2172,10 @@ describe("EmailKit client helpers", () => {
       },
       expect.objectContaining({
         publicRoutes: expect.objectContaining({
-          webhookUrl: expectedUrl,
-          lifecycleWebhookUrl: expectedLifecycleUrl,
+          webhook: {
+            url: expectedUrl,
+            lifecycleNotificationUrl: expectedLifecycleUrl,
+          },
         }),
       }),
     );
@@ -2202,7 +2186,9 @@ describe("EmailKit client helpers", () => {
         provider: { lifecycleNotificationUrl: expectedLifecycleUrl },
       },
       expect.objectContaining({
-        publicRoutes: expect.objectContaining({ webhookUrl: expectedUrl }),
+        publicRoutes: expect.objectContaining({
+          webhook: expect.objectContaining({ url: expectedUrl }),
+        }),
       }),
     );
     expect(domainSetup).toHaveBeenCalledWith(
@@ -2212,7 +2198,9 @@ describe("EmailKit client helpers", () => {
         provider: { lifecycleNotificationUrl: expectedLifecycleUrl },
       },
       expect.objectContaining({
-        publicRoutes: expect.objectContaining({ webhookUrl: expectedUrl }),
+        publicRoutes: expect.objectContaining({
+          webhook: expect.objectContaining({ url: expectedUrl }),
+        }),
       }),
     );
   });
@@ -2227,13 +2215,10 @@ describe("EmailKit client helpers", () => {
         status: "active",
       },
     });
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         webhooks: { account: { setup: true } };
         publicRoutes: { webhook: true; lifecycleWebhook: true };
-      },
-      "env-driver"
+      }, "env-driver"
     > = {
       ...createPlainDriver("env-driver"),
       capabilities: {
@@ -2256,8 +2241,11 @@ describe("EmailKit client helpers", () => {
       },
       expect.objectContaining({
         publicRoutes: expect.objectContaining({
-          webhookUrl: "https://env.example.com/api/email/env-driver",
-          lifecycleWebhookUrl: "https://env.example.com/api/email/env-driver",
+          webhook: {
+            url: "https://env.example.com/api/email/env-driver",
+            lifecycleNotificationUrl:
+              "https://env.example.com/api/email/env-driver",
+          },
         }),
       }),
     );
@@ -2273,13 +2261,10 @@ describe("EmailKit client helpers", () => {
         status: "active",
       },
     });
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         webhooks: { account: { setup: true } };
         publicRoutes: { webhook: true; lifecycleWebhook: true };
-      },
-      "config-driver"
+      }, "config-driver"
     > = {
       ...createPlainDriver("config-driver"),
       capabilities: {
@@ -2304,7 +2289,9 @@ describe("EmailKit client helpers", () => {
       }),
       expect.objectContaining({
         publicRoutes: expect.objectContaining({
-          webhookUrl: "https://config.example.com/api/email/config-driver",
+          webhook: expect.objectContaining({
+            url: "https://config.example.com/api/email/config-driver",
+          }),
         }),
       }),
     );
@@ -2320,13 +2307,10 @@ describe("EmailKit client helpers", () => {
         status: "active",
       },
     });
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         webhooks: { account: { setup: true } };
         publicRoutes: { webhook: true; lifecycleWebhook: true };
-      },
-      "strict-driver"
+      }, "strict-driver"
     > = {
       ...createPlainDriver("strict-driver"),
       capabilities: {
@@ -2354,13 +2338,10 @@ describe("EmailKit client helpers", () => {
       redirectUrl: "https://auth.example.com/start",
       state: "signed-state",
     });
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         mailboxConnect: true;
         publicRoutes: { connectCallback: true; connectLanding: true };
-      },
-      "gmail"
+      }, "gmail"
     > = {
       ...createPlainDriver("gmail"),
       capabilities: {
@@ -2394,7 +2375,9 @@ describe("EmailKit client helpers", () => {
       }),
       expect.objectContaining({
         publicRoutes: expect.objectContaining({
-          connectCallbackUrl: "https://app.example.com/api/email/gmail",
+          callback: {
+            url: "https://app.example.com/api/email/gmail",
+          },
           connectLandingUrl: "https://app.example.com/connected",
           connectFailureUrl: "https://app.example.com/failed",
         }),
@@ -2406,7 +2389,7 @@ describe("EmailKit client helpers", () => {
     const connect = vi.fn().mockResolvedValue({
       redirectUrl: "https://auth.example.com/start",
     });
-    const driver: EmailDriver<any, { mailboxConnect: true }, "api-mailbox"> = {
+    const driver: EmailDriver<{ mailboxConnect: true }, "api-mailbox"> = {
       ...createPlainDriver("api-mailbox"),
       capabilities: { mailboxConnect: true },
       mailboxes: { connect },
@@ -2441,13 +2424,10 @@ describe("EmailKit client helpers", () => {
   });
 
   it("rejects mailbox connect landing URLs outside configured origins", async () => {
-    const driver: EmailDriver<
-      any,
-      {
+    const driver: EmailDriver<{
         mailboxConnect: true;
         publicRoutes: { connectCallback: true; connectLanding: true };
-      },
-      "gmail"
+      }, "gmail"
     > = {
       ...createPlainDriver("gmail"),
       capabilities: {
@@ -2512,10 +2492,7 @@ describe("EmailKit client helpers", () => {
       context: { tenantId: "tenant_123" },
       raw: { provider: "delete" },
     });
-    const driver: EmailDriver<
-      any,
-      { webhooks: { account: true } },
-      "account-driver"
+    const driver: EmailDriver<{ webhooks: { account: true } }, "account-driver"
     > = {
       ...createPlainDriver("account-driver"),
       capabilities: { webhooks: { account: true } },
@@ -2604,7 +2581,7 @@ describe("EmailKit client helpers", () => {
   it("dispatches webhook created hooks for webhooks returned by mailbox connection", async () => {
     const onConnected = vi.fn();
     const onCreated = vi.fn();
-    const driver: EmailDriver<any, { mailboxConnect: true }, "mailbox-driver"> =
+    const driver: EmailDriver<{ mailboxConnect: true }, "mailbox-driver"> =
       {
         ...createPlainDriver("mailbox-driver"),
         capabilities: { mailboxConnect: true },
@@ -2696,16 +2673,13 @@ describe("EmailKit client helpers", () => {
   });
 
   it("validates webhook scopes against implemented methods", () => {
-    const declaredMissing: EmailDriver<
-      any,
-      { webhooks: { account: true } },
-      "declared-missing"
+    const declaredMissing: EmailDriver<{ webhooks: { account: true } }, "declared-missing"
     > = {
       ...createPlainDriver("declared-missing"),
       capabilities: { webhooks: { account: true } },
       webhooks: { account: {} },
     };
-    const implementedUndeclared: EmailDriver<any, {}, "implemented-missing"> = {
+    const implementedUndeclared: EmailDriver<{}, "implemented-missing"> = {
       ...createPlainDriver("implemented-missing"),
       capabilities: {},
       webhooks: { account: { setup: vi.fn() } },
@@ -2738,7 +2712,7 @@ describe("EmailKit sync", () => {
   const createMailboxSyncDriver = <const TId extends string>(
     id: TId,
     mailbox: NonNullable<EmailDriver["sync"]>["mailbox"],
-  ): EmailDriver<any, { sync: { mailbox: true } }, TId> => ({
+  ): EmailDriver<{ sync: { mailbox: true } }, TId> => ({
     ...createPlainDriver(id),
     capabilities: { sync: { mailbox: true } },
     sync: { mailbox },
@@ -2961,16 +2935,13 @@ describe("EmailKit sync", () => {
   });
 
   it("validates sync scopes against implemented methods", () => {
-    const declaredMissing: EmailDriver<
-      any,
-      { sync: { mailbox: true } },
-      "declared-missing"
+    const declaredMissing: EmailDriver<{ sync: { mailbox: true } }, "declared-missing"
     > = {
       ...createPlainDriver("declared-missing"),
       capabilities: { sync: { mailbox: true } },
       sync: {},
     };
-    const implementedUndeclared: EmailDriver<any, {}, "implemented-missing"> = {
+    const implementedUndeclared: EmailDriver<{}, "implemented-missing"> = {
       ...createPlainDriver("implemented-missing"),
       capabilities: {},
       sync: { mailbox: vi.fn() },
@@ -2986,10 +2957,7 @@ describe("EmailKit sync", () => {
 
   it("exposes top-level sync for account-scope drivers only", async () => {
     const onInbound = vi.fn();
-    const accountDriver: EmailDriver<
-      any,
-      { sync: { account: true } },
-      "account-sync-driver"
+    const accountDriver: EmailDriver<{ sync: { account: true } }, "account-sync-driver"
     > = {
       ...createPlainDriver("account-sync-driver"),
       capabilities: { sync: { account: true } },
@@ -3025,7 +2993,7 @@ describe("EmailKit sync", () => {
   it("keeps live webhook dispatch unchanged", async () => {
     const onInbound = vi.fn();
     const onAll = vi.fn();
-    const driver: EmailDriver<any, {}, "webhook-driver"> = {
+    const driver: EmailDriver<{}, "webhook-driver"> = {
       ...createPlainDriver("webhook-driver"),
       handleWebhook: vi
         .fn()

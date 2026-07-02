@@ -3,6 +3,8 @@ import {
   AIInbxDriver,
   GMAIL_CAPABILITIES,
   GmailDriver,
+  isGmailAuth,
+  isOutlookAuth,
   MAILGUN_CAPABILITIES,
   MailgunDriver,
   OUTLOOK_CAPABILITIES,
@@ -11,8 +13,7 @@ import {
   ResendDriver,
   type DriverCapabilities,
   type EmailDriverTuple,
-  type GmailMailboxAuth,
-  type OutlookMailboxAuth,
+  type OutlookWebhookAuthResolver,
 } from "emailkit"
 
 import {
@@ -64,6 +65,32 @@ const outlookProviderMailboxIdFromResource = (resource?: string) => {
 
 export const emailkitPublicRoute = (emailDriver: string) =>
   `${publicBaseUrl()}/api/email/${encodeURIComponent(emailDriver)}`
+
+const outlookWebhookAuthResolver: OutlookWebhookAuthResolver = async ({
+  mailboxEmail,
+  notification,
+}) => {
+  if (mailboxEmail) {
+    const mailbox = await findPersistedMailbox(mailboxEmail, "outlook")
+    const auth = mailbox?.auth
+    if (isOutlookAuth(auth)) return auth
+  }
+  if (notification.subscriptionId) {
+    const mailbox = await findOutlookMailboxIdForSubscription(
+      notification.subscriptionId
+    )
+    const auth = mailbox?.auth
+    if (isOutlookAuth(auth)) return auth
+  }
+  const persisted = await findPersistedOutlookMailboxForWebhook({
+    subscriptionId: notification.subscriptionId,
+    providerMailboxId: outlookProviderMailboxIdFromResource(
+      notification.resource
+    ),
+  })
+  const auth = persisted?.auth
+  return isOutlookAuth(auth) ? auth : undefined
+}
 
 const definitions: DriverDefinition[] = [
   {
@@ -123,26 +150,23 @@ const definitions: DriverDefinition[] = [
     label: "Gmail",
     family: "gmail",
     capabilities: GMAIL_CAPABILITIES,
-    requiredEnv: ["GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "EMAILKIT_SECRET"],
+    requiredEnv: [
+      "GMAIL_CLIENT_ID",
+      "GMAIL_CLIENT_SECRET",
+      "GMAIL_WEBHOOK_TOKEN",
+      "EMAILKIT_SECRET",
+    ],
     optionalEnv: [
       "GMAIL_PUBSUB_TOPIC",
       "GMAIL_AUTO_SUBSCRIBE_INBOUND",
-      "GMAIL_WEBHOOK_TOKEN",
       "GMAIL_SCOPES",
       "PUBLIC_BASE_URL",
       "APP_URL",
       "FROM_EMAIL_ADDRESS",
       "TO_EMAIL_ADDRESS",
     ],
-    create: () => {
-      const asGmailAuth = (auth: unknown): GmailMailboxAuth | undefined =>
-        auth &&
-        typeof auth === "object" &&
-        typeof (auth as { accessToken?: unknown }).accessToken === "string"
-          ? (auth as GmailMailboxAuth)
-          : undefined
-
-      return GmailDriver({
+    create: () =>
+      GmailDriver({
         id: "gmail",
         clientId: env("GMAIL_CLIENT_ID"),
         clientSecret: env("GMAIL_CLIENT_SECRET"),
@@ -151,11 +175,12 @@ const definitions: DriverDefinition[] = [
           ? listEnv("GMAIL_SCOPES")
           : undefined,
         autoSubscribeInbound: env("GMAIL_AUTO_SUBSCRIBE_INBOUND") !== "false",
-        verificationToken: env("GMAIL_WEBHOOK_TOKEN") || undefined,
+        verificationToken: env("GMAIL_WEBHOOK_TOKEN"),
         webhookAuthResolver: async ({ mailboxEmail }) => {
           if (!mailboxEmail) return undefined
           const mailbox = await findPersistedMailbox(mailboxEmail, "gmail")
-          return asGmailAuth(mailbox?.auth)
+          const auth = mailbox?.auth
+          return isGmailAuth(auth) ? auth : undefined
         },
         onAuthUpdated: async ({ auth, mailbox }) => {
           const email = mailbox?.email
@@ -174,7 +199,6 @@ const definitions: DriverDefinition[] = [
           )
         },
       })
-    },
   },
   {
     id: "outlook",
@@ -196,46 +220,33 @@ const definitions: DriverDefinition[] = [
       "FROM_EMAIL_ADDRESS",
       "TO_EMAIL_ADDRESS",
     ],
-    create: () =>
-      OutlookDriver({
+    create: () => {
+      const autoSubscribeInbound = outlookAutoSubscribeInbound()
+      const webhookClientState = env("OUTLOOK_WEBHOOK_CLIENT_STATE") || undefined
+      // Without auto-subscribe the driver requires an explicit clientState to
+      // verify notifications; degrade to send-only instead of throwing at
+      // module load and taking every sandbox route down.
+      const inboundReady = autoSubscribeInbound || Boolean(webhookClientState)
+      if (!inboundReady) {
+        console.warn(
+          "[sandbox] Outlook inbound disabled: set OUTLOOK_WEBHOOK_CLIENT_STATE or enable OUTLOOK_AUTO_SUBSCRIBE_INBOUND"
+        )
+      }
+      return OutlookDriver({
         id: "outlook",
         clientId: env("OUTLOOK_CLIENT_ID"),
         clientSecret: env("OUTLOOK_CLIENT_SECRET"),
         tenant: env("OUTLOOK_TENANT") || "common",
         scopes: outlookScopes(),
-        autoSubscribeInbound: outlookAutoSubscribeInbound(),
-        webhookClientState: env("OUTLOOK_WEBHOOK_CLIENT_STATE") || undefined,
-        webhookAuthResolver: async ({ mailboxEmail, notification }) => {
-          const asOutlookAuth = (
-            auth: unknown
-          ): OutlookMailboxAuth | undefined =>
-            auth &&
-            typeof auth === "object" &&
-            typeof (auth as { accessToken?: unknown }).accessToken === "string"
-              ? (auth as OutlookMailboxAuth)
-              : undefined
-
-          if (mailboxEmail) {
-            const mailbox = await findPersistedMailbox(mailboxEmail, "outlook")
-            const auth = asOutlookAuth(mailbox?.auth)
-            if (auth) return auth
-          }
-          if (notification.subscriptionId) {
-            const mailbox = await findOutlookMailboxIdForSubscription(
-              notification.subscriptionId
-            )
-            const auth = asOutlookAuth(mailbox?.auth)
-            if (auth) return auth
-          }
-          const persisted = await findPersistedOutlookMailboxForWebhook({
-            subscriptionId: notification.subscriptionId,
-            providerMailboxId: outlookProviderMailboxIdFromResource(
-              notification.resource
-            ),
-          })
-          return asOutlookAuth(persisted?.auth)
-        },
-      }),
+        autoSubscribeInbound,
+        webhookClientState,
+        ...(inboundReady
+          ? {
+              webhookAuthResolver: outlookWebhookAuthResolver,
+            }
+          : {}),
+      })
+    },
   },
 ]
 

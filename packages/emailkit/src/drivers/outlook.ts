@@ -24,7 +24,6 @@ import type {
   InboundEmailEvent,
   Mailbox,
   MailboxConnectionResult,
-  MailboxIdentity,
   MailboxSyncInput,
   MailboxWebhookDeleteInput,
   MailboxWebhookDeleteResult,
@@ -44,11 +43,34 @@ import type {
 import { EmailKitError } from "../types";
 import { bytesToBase64, stringToBase64 } from "../utils/base64";
 import {
+  type OAuthMailboxAuth,
+  addNormalizedMailboxEmail,
+  authorizationHeader,
+  createOAuthMailboxKit,
+  formatScopes,
+  isOAuthMailboxAuth,
+  mailboxProviderMetadata,
+  nonEmptyString,
+  normalizeBaseUrl,
+  normalizedMailboxEmails,
+  oauthErrorMessage,
+  readJsonResponse,
+  resolveProviderFetchUrl,
+  resolvePublicWebhookUrl,
+  sanitizeTokenResponse,
+  uniqueScopes,
+  unsupportedOAuthMailboxSendFields,
+} from "../utils/oauth-mailbox";
+import {
+  parseWebhookBody,
+  webhookEvents,
+  webhookRenewAfter,
+} from "../utils/webhook";
+import {
   OAUTH_STATE_VERSION,
   createCodeChallenge,
   createCodeVerifier,
   createStateNonce,
-  decodeOAuthState,
   encodeOAuthState,
   type OAuthStatePayload,
 } from "../utils/oauth-state";
@@ -134,8 +156,13 @@ export interface OutlookDriverConfig<
    */
   webhookAuth?: OutlookMailboxAuth;
   /**
-   * Expected Microsoft Graph subscription clientState value(s). Configure this
-   * to reject forged webhook notifications before mailbox data is fetched.
+   * Expected Microsoft Graph subscription clientState value(s); notifications
+   * that do not carry a matching clientState are rejected with 401. When the
+   * driver creates subscriptions itself (autoSubscribeInbound, or no
+   * webhookAuthResolver) it defaults to a value derived from the client
+   * credentials. Required when webhookAuthResolver is set without
+   * autoSubscribeInbound, because subscriptions created outside this driver
+   * must carry the same value.
    */
   webhookClientState?: string | string[];
   /**
@@ -145,13 +172,7 @@ export interface OutlookDriverConfig<
   webhookAuthResolver?: OutlookWebhookAuthResolver;
 }
 
-export interface OutlookMailboxAuth {
-  accessToken: string;
-  refreshToken?: string;
-  expiresAt?: number;
-  scopes?: string[];
-  tokenType?: string;
-}
+export type OutlookMailboxAuth = OAuthMailboxAuth;
 
 export type OutlookSendEmailMode = "sendMail" | "draft";
 
@@ -265,7 +286,6 @@ const DEFAULT_SCOPES = [
   "Mail.Read",
 ];
 const PROVIDER = "outlook";
-const TOKEN_REFRESH_LEEWAY_MS = 60_000;
 const DEFAULT_INBOUND_RESOURCE = "me/messages";
 const DEFAULT_INBOUND_SUBSCRIPTION_MINUTES = 60 * 24 * 3;
 const WEBHOOK_RENEWAL_BUFFER_MS = 60 * 60 * 1000;
@@ -275,37 +295,6 @@ interface OutlookStatePayload extends OAuthStatePayload {
   provider: typeof PROVIDER;
   webhookUrl?: string;
   lifecycleNotificationUrl?: string;
-}
-
-type OutlookPublicRoutes = NonNullable<
-  EmailDriverOperationOptions["publicRoutes"]
-> & {
-  callback?: {
-    url?: unknown;
-    callbackUrl?: unknown;
-  };
-  webhook?: {
-    url?: unknown;
-    lifecycleUrl?: unknown;
-    lifecycleNotificationUrl?: unknown;
-  };
-};
-
-interface OutlookPublicRouteOptions {
-  callbackUrl?: unknown;
-  publicRoutes?: OutlookPublicRoutes;
-}
-
-interface MicrosoftTokenResponse {
-  access_token?: string;
-  refresh_token?: string;
-  expires_in?: number;
-  ext_expires_in?: number;
-  scope?: string;
-  token_type?: string;
-  error?: string;
-  error_description?: string;
-  [key: string]: unknown;
 }
 
 interface MicrosoftUserResponse {
@@ -425,63 +414,6 @@ interface OutlookAttachmentProviderMetadata {
   messageId?: string;
 }
 
-const decodeState = (state: string, secret: string): OutlookStatePayload =>
-  decodeOAuthState<OutlookStatePayload>(state, secret, {
-    provider: PROVIDER,
-    label: "Outlook",
-  });
-
-const requireSecret = (
-  secret: string | undefined,
-  operation: string,
-): string => {
-  if (!secret) {
-    throw new EmailKitError(
-      `EmailKit secret is required for Outlook ${operation}`,
-      PROVIDER,
-      "MISSING_SECRET",
-    );
-  }
-  return secret;
-};
-
-const nonEmptyString = (value: unknown): string | undefined =>
-  typeof value === "string" && value.trim() ? value : undefined;
-
-const outlookRouteOptions = (
-  options?: EmailDriverOperationOptions,
-): OutlookPublicRouteOptions =>
-  (options || {}) as EmailDriverOperationOptions & OutlookPublicRouteOptions;
-
-const resolveMailboxConnectCallbackUrl = (
-  input: { provider?: Record<string, unknown> },
-  options?: EmailDriverOperationOptions,
-): string => {
-  const routeOptions = outlookRouteOptions(options);
-  const callbackUrl =
-    nonEmptyString((input as { callbackUrl?: unknown }).callbackUrl) ||
-    nonEmptyString(routeOptions.callbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.connectCallbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.callback?.callbackUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.callback?.url);
-
-  if (!callbackUrl) {
-    throw new EmailKitError(
-      "Outlook mailbox connect requires callbackUrl from EmailKit public routes",
-      PROVIDER,
-      "MISSING_CALLBACK_URL",
-    );
-  }
-
-  return callbackUrl;
-};
-
-const resolvePublicWebhookUrl = (
-  options?: EmailDriverOperationOptions,
-): string | undefined =>
-  nonEmptyString(outlookRouteOptions(options).publicRoutes?.webhookUrl) ||
-  nonEmptyString(outlookRouteOptions(options).publicRoutes?.webhook?.url);
-
 const resolveWebhookSetupUrl = (input: { url?: string }): string => {
   const url = nonEmptyString(input.url);
   if (!url) {
@@ -500,30 +432,12 @@ const resolveLifecycleNotificationUrl = (
   options?: EmailDriverOperationOptions,
   autoRenewOnLifecycle = true,
 ): string | undefined => {
-  const routeOptions = outlookRouteOptions(options);
+  const publicRoutes = options?.publicRoutes;
   return (
     nonEmptyString(provider?.lifecycleNotificationUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.lifecycleWebhookUrl) ||
-    nonEmptyString(routeOptions.publicRoutes?.webhook?.lifecycleUrl) ||
-    nonEmptyString(
-      routeOptions.publicRoutes?.webhook?.lifecycleNotificationUrl,
-    ) ||
+    nonEmptyString(publicRoutes?.webhook?.lifecycleNotificationUrl) ||
     (autoRenewOnLifecycle ? notificationUrl : undefined)
   );
-};
-
-const normalizeBaseUrl = (url: string): string => url.replace(/\/+$/, "");
-
-const formatScopes = (scopes: string[]): string => scopes.join(" ");
-
-const uniqueScopes = (scopes: string[]): string[] => {
-  const seen = new Set<string>();
-  return scopes.filter((scope) => {
-    const key = scope.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 };
 
 const scopesForMailboxConnect = (
@@ -639,75 +553,8 @@ const angleBracketedMessageId = (messageId: string): string =>
 const escapeODataStringLiteral = (value: string): string =>
   value.replace(/'/g, "''");
 
-const readJsonResponse = async (response: Response): Promise<unknown> => {
-  const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) return response.json();
-  const text = await response.text();
-  if (!text) return undefined;
-  return text;
-};
-
-const microsoftErrorMessage = (body: unknown, fallback: string): string => {
-  if (typeof body === "object" && body !== null) {
-    const record = body as Record<string, unknown>;
-    const graphError = record.error;
-    if (typeof graphError === "object" && graphError !== null) {
-      const message = (graphError as Record<string, unknown>).message;
-      if (typeof message === "string") return message;
-    }
-    if (typeof record.error_description === "string") {
-      return record.error_description;
-    }
-    if (typeof record.message === "string") return record.message;
-  }
-  if (typeof body === "string" && body) return body;
-  return fallback;
-};
-
-const sanitizeTokenResponse = (token: MicrosoftTokenResponse) => ({
-  expiresIn: token.expires_in,
-  extExpiresIn: token.ext_expires_in,
-  scopes:
-    typeof token.scope === "string"
-      ? token.scope.split(/\s+/).filter(Boolean)
-      : undefined,
-  tokenType: token.token_type,
-});
-
-const toAuth = (
-  token: MicrosoftTokenResponse,
-  previous?: OutlookMailboxAuth,
-): OutlookMailboxAuth => {
-  if (!token.access_token) {
-    throw new EmailKitError(
-      "Microsoft token response did not include an access token",
-      PROVIDER,
-      "INVALID_TOKEN_RESPONSE",
-      undefined,
-      undefined,
-      token,
-    );
-  }
-
-  return {
-    accessToken: token.access_token,
-    refreshToken: token.refresh_token || previous?.refreshToken,
-    expiresAt:
-      typeof token.expires_in === "number"
-        ? Date.now() + token.expires_in * 1000
-        : previous?.expiresAt,
-    scopes:
-      typeof token.scope === "string"
-        ? token.scope.split(/\s+/).filter(Boolean)
-        : previous?.scopes,
-    tokenType: token.token_type || previous?.tokenType || "Bearer",
-  };
-};
-
-const isOutlookAuth = (auth: unknown): auth is OutlookMailboxAuth =>
-  typeof auth === "object" &&
-  auth !== null &&
-  typeof (auth as OutlookMailboxAuth).accessToken === "string";
+export const isOutlookAuth = (auth: unknown): auth is OutlookMailboxAuth =>
+  isOAuthMailboxAuth(auth);
 
 const webhookAuthFromConfig = async (
   config: OutlookDriverConfig<string>,
@@ -743,29 +590,6 @@ const staticWebhookAuthFromConfig = (
   return undefined;
 };
 
-const subscriptionRenewAfter = (
-  expiresAt: Date | undefined,
-): Date | undefined => {
-  const expiresTime = expiresAt?.getTime();
-  if (!expiresTime || Number.isNaN(expiresTime)) return undefined;
-
-  const remainingMs = expiresTime - Date.now();
-  if (remainingMs <= 1) return new Date(expiresTime - 1);
-
-  const bufferMs = Math.min(
-    WEBHOOK_RENEWAL_BUFFER_MS,
-    Math.max(1, Math.floor(remainingMs / 2)),
-  );
-  return new Date(expiresTime - bufferMs);
-};
-
-const webhookEvents = (
-  events: MailboxWebhookSetupInput["events"],
-): NonNullable<Webhook["events"]> => {
-  if (events === "all") return ["inbound"];
-  return events && events.length > 0 ? events : ["inbound"];
-};
-
 const normalizeInboundSubscription = (
   subscription: OutlookInboundSubscription,
   input: {
@@ -789,7 +613,7 @@ const normalizeInboundSubscription = (
     status: "active",
     providerId: subscription.id,
     expiresAt: validExpiresAt,
-    renewAfter: subscriptionRenewAfter(validExpiresAt),
+    renewAfter: webhookRenewAfter(validExpiresAt, WEBHOOK_RENEWAL_BUFFER_MS),
     raw: subscription.raw || subscription,
   };
 };
@@ -810,17 +634,6 @@ const webhookSubscriptionId = (
     );
   }
   return id;
-};
-
-const parseWebhookBody = (request: WebhookRequest): unknown => {
-  if (typeof request.body === "string") {
-    try {
-      return JSON.parse(request.body);
-    } catch {
-      return request.body;
-    }
-  }
-  return request.body;
 };
 
 const isGraphWebhookPayload = (
@@ -966,7 +779,16 @@ const verifyWebhookClientState = (
   notification: GraphChangeNotification,
 ): void => {
   const allowed = webhookClientStates(config);
-  if (allowed.length === 0) return;
+  if (allowed.length === 0) {
+    // Normally unreachable: OutlookDriver() rejects this configuration at
+    // construction. Guards dynamic config mutation after construction.
+    throw new EmailKitError(
+      "Outlook webhook rejected: no clientState configured. Set webhookClientState in the driver config and include the same value in your Graph subscriptions.",
+      PROVIDER,
+      "MISSING_WEBHOOK_CLIENT_STATE",
+      401,
+    );
+  }
 
   if (notification.clientState && allowed.includes(notification.clientState)) {
     return;
@@ -1051,44 +873,11 @@ const resolveGraphUrl = (
   graphBase: string,
   path: string | URL,
   init?: ProviderFetchInit,
-): URL => {
-  const value = path instanceof URL ? path.toString() : path;
-  const url = /^https?:\/\//i.test(value)
-    ? new URL(value)
-    : new URL(value.replace(/^\/+/, ""), `${graphBase}/`);
-  const graphBaseUrl = new URL(`${graphBase}/`);
-  if (
-    url.origin !== graphBaseUrl.origin ||
-    !url.pathname.startsWith(graphBaseUrl.pathname)
-  ) {
-    throw new EmailKitError(
-      "Invalid Microsoft Graph providerFetch URL",
-      PROVIDER,
-      "INVALID_PROVIDER_FETCH_URL",
-      400,
-    );
-  }
-
-  if (init?.searchParams) {
-    const params =
-      init.searchParams instanceof URLSearchParams
-        ? Array.from(init.searchParams.entries())
-        : Object.entries(init.searchParams).flatMap(([key, value]) => {
-            if (value === undefined || value === null) return [];
-            if (Array.isArray(value)) {
-              return value
-                .filter((entry) => entry !== undefined && entry !== null)
-                .map((entry) => [key, String(entry)] as const);
-            }
-            return [[key, String(value)] as const];
-          });
-
-    for (const [key] of params) url.searchParams.delete(key);
-    for (const [key, value] of params) url.searchParams.append(key, value);
-  }
-
-  return url;
-};
+): URL =>
+  resolveProviderFetchUrl(graphBase, path, init, {
+    provider: PROVIDER,
+    message: "Invalid Microsoft Graph providerFetch URL",
+  });
 
 const normalizeHeaders = (
   headers: GraphMessage["internetMessageHeaders"],
@@ -1102,25 +891,16 @@ const normalizeHeaders = (
   return normalized;
 };
 
-const addNormalizedMailboxEmail = (
-  emails: Set<string>,
-  value: unknown,
-): void => {
-  if (typeof value === "string" && value.trim()) {
-    emails.add(value.trim().toLowerCase());
-  }
-};
-
-const normalizedMailboxEmails = (input: MailboxSyncInput): Set<string> => {
-  const emails = new Set<string>();
-  addNormalizedMailboxEmail(emails, input.email);
+// Extends the shared helper with the Graph /me identities stashed on
+// mailbox.raw.user at connect time.
+const outlookMailboxEmails = (input: MailboxSyncInput): Set<string> => {
+  const emails = normalizedMailboxEmails(input);
 
   if (
     input.mailbox &&
     typeof input.mailbox === "object" &&
     !Array.isArray(input.mailbox)
   ) {
-    addNormalizedMailboxEmail(emails, input.mailbox.email);
     const raw = "raw" in input.mailbox ? input.mailbox.raw : undefined;
     if (raw && typeof raw === "object" && !Array.isArray(raw)) {
       const user = (raw as { user?: unknown }).user;
@@ -1135,23 +915,6 @@ const normalizedMailboxEmails = (input: MailboxSyncInput): Set<string> => {
   }
 
   return emails;
-};
-
-const mailboxProviderMetadata = (
-  input: MailboxSyncInput,
-): Pick<
-  OutlookAttachmentProviderMetadata,
-  "mailboxEmail" | "mailboxId"
-> => {
-  const mailbox =
-    input.mailbox && typeof input.mailbox === "object" && !Array.isArray(input.mailbox)
-      ? input.mailbox
-      : undefined;
-  return {
-    mailboxEmail:
-      nonEmptyString(input.email) || nonEmptyString(mailbox?.email),
-    mailboxId: nonEmptyString(input.mailboxId) || nonEmptyString(mailbox?.id),
-  };
 };
 
 const isMessageFromMailbox = (
@@ -1249,14 +1012,6 @@ const transformGraphMessage = (
   };
 };
 
-const queryValue = (
-  request: WebhookRequest,
-  key: string,
-): string | undefined => {
-  const value = request.query?.[key];
-  return typeof value === "string" ? value : undefined;
-};
-
 const requestIdFrom = (response: Response): string | undefined =>
   response.headers.get("request-id") ||
   response.headers.get("x-ms-request-id") ||
@@ -1269,11 +1024,21 @@ export const OutlookDriver = <
 >(
   config: OutlookDriverConfig<TId, TSendEmailMode>,
 ): EmailDriver<
-  OutlookDriverConfig<TId, TSendEmailMode>,
   OutlookCapabilitiesForSendMode<TSendEmailMode>,
   TId
 > => {
   const driverId = (config.id || "outlook") as TId;
+  if (webhookClientStates(config).length === 0) {
+    // Only reachable with webhookAuthResolver and no autoSubscribeInbound
+    // (or an explicitly empty webhookClientState array): subscriptions are
+    // created outside this driver, so the derived default clientState cannot
+    // be assumed and verification needs an explicit value.
+    throw new EmailKitError(
+      "Outlook webhook verification requires a clientState. Set webhookClientState in the driver config and include the same value in the Graph subscriptions you create.",
+      PROVIDER,
+      "MISSING_WEBHOOK_CLIENT_STATE",
+    );
+  }
   const tenant = encodeURIComponent(config.tenant || "common");
   const authBase = normalizeBaseUrl(
     config.authBase || "https://login.microsoftonline.com",
@@ -1293,56 +1058,29 @@ export const OutlookDriver = <
   const scopes =
     config.scopes && config.scopes.length > 0 ? config.scopes : DEFAULT_SCOPES;
   const mailboxScopes = scopesForMailboxConnect(scopes, config);
-  const tokenUrl = `${authBase}/${tenant}/oauth2/v2.0/token`;
 
-  const fetchToken = async (
-    form: URLSearchParams,
-    signal?: AbortSignal,
-  ): Promise<MicrosoftTokenResponse> => {
-    const response = await fetch(tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: form,
-      signal,
-    });
-    const body = await readJsonResponse(response);
-    if (!response.ok) {
-      throw new EmailKitError(
-        microsoftErrorMessage(body, "Microsoft token request failed"),
-        PROVIDER,
-        undefined,
-        response.status,
-        undefined,
-        body,
-      );
-    }
-    return body as MicrosoftTokenResponse;
-  };
-
-  const refreshAuth = async (
-    auth: OutlookMailboxAuth,
-    signal?: AbortSignal,
-  ): Promise<OutlookMailboxAuth> => {
-    if (!auth.refreshToken) {
-      throw new EmailKitError(
-        "Outlook access token is expired and no refresh token was provided",
-        PROVIDER,
-        "MISSING_REFRESH_TOKEN",
-      );
-    }
-
-    const form = new URLSearchParams({
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: auth.refreshToken,
+  const {
+    requireSecret,
+    resolveConnectCallbackUrl: resolveMailboxConnectCallbackUrl,
+    parseCallbackRequest,
+    decodeState,
+    fetchToken,
+    toAuth,
+    resolveMailboxOperationAuth,
+  } = createOAuthMailboxKit<OutlookMailboxAuth>({
+    provider: PROVIDER,
+    label: "Outlook",
+    issuer: "Microsoft",
+    clientId: config.clientId,
+    clientSecret: config.clientSecret,
+    tokenEndpoint: `${authBase}/${tenant}/oauth2/v2.0/token`,
+    // Microsoft refresh grants scope down to the requested scopes.
+    refreshForm: (auth) => ({
       scope: formatScopes(
         auth.scopes && auth.scopes.length > 0 ? auth.scopes : mailboxScopes,
       ),
-    });
-    const token = await fetchToken(form, signal);
-    return toAuth(token, auth);
-  };
+    }),
+  });
 
   const lookupNativeReplySource = async (
     authorization: string,
@@ -1369,7 +1107,7 @@ export const OutlookDriver = <
     const body = await readJsonResponse(response);
     if (!response.ok) {
       throw new EmailKitError(
-        microsoftErrorMessage(
+        oauthErrorMessage(
           body,
           "Microsoft Graph reply source message lookup failed",
         ),
@@ -1481,7 +1219,7 @@ export const OutlookDriver = <
     const response = await fetch(`${graphBase}/subscriptions`, {
       method: "POST",
       headers: {
-        Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+        Authorization: authorizationHeader(auth),
         "Content-Type": "application/json",
       },
       body: JSON.stringify(requestBody),
@@ -1489,7 +1227,7 @@ export const OutlookDriver = <
     const body = await readJsonResponse(response);
     if (!response.ok) {
       throw new EmailKitError(
-        microsoftErrorMessage(
+        oauthErrorMessage(
           body,
           "Microsoft Graph inbound subscription creation failed",
         ),
@@ -1523,40 +1261,6 @@ export const OutlookDriver = <
       clientState: subscription.clientState,
       raw: subscription,
     };
-  };
-
-  const resolveMailboxOperationAuth = async (
-    operation: string,
-    input: { auth?: unknown; mailbox?: MailboxIdentity | Mailbox },
-    options?: EmailDriverOperationOptions,
-    signal?: AbortSignal,
-  ): Promise<OutlookMailboxAuth> => {
-    const inputAuth = isOutlookAuth(input.auth) ? input.auth : undefined;
-    const optionsAuth = isOutlookAuth(options?.auth) ? options.auth : undefined;
-    let auth = inputAuth || optionsAuth;
-    if (!auth) {
-      throw new EmailKitError(
-        `Outlook ${operation} requires mailbox auth with an accessToken`,
-        PROVIDER,
-        "MISSING_AUTH",
-      );
-    }
-
-    if (
-      typeof auth.expiresAt === "number" &&
-      auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
-    ) {
-      const previousAuth = auth;
-      auth = await refreshAuth(auth, signal);
-      await options?.onAuthUpdated?.({
-        auth,
-        previousAuth,
-        mailbox: "mailbox" in input ? input.mailbox : options?.mailbox,
-        context: options?.context,
-      });
-    }
-
-    return auth;
   };
 
   const refreshInboundSubscription = async (
@@ -1593,7 +1297,7 @@ export const OutlookDriver = <
       {
         method: "PATCH",
         headers: {
-          Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+          Authorization: authorizationHeader(auth),
           "Content-Type": "application/json",
         },
         body: JSON.stringify(requestBody),
@@ -1602,7 +1306,7 @@ export const OutlookDriver = <
     const body = await readJsonResponse(response);
     if (!response.ok) {
       throw new EmailKitError(
-        microsoftErrorMessage(
+        oauthErrorMessage(
           body,
           "Microsoft Graph inbound subscription renewal failed",
         ),
@@ -1647,7 +1351,7 @@ export const OutlookDriver = <
       {
         method: "DELETE",
         headers: {
-          Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+          Authorization: authorizationHeader(auth),
         },
       },
     );
@@ -1657,7 +1361,7 @@ export const OutlookDriver = <
     }
     if (!response.ok) {
       throw new EmailKitError(
-        microsoftErrorMessage(
+        oauthErrorMessage(
           body,
           "Microsoft Graph inbound subscription deletion failed",
         ),
@@ -1836,31 +1540,7 @@ export const OutlookDriver = <
         );
       }
 
-      const unsupportedSendFields = [
-        ...((message as { track?: unknown }).track !== undefined
-          ? ["track"]
-          : []),
-        ...((message as { tags?: unknown }).tags !== undefined ? ["tags"] : []),
-        ...((message as { metadata?: unknown }).metadata !== undefined
-          ? ["metadata"]
-          : []),
-        ...((message as { sendAt?: unknown }).sendAt !== undefined
-          ? ["sendAt"]
-          : []),
-        ...((message as { templateId?: unknown }).templateId !== undefined
-          ? ["templateId"]
-          : []),
-        ...((message as { templateData?: unknown }).templateData !== undefined
-          ? ["templateData"]
-          : []),
-        ...((message as { sandbox?: unknown }).sandbox !== undefined
-          ? ["sandbox"]
-          : []),
-        ...((message as { idempotencyKey?: unknown }).idempotencyKey !==
-        undefined
-          ? ["idempotencyKey"]
-          : []),
-      ];
+      const unsupportedSendFields = unsupportedOAuthMailboxSendFields(message);
       if (unsupportedSendFields.length > 0) {
         throw new EmailKitError(
           `Outlook sendEmail does not support these EmailKit send fields: ${unsupportedSendFields.join(
@@ -1883,22 +1563,12 @@ export const OutlookDriver = <
         );
       }
 
-      let auth = options.auth;
-      if (
-        typeof auth.expiresAt === "number" &&
-        auth.expiresAt <= Date.now() + TOKEN_REFRESH_LEEWAY_MS
-      ) {
-        const previousAuth = auth;
-        auth = await refreshAuth(auth, options.signal);
-        await options.onAuthUpdated?.({
-          auth,
-          previousAuth,
-          ...(options.mailbox ? { mailbox: options.mailbox } : {}),
-          ...(options.context !== undefined
-            ? { context: options.context }
-            : {}),
-        });
-      }
+      const auth = await resolveMailboxOperationAuth(
+        "sendEmail",
+        { auth: options.auth, mailbox: options.mailbox },
+        options,
+        options.signal,
+      );
 
       const reply = resolveMessageReplyContext(message);
       const unsupportedReplyFields = [
@@ -1993,7 +1663,7 @@ export const OutlookDriver = <
       }
 
       if (sendEmailMode === "draft") {
-        const authorization = `${auth.tokenType || "Bearer"} ${auth.accessToken}`;
+        const authorization = authorizationHeader(auth);
         const replySource = reply.messageId
           ? await lookupNativeReplySource(
               authorization,
@@ -2025,7 +1695,7 @@ export const OutlookDriver = <
         const createDraftBody = await readJsonResponse(createDraftResponse);
         if (!createDraftResponse.ok) {
           throw new EmailKitError(
-            microsoftErrorMessage(
+            oauthErrorMessage(
               createDraftBody,
               replySourceId
                 ? "Microsoft Graph create reply draft failed"
@@ -2085,7 +1755,7 @@ export const OutlookDriver = <
             updateDraftBody = await readJsonResponse(updateDraftResponse);
             if (!updateDraftResponse.ok) {
               throw new EmailKitError(
-                microsoftErrorMessage(
+                oauthErrorMessage(
                   updateDraftBody,
                   "Microsoft Graph update reply draft failed",
                 ),
@@ -2118,7 +1788,7 @@ export const OutlookDriver = <
               const attachmentBody = await readJsonResponse(attachmentResponse);
               if (!attachmentResponse.ok) {
                 throw new EmailKitError(
-                  microsoftErrorMessage(
+                  oauthErrorMessage(
                     attachmentBody,
                     "Microsoft Graph reply draft attachment upload failed",
                   ),
@@ -2147,7 +1817,7 @@ export const OutlookDriver = <
           const sendDraftBody = await readJsonResponse(sendDraftResponse);
           if (!sendDraftResponse.ok) {
             throw new EmailKitError(
-              microsoftErrorMessage(
+              oauthErrorMessage(
                 sendDraftBody,
                 "Microsoft Graph send draft failed",
               ),
@@ -2202,7 +1872,7 @@ export const OutlookDriver = <
       const response = await fetch(`${graphBase}/me/sendMail`, {
         method: "POST",
         headers: {
-          Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+          Authorization: authorizationHeader(auth),
           "Content-Type": "application/json",
         },
         body: JSON.stringify(requestBody),
@@ -2211,7 +1881,7 @@ export const OutlookDriver = <
       const body = await readJsonResponse(response);
       if (!response.ok) {
         throw new EmailKitError(
-          microsoftErrorMessage(body, "Microsoft Graph sendMail failed"),
+          oauthErrorMessage(body, "Microsoft Graph sendMail failed"),
           PROVIDER,
           undefined,
           response.status,
@@ -2256,7 +1926,7 @@ export const OutlookDriver = <
       if (!headers.has("Authorization")) {
         headers.set(
           "Authorization",
-          `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+          authorizationHeader(auth),
         );
       }
 
@@ -2306,14 +1976,14 @@ export const OutlookDriver = <
         const messageUrl = graphMessageUrl(graphBase, resourcePath);
         const response = await fetch(messageUrl, {
           headers: {
-            Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+            Authorization: authorizationHeader(auth),
             Accept: "application/json",
           },
         });
         const body = await readJsonResponse(response);
         if (!response.ok) {
           throw new EmailKitError(
-            microsoftErrorMessage(body, "Microsoft Graph message fetch failed"),
+            oauthErrorMessage(body, "Microsoft Graph message fetch failed"),
             PROVIDER,
             undefined,
             response.status,
@@ -2341,7 +2011,7 @@ export const OutlookDriver = <
       request: WebhookRequest,
       _handled: boolean,
     ): Promise<WebhookResponse> => {
-      const validationToken = queryValue(request, "validationToken");
+      const validationToken = request.query?.validationToken;
       if (validationToken) {
         return {
           status: 200,
@@ -2361,33 +2031,8 @@ export const OutlookDriver = <
       options,
     ): Promise<MailboxConnectionResult> => {
       const secret = requireSecret(options?.secret, "callback handling");
-      const error = queryValue(request, "error");
-      if (error) {
-        throw new EmailKitError(
-          queryValue(request, "error_description") || error,
-          PROVIDER,
-          error,
-        );
-      }
-
-      const code = queryValue(request, "code");
-      const stateValue = queryValue(request, "state");
-      if (!code) {
-        throw new EmailKitError(
-          "Missing Outlook OAuth code",
-          PROVIDER,
-          "MISSING_CODE",
-        );
-      }
-      if (!stateValue) {
-        throw new EmailKitError(
-          "Missing Outlook OAuth state",
-          PROVIDER,
-          "MISSING_STATE",
-        );
-      }
-
-      const state = decodeState(stateValue, secret);
+      const { code, state: stateValue } = parseCallbackRequest(request);
+      const state = decodeState<OutlookStatePayload>(stateValue, secret);
       const token = await fetchToken(
         new URLSearchParams({
           client_id: config.clientId,
@@ -2406,14 +2051,14 @@ export const OutlookDriver = <
         {
           method: "GET",
           headers: {
-            Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+            Authorization: authorizationHeader(auth),
           },
         },
       );
       const meBody = await readJsonResponse(meResponse);
       if (!meResponse.ok) {
         throw new EmailKitError(
-          microsoftErrorMessage(meBody, "Microsoft Graph /me request failed"),
+          oauthErrorMessage(meBody, "Microsoft Graph /me request failed"),
           PROVIDER,
           undefined,
           meResponse.status,
@@ -2655,7 +2300,7 @@ export const OutlookDriver = <
           input.signal,
         );
         const until = input.until || new Date();
-        const mailboxEmails = normalizedMailboxEmails(input);
+        const mailboxEmails = outlookMailboxEmails(input);
         const attachmentProvider = mailboxProviderMetadata(input);
         const resource = config.inboundResource || DEFAULT_INBOUND_RESOURCE;
         const listUrl = new URL(`${graphBase}/${resource}`);
@@ -2671,7 +2316,7 @@ export const OutlookDriver = <
         while (nextUrl) {
           const response = await fetch(nextUrl, {
             headers: {
-              Authorization: `${auth.tokenType || "Bearer"} ${auth.accessToken}`,
+              Authorization: authorizationHeader(auth),
               Accept: "application/json",
             },
             signal: input.signal,
@@ -2679,7 +2324,7 @@ export const OutlookDriver = <
           const body = await readJsonResponse(response);
           if (!response.ok) {
             throw new EmailKitError(
-              microsoftErrorMessage(
+              oauthErrorMessage(
                 body,
                 "Microsoft Graph message listing failed",
               ),

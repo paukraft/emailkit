@@ -55,56 +55,54 @@ const inboundEmail = (
  * must interleave emails across threads when sorting ascending.
  */
 const stubThreadsApi = () => {
-  const fetchMock = vi.fn(
-    async (input: string | URL, init?: RequestInit) => {
-      const url = new URL(input.toString());
+  const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+    const url = new URL(input.toString());
 
-      if (url.pathname === "/api/v1/threads/search") {
-        const body = JSON.parse(String(init?.body));
-        if (body.offset === 0) {
-          return jsonResponse({
-            threads: [{ id: "t1" }],
-            pagination: { total: 2, limit: 100, offset: 0, hasMore: true },
-          });
-        }
-        if (body.offset === 1) {
-          return jsonResponse({
-            threads: [{ id: "t2" }],
-            pagination: { total: 2, limit: 100, offset: 1, hasMore: false },
-          });
-        }
-        throw new Error(`Unexpected search offset: ${body.offset}`);
-      }
-
-      if (url.pathname === "/api/v1/threads/t1") {
+    if (url.pathname === "/api/v1/threads/search") {
+      const body = JSON.parse(String(init?.body));
+      if (body.offset === 0) {
         return jsonResponse({
-          id: "t1",
-          createdAt: "2026-05-20T10:00:00.000Z",
-          subject: "Thread t1",
-          emails: [
-            inboundEmail("e_old", "t1", "2026-05-20T10:00:00.000Z"),
-            inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z"),
-            inboundEmail("e_out", "t1", "2026-06-04T10:00:00.000Z", {
-              direction: "OUTBOUND",
-              status: "SENT",
-            }),
-            inboundEmail("e3", "t1", "2026-06-05T10:00:00.000Z"),
-            inboundEmail("e_new", "t1", "2026-06-11T10:00:00.000Z"),
-          ],
+          threads: [{ id: "t1" }],
+          pagination: { total: 2, limit: 100, offset: 0, hasMore: true },
         });
       }
-      if (url.pathname === "/api/v1/threads/t2") {
+      if (body.offset === 1) {
         return jsonResponse({
-          id: "t2",
-          createdAt: "2026-06-03T10:00:00.000Z",
-          subject: "Thread t2",
-          emails: [inboundEmail("e2", "t2", "2026-06-03T10:00:00.000Z")],
+          threads: [{ id: "t2" }],
+          pagination: { total: 2, limit: 100, offset: 1, hasMore: false },
         });
       }
+      throw new Error(`Unexpected search offset: ${body.offset}`);
+    }
 
-      throw new Error(`Unexpected request: ${url}`);
-    },
-  );
+    if (url.pathname === "/api/v1/threads/t1") {
+      return jsonResponse({
+        id: "t1",
+        createdAt: "2026-05-20T10:00:00.000Z",
+        subject: "Thread t1",
+        emails: [
+          inboundEmail("e_old", "t1", "2026-05-20T10:00:00.000Z"),
+          inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z"),
+          inboundEmail("e_out", "t1", "2026-06-04T10:00:00.000Z", {
+            direction: "OUTBOUND",
+            status: "SENT",
+          }),
+          inboundEmail("e3", "t1", "2026-06-05T10:00:00.000Z"),
+          inboundEmail("e_new", "t1", "2026-06-11T10:00:00.000Z"),
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/threads/t2") {
+      return jsonResponse({
+        id: "t2",
+        createdAt: "2026-06-03T10:00:00.000Z",
+        subject: "Thread t2",
+        emails: [inboundEmail("e2", "t2", "2026-06-03T10:00:00.000Z")],
+      });
+    }
+
+    throw new Error(`Unexpected request: ${url}`);
+  });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 };
@@ -182,7 +180,7 @@ describe("AIInbxDriver sync", () => {
   it("replays inbound attachments with webhook-compatible shape and lazy content retrieval", async () => {
     const signedUrl =
       "https://signed-bucket.s3.amazonaws.com/report.txt?X-Amz-Signature=abc";
-    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (input: string | URL, _init?: RequestInit) => {
       const url = new URL(input.toString());
 
       if (url.pathname === "/api/v1/threads/search") {
@@ -260,6 +258,97 @@ describe("AIInbxDriver sync", () => {
     expect(new Headers(init?.headers).get("authorization")).toBeNull();
   });
 
+  it("auto-fetches inbound attachments in parallel during sync", async () => {
+    const signedUrl1 =
+      "https://signed-bucket.s3.amazonaws.com/first.txt?X-Amz-Signature=abc";
+    const signedUrl2 =
+      "https://signed-bucket.s3.amazonaws.com/second.txt?X-Amz-Signature=def";
+    const attachmentStarts: string[] = [];
+    const waitForSecondAttachment = async () => {
+      for (let i = 0; i < 30; i += 1) {
+        if (attachmentStarts.includes(signedUrl2)) return;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      throw new Error("second attachment fetch did not start");
+    };
+
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = new URL(input.toString());
+
+      if (url.pathname === "/api/v1/threads/search") {
+        return jsonResponse({
+          threads: [{ id: "t1" }],
+          pagination: { total: 1, limit: 100, offset: 0, hasMore: false },
+        });
+      }
+
+      if (url.pathname === "/api/v1/threads/t1") {
+        return jsonResponse({
+          id: "t1",
+          createdAt: "2026-06-02T10:00:00.000Z",
+          subject: "Thread t1",
+          emails: [
+            inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z", {
+              attachments: [
+                {
+                  id: "att_1",
+                  createdAt: "2026-06-02T10:00:00.000Z",
+                  fileName: "first.txt",
+                  contentType: "text/plain",
+                  sizeInBytes: 5,
+                  cid: null,
+                  disposition: "attachment",
+                  signedUrl: signedUrl1,
+                  expiresAt: "2026-06-02T11:00:00.000Z",
+                },
+                {
+                  id: "att_2",
+                  createdAt: "2026-06-02T10:00:00.000Z",
+                  fileName: "second.txt",
+                  contentType: "text/plain",
+                  sizeInBytes: 6,
+                  cid: null,
+                  disposition: "attachment",
+                  signedUrl: signedUrl2,
+                  expiresAt: "2026-06-02T11:00:00.000Z",
+                },
+              ],
+            }),
+          ],
+        });
+      }
+
+      if (input.toString() === signedUrl1) {
+        attachmentStarts.push(signedUrl1);
+        await waitForSecondAttachment();
+        return new Response("first", { status: 200 });
+      }
+
+      if (input.toString() === signedUrl2) {
+        attachmentStarts.push(signedUrl2);
+        return new Response("second", { status: 200 });
+      }
+
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const onInbound = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [AIInbxDriver({ apiKey: "ai_test" })],
+      hooks: { email: { onInbound } },
+    });
+
+    await client.sync({ since: SINCE, until: UNTIL });
+
+    const inbound = onInbound.mock.calls[0]![0];
+    expect(
+      inbound.attachments.map((attachment: { content: Uint8Array }) =>
+        new TextDecoder().decode(attachment.content),
+      ),
+    ).toEqual(["first", "second"]);
+  });
+
   it("rejects the next request when the sync signal aborts", async () => {
     const controller = new AbortController();
     const fetchMock = vi.fn(
@@ -291,14 +380,12 @@ describe("AIInbxDriver sync", () => {
   it("throws EmailKitError when the threads search API fails", async () => {
     vi.stubGlobal(
       "fetch",
-      vi
-        .fn()
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ message: "server exploded" }), {
-            status: 500,
-            headers: { "content-type": "application/json" },
-          }),
-        ),
+      vi.fn().mockResolvedValueOnce(
+        new Response(JSON.stringify({ message: "server exploded" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
     );
 
     const driver = AIInbxDriver({ apiKey: "ai_test" });

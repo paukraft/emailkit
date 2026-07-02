@@ -1,12 +1,27 @@
 # EmailKit
 
-Unified email SDK with pluggable drivers (Mailgun, Resend, AIInbx, Outlook) and optional Next.js helpers.
+Unified email SDK with pluggable drivers (Gmail, Mailgun, Resend, AIInbx, Outlook) and optional Next.js helpers.
 
 ## Install
 
 ```bash
 npm i emailkit
 ```
+
+## Migrating from 2.x to 3.0
+
+Webhook verification is stricter:
+
+- Resend and AIInbx `verifyWebhook` now require `rawBody` (the unparsed
+  request text) on the webhook request and throw `MISSING_RAW_BODY` without
+  it. Custom adapters must capture the body as text before parsing; the
+  built-in Next.js adapter already does.
+- Mailgun and AIInbx reject webhooks whose signed timestamp is more than
+  5 minutes from server time (replay protection).
+- Outlook drivers using `webhookAuthResolver` without `autoSubscribeInbound`
+  must set an explicit `webhookClientState` — construction throws otherwise,
+  and Graph subscriptions created without that `clientState` must be
+  recreated before notifications verify.
 
 ## Usage
 
@@ -141,6 +156,116 @@ await emailkit.mailboxes.webhooks.setup({
 });
 ```
 
+### Gmail
+
+Gmail uses delegated Google OAuth mailbox auth. The same EmailKit mailbox,
+send, webhook, sync, attachment, and `providerFetch` APIs work across Gmail and
+other drivers; Gmail-specific setup is contained in the driver config.
+
+Send-only Gmail needs a Google Cloud project with the Gmail API enabled, an
+OAuth consent screen, and an OAuth client configured with your EmailKit
+callback URL:
+
+```sh
+EMAILKIT_SECRET="replace-with-a-long-random-secret"
+PUBLIC_BASE_URL="https://app.example.com"
+GOOGLE_CLIENT_ID="..."
+GOOGLE_CLIENT_SECRET="..."
+```
+
+With the default route template, register this OAuth redirect URI:
+
+```txt
+https://app.example.com/api/email/gmail
+```
+
+```ts
+import { EmailKit, GmailDriver } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    GmailDriver({
+      id: "gmail",
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+  ],
+  hooks: {
+    mailbox: {
+      onConnected: async ({ mailbox, auth }) => {
+        if (mailbox && auth) await saveGmailAuth(mailbox.email, auth);
+      },
+      onAuthUpdated: async ({ mailbox, auth }) => {
+        if (mailbox?.email) await saveGmailAuth(mailbox.email, auth);
+      },
+    },
+  },
+});
+```
+
+Connect a mailbox once, persist the returned auth in `onConnected`, then send
+through the universal `sendEmail` API:
+
+```ts
+const { redirectUrl } = await emailkit.mailboxes.connect({
+  emailDriver: "gmail",
+  email: "support@example.com",
+});
+
+const mailbox = await loadMailbox("support@example.com");
+const auth = await loadGmailAuth(mailbox.email);
+
+await emailkit.sendEmail({
+  from: { email: mailbox.email },
+  to: { email: "recipient@example.com" },
+  subject: "Hello from Gmail",
+  text: "Same EmailKit API, Gmail underneath.",
+  sender: { emailDriver: "gmail", mailbox, auth },
+});
+```
+
+Inbound Gmail needs one extra Google Cloud path because Gmail publishes mailbox
+changes through Cloud Pub/Sub:
+
+1. Enable the Gmail API and Cloud Pub/Sub in the same Google Cloud project.
+2. Create a topic, for example `projects/my-project/topics/emailkit-gmail`.
+3. Grant `gmail-api-push@system.gserviceaccount.com` the Pub/Sub Publisher
+   role on that topic.
+4. Create a push subscription whose endpoint is your EmailKit webhook route
+   with a token query parameter, for example
+   `https://app.example.com/api/email/gmail?token=secret-token`.
+5. Set the same topic and token on the driver:
+
+```sh
+GOOGLE_PUBSUB_TOPIC="projects/my-project/topics/emailkit-gmail"
+GMAIL_WEBHOOK_TOKEN="secret-token"
+```
+
+```ts
+GmailDriver({
+  id: "gmail",
+  clientId: process.env.GOOGLE_CLIENT_ID!,
+  clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+  pubsubTopic: process.env.GOOGLE_PUBSUB_TOPIC!,
+  verificationToken: process.env.GMAIL_WEBHOOK_TOKEN!,
+  autoSubscribeInbound: true,
+  webhookAuthResolver: async ({ mailboxEmail }) => {
+    return mailboxEmail ? await loadGmailAuth(mailboxEmail) : undefined;
+  },
+  onAuthUpdated: async ({ mailbox, auth }) => {
+    if (mailbox?.email) await saveGmailAuth(mailbox.email, auth);
+  },
+});
+```
+
+Gmail push notifications only include the mailbox email and a history cursor.
+EmailKit hydrates those notifications into normal `onInbound` events, but it
+must be able to load and update the mailbox auth. Wire
+`hooks.mailbox.onConnected`, `hooks.mailbox.onAuthUpdated`, and the Gmail
+driver's `onAuthUpdated` to the same durable store. Gmail watches expire after
+about 7 days; EmailKit renews active watches opportunistically and reports
+`renewAfter` for scheduled refreshes.
+
 ### Outlook
 
 Outlook uses delegated Microsoft Graph mailbox auth. Register your EmailKit
@@ -180,7 +305,12 @@ Shared mailbox/send-as is not supported by the normalized driver; use
 Outlook webhook setup uses the `auth` you pass to create the Microsoft Graph
 subscription, but live webhook parsing happens later in a separate request.
 Configure `webhookAuthResolver` or `webhookAuth` so EmailKit can hydrate Graph
-notifications when those webhooks arrive.
+notifications when those webhooks arrive. Notifications without a matching
+`clientState` are rejected with 401: the driver stamps a derived default onto
+subscriptions it creates, and when you create subscriptions yourself
+(`webhookAuthResolver` without `autoSubscribeInbound`) you must set
+`webhookClientState` and include the same value in those subscriptions —
+the driver throws at construction otherwise.
 
 Reply threading is native (`nativeReplyThreading` capability): Microsoft Graph
 cannot set `In-Reply-To`/`References` headers on outbound mail, so the driver
@@ -326,15 +456,31 @@ etc.) — the method only exists on scopes your configured drivers support.
 
 ```ts
 const handle = emailkit.handler();
-const res = await handle({ method, headers, body });
+const res = await handle({ method, headers, body, rawBody });
 ```
 
-Provider webhooks are verified before dispatch. Configure each driver's
-webhook signing secret (`webhookSecret`, `webhookSigningKey`, or Outlook
-`webhookClientState`) before accepting production webhook traffic; unsigned
-webhook requests are rejected. Drivers that sign the request body (Resend,
-AIInbx) require `rawBody` on the webhook request — the unparsed request text;
-the built-in Next.js adapter provides it automatically.
+`rawBody` is the unparsed request text. Drivers that sign the request body
+(Resend, AIInbx) require it and fail verification with a `MISSING_RAW_BODY`
+error when a custom adapter omits it — capture the body as text before
+parsing it.
+
+Provider webhooks are verified before dispatch and rejected with 401 when
+verification is not possible — there is no permissive fallback. Configure each
+driver's webhook signing secret (`webhookSecret`, `webhookSigningKey`, Outlook
+`webhookClientState`, or Gmail `verificationToken`) before accepting
+production webhook traffic. Gmail additionally requires the Pub/Sub push
+subscription endpoint URL to carry the same value as
+`?token=<verificationToken>`; a Gmail driver configured for inbound webhooks
+without a `verificationToken` throws at construction. Outlook derives a
+default `clientState` for subscriptions the driver creates itself, so an
+explicit `webhookClientState` is only required when subscriptions are created
+outside the driver (`webhookAuthResolver` without `autoSubscribeInbound`) —
+that misconfiguration also throws at construction. Drivers that sign the
+request body (Resend, AIInbx) require `rawBody` on the webhook request; the
+built-in Next.js adapter provides it automatically for every content type.
+Mailgun and AIInbx additionally reject webhooks whose signed timestamp is
+more than 5 minutes from server time (replay protection) — rejections are
+logged so clock skew is distinguishable from a bad signature.
 
 ### Provider fetch helper
 

@@ -1588,16 +1588,34 @@ type SupportsPublicRoute<
         : false
       : false;
 
+export interface DriverWebhookPublicRoutes {
+  url?: string;
+}
+
+export interface DriverLifecycleWebhookPublicRoutes {
+  lifecycleNotificationUrl?: string;
+}
+
+export interface DriverConnectCallbackPublicRoutes {
+  url?: string;
+}
+
 export type DriverPublicRoutes<
   TCapabilities extends DriverCapabilities = DriverCapabilities,
 > = (SupportsPublicRoute<TCapabilities, "webhook"> extends true
-  ? { webhookUrl?: string }
+  ? {
+      webhook?: DriverWebhookPublicRoutes;
+    }
   : {}) &
   (SupportsPublicRoute<TCapabilities, "lifecycleWebhook"> extends true
-    ? { lifecycleWebhookUrl?: string }
+    ? {
+        webhook?: DriverLifecycleWebhookPublicRoutes;
+      }
     : {}) &
   (SupportsPublicRoute<TCapabilities, "connectCallback"> extends true
-    ? { connectCallbackUrl?: string }
+    ? {
+        callback?: DriverConnectCallbackPublicRoutes;
+      }
     : {}) &
   (SupportsPublicRoute<TCapabilities, "connectLanding"> extends true
     ? {

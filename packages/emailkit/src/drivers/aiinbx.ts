@@ -41,6 +41,12 @@ import {
   resolveMessageReplyContext,
 } from "../utils/reply";
 import { createProviderFetch } from "../utils/provider-fetch";
+import { retrieveAttachmentsInParallel } from "../utils/attachments";
+import {
+  getHeader,
+  isFreshWebhookTimestamp,
+  requireRawBody,
+} from "../utils/webhook";
 
 /**
  * AIInbx-specific configuration
@@ -364,39 +370,33 @@ const retrieveAIInbxAttachments = async (
   attachmentMetadata: Attachment[],
   signal?: AbortSignal,
 ): Promise<Attachment[]> => {
-  const attachments: Attachment[] = [];
+  return retrieveAttachmentsInParallel({
+    attachments: attachmentMetadata,
+    signal,
+    retrieve: async (attachmentMeta) => {
+      if (!attachmentMeta.url) return attachmentMeta;
 
-  for (const attachmentMeta of attachmentMetadata) {
-    if (attachmentMeta.url) {
-      try {
-        const res = await fetch(attachmentMeta.url, { signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const buf = new Uint8Array(await res.arrayBuffer());
+      const res = await fetch(attachmentMeta.url, { signal });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const buf = new Uint8Array(await res.arrayBuffer());
 
-        attachments.push({
-          filename: attachmentMeta.filename,
-          content: buf,
-          contentType: attachmentMeta.contentType,
-          url: attachmentMeta.url,
-          size: attachmentMeta.size,
-          contentId: attachmentMeta.contentId,
-          isInline: attachmentMeta.isInline,
-        });
-      } catch (error) {
-        // Failed downloads degrade to metadata, but an abort must propagate.
-        if (signal?.aborted) throw error;
-        console.error(
-          `Failed to retrieve AIInbx attachment ${attachmentMeta.filename}:`,
-          error,
-        );
-        attachments.push(attachmentMeta);
-      }
-    } else {
-      attachments.push(attachmentMeta);
-    }
-  }
-
-  return attachments;
+      return {
+        filename: attachmentMeta.filename,
+        content: buf,
+        contentType: attachmentMeta.contentType,
+        url: attachmentMeta.url,
+        size: attachmentMeta.size,
+        contentId: attachmentMeta.contentId,
+        isInline: attachmentMeta.isInline,
+      };
+    },
+    onError: (attachmentMeta, error) => {
+      console.error(
+        `Failed to retrieve AIInbx attachment ${attachmentMeta.filename}:`,
+        error,
+      );
+    },
+  });
 };
 
 /**
@@ -651,7 +651,7 @@ const transformOutboundEvent = (
 
 export const AIInbxDriver = <const TId extends string = "aiinbx">(
   config: AIInbxDriverConfig<TId>,
-): EmailDriver<AIInbxDriverConfig<TId>, typeof AIINBX_CAPABILITIES, TId> & {
+): EmailDriver<typeof AIINBX_CAPABILITIES, TId> & {
   domains: Partial<DriverDomainsAPI>;
 } => {
   const driverId = (config.id || "aiinbx") as TId;
@@ -751,7 +751,11 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
   };
 
   const listDomainPayloads = async (): Promise<any[]> => {
-    const body = await requestApi("/domains", { method: "GET" }, "list domains");
+    const body = await requestApi(
+      "/domains",
+      { method: "GET" },
+      "list domains",
+    );
     return ((body as any)?.domains || []) as any[];
   };
 
@@ -1104,64 +1108,44 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
         return false;
       }
 
-          // AIInbx uses HMAC SHA-256 signature verification
-          // Signature format: sha256=HMAC_SHA256(timestamp.body, webhookSecret)
-          // Note: Uses a dot (.) between timestamp and body, not concatenation
-          const signatureHeader =
-            request.headers["x-aiinbx-signature"] ||
-            request.headers["X-AiInbx-Signature"];
-          const timestampHeader =
-            request.headers["x-aiinbx-timestamp"] ||
-            request.headers["X-AiInbx-Timestamp"];
+      // AIInbx uses HMAC SHA-256 signature verification.
+      const signatureHeader = getHeader(request.headers, "x-aiinbx-signature");
+      const timestampHeader = getHeader(request.headers, "x-aiinbx-timestamp");
 
-          if (!signatureHeader || !timestampHeader) {
-            return false;
-          }
+      if (
+        !signatureHeader ||
+        !timestampHeader ||
+        !isFreshWebhookTimestamp(timestampHeader, "aiinbx")
+      ) {
+        return false;
+      }
 
-          // Signatures are computed over the exact raw request bytes; a
-          // re-stringified parsed body cannot reproduce them.
-          if (request.rawBody === undefined) {
-            throw new EmailKitError(
-              "Webhook signature verification requires the raw request body. Pass rawBody on WebhookRequest (the unparsed request text).",
-              "aiinbx",
-              "MISSING_RAW_BODY",
-              500,
-            );
-          }
+      const bodyString = requireRawBody(request, "aiinbx");
 
-          try {
-            const bodyString = request.rawBody;
+      try {
+        const payload = `${timestampHeader}.${bodyString}`;
+        const expectedSignature =
+          "sha256=" +
+          createHmac("sha256", config.webhookSecret)
+            .update(payload)
+            .digest("hex");
 
-            // Create expected signature: sha256=HMAC_SHA256(timestamp.body, secret)
-            // Note the dot between timestamp and body
-            const payload = `${timestampHeader}.${bodyString}`;
-            const expectedSignature =
-              "sha256=" +
-              createHmac("sha256", config.webhookSecret)
-                .update(payload)
-                .digest("hex");
+        if (signatureHeader.length !== expectedSignature.length) {
+          return false;
+        }
 
-            // Compare signatures using timing-safe comparison
-            // The signature header already includes the sha256= prefix
-            const receivedSignature = signatureHeader;
-
-            // Use timing-safe comparison to prevent timing attacks
-            if (receivedSignature.length !== expectedSignature.length) {
-              return false;
-            }
-
-            return timingSafeEqual(
-              Buffer.from(receivedSignature, "utf8"),
-              Buffer.from(expectedSignature, "utf8"),
-            );
-          } catch {
-            return false;
-          }
+        return timingSafeEqual(
+          Buffer.from(signatureHeader, "utf8"),
+          Buffer.from(expectedSignature, "utf8"),
+        );
+      } catch {
+        return false;
+      }
     },
 
     webhookResponse: async (
-      request: WebhookRequest,
-      handled: boolean,
+      _request: WebhookRequest,
+      _handled: boolean,
     ): Promise<WebhookResponse> => {
       return {
         status: 200,
@@ -1306,7 +1290,11 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
       delete: async (idOrName: string): Promise<{ deleted: boolean }> => {
         const id = await resolveDomainId(idOrName);
-        await requestApi(`/domains/${id}`, { method: "DELETE" }, "delete domain");
+        await requestApi(
+          `/domains/${id}`,
+          { method: "DELETE" },
+          "delete domain",
+        );
         return { deleted: true };
       },
     },

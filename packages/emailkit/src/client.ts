@@ -91,8 +91,8 @@ import type {
 import { EmailKitError, EmailKitSyncError } from "./types";
 
 export type EmailDriverTuple = readonly [
-  EmailDriver<any, any, string>,
-  ...EmailDriver<any, any, string>[],
+  EmailDriver<any, string>,
+  ...EmailDriver<any, string>[],
 ];
 
 type ConfiguredDriver<TDrivers extends EmailDriverTuple> = TDrivers[number];
@@ -112,7 +112,7 @@ type CapabilityDriverId<
   TCapability extends keyof DriverCapabilities,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? keyof TCapabilities extends never
@@ -146,7 +146,7 @@ type DomainMethodDriverId<
   TMethod extends DriverDomainMethod,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DomainCapabilitiesSupportMethod<TCapabilities, TMethod> extends true
@@ -158,7 +158,7 @@ type DomainMethodDriverId<
 
 type DomainEnsureDriverId<TDrivers extends EmailDriverTuple> =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DomainCapabilitiesSupportMethod<TCapabilities, "create"> extends true
@@ -192,7 +192,7 @@ type WebhookCapabilityDriverId<
   TMethod extends keyof DriverWebhookMethodCapabilities,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? keyof TCapabilities extends never
@@ -243,7 +243,7 @@ type SyncScopeDriverId<
   TScope extends keyof DriverSyncCapabilities,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? keyof TCapabilities extends never
@@ -266,14 +266,14 @@ type EmailSenderOverrideForConfiguredDrivers<
   TDrivers extends EmailDriverTuple,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? EmailSenderOverride<DriverId<TDriver>, DriverCapabilitiesType<TDriver>>
       : never
     : never;
 
 type ConnectMailboxDriver<TDrivers extends EmailDriverTuple> =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver>["mailboxConnect"] extends true
         ? TDriver
         : never
@@ -287,14 +287,14 @@ type ConnectMailboxInputForDriverId<
   TDrivers extends EmailDriverTuple,
   TDriverId extends MailboxConnectDriverId<TDrivers>,
 > = ConnectMailboxInputForDriver<
-  Extract<ConnectMailboxDriver<TDrivers>, EmailDriver<any, any, TDriverId>>
+  Extract<ConnectMailboxDriver<TDrivers>, EmailDriver<any, TDriverId>>
 >;
 
 type ConnectMailboxInputForConfiguredDrivers<
   TDrivers extends EmailDriverTuple,
 > =
   ConnectMailboxDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? ConnectMailboxInputForDriver<TDriver> &
           OperationSelector<DriverId<TDriver>>
       : never
@@ -329,7 +329,7 @@ type ConfiguredCapabilityValues<
   TCapability extends keyof DriverCapabilities,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilityValue<TDriver, TCapability>
       : never
     : never;
@@ -354,7 +354,7 @@ type DriverSupportsReplyThreadId<TCapabilities extends DriverCapabilities> =
 
 type ConfiguredReplyHeadersSupportValues<TDrivers extends EmailDriverTuple> =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DriverSupportsReplyHeaders<TCapabilities>
@@ -366,7 +366,7 @@ type ConfiguredNativeReplyThreadingSupportValues<
   TDrivers extends EmailDriverTuple,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DriverSupportsNativeReplyThreading<TCapabilities>
@@ -376,7 +376,7 @@ type ConfiguredNativeReplyThreadingSupportValues<
 
 type ConfiguredReplyThreadIdSupportValues<TDrivers extends EmailDriverTuple> =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DriverSupportsReplyThreadId<TCapabilities>
@@ -422,7 +422,7 @@ type ConfiguredSendTrackingSupportValues<
   TKind extends keyof DriverSendTrackingCapabilities,
 > =
   ConfiguredDriver<TDrivers> extends infer TDriver
-    ? TDriver extends EmailDriver<any, any, string>
+    ? TDriver extends EmailDriver<any, string>
       ? DriverCapabilitiesType<TDriver> extends infer TCapabilities extends
           DriverCapabilities
         ? DriverSupportsSendTrackingKind<TCapabilities, TKind>
@@ -483,7 +483,7 @@ type SendEmailMessageForSelectedDriver<TDriver extends EmailDriver> = Omit<
 export type SendEmailMessage<TDrivers extends EmailDriverTuple> =
   | SendEmailMessageWithoutExplicitDriver<TDrivers>
   | (ConfiguredDriver<TDrivers> extends infer TDriver
-      ? TDriver extends EmailDriver<any, any, string>
+      ? TDriver extends EmailDriver<any, string>
         ? SendEmailMessageForSelectedDriver<TDriver>
         : never
       : never);
@@ -757,7 +757,7 @@ const supportsPublicRoute = (
 const resolveDriverWebhookRoutes = (
   publicRoutes: PublicRoutesConfig | undefined,
   driver: EmailDriver,
-): Pick<DriverPublicRoutes, "webhookUrl" | "lifecycleWebhookUrl"> => {
+): DriverPublicRoutes => {
   if (!supportsPublicRoute(driver, "webhook")) return {};
   const resolvedPublicRoutes = resolvePublicRoutesConfig(publicRoutes);
   if (!resolvedPublicRoutes) return {};
@@ -777,8 +777,16 @@ const resolveDriverWebhookRoutes = (
       : webhookUrl
     : undefined;
   return {
-    ...(webhookUrl ? { webhookUrl } : {}),
-    ...(lifecycleWebhookUrl ? { lifecycleWebhookUrl } : {}),
+    ...(webhookUrl
+      ? {
+          webhook: {
+            url: webhookUrl,
+            ...(lifecycleWebhookUrl
+              ? { lifecycleNotificationUrl: lifecycleWebhookUrl }
+              : {}),
+          },
+        }
+      : {}),
   };
 };
 
@@ -891,7 +899,7 @@ export interface BaseEmailKitClient<TDrivers extends EmailDriverTuple> {
   emailDrivers: TDrivers;
   getDriver: <TDriverId extends ConfiguredDriverId<TDrivers>>(
     id: TDriverId,
-  ) => Extract<ConfiguredDriver<TDrivers>, EmailDriver<any, any, TDriverId>>;
+  ) => Extract<ConfiguredDriver<TDrivers>, EmailDriver<any, TDriverId>>;
   attachments: AttachmentsFacade;
   domains: DomainsFacade<TDrivers>;
   mailboxes: MailboxesFacade<TDrivers>;
@@ -1153,13 +1161,13 @@ export type MailboxesBaseFacade<
 export interface AttachmentsFacade {
   getContent: (
     attachment: Attachment,
-    opts?: { emailDriver?: string },
+    opts?: { emailDriver?: string; signal?: AbortSignal },
   ) => Promise<string | Uint8Array>;
 }
 
 const attachmentEmailDriver = (
   attachment: Attachment,
-  opts: { emailDriver?: string } | undefined,
+  opts: { emailDriver?: string; signal?: AbortSignal } | undefined,
   defaultProvider: string,
 ): string | undefined => {
   if (
@@ -1480,15 +1488,20 @@ const createAttachmentsFacade = (
       );
     }
 
+    const fetchInit: ProviderFetchInit | undefined =
+      attachment.provider || opts?.signal
+        ? {
+            ...(attachment.provider ? { provider: attachment.provider } : {}),
+            ...(opts?.signal ? { signal: opts.signal } : {}),
+          }
+        : undefined;
+
     const providerFetch = await resolveProviderFetch(
       emailDriver,
       attachment.url,
-      attachment.provider ? { provider: attachment.provider } : undefined,
+      fetchInit,
     );
-    const response = await providerFetch(
-      attachment.url,
-      attachment.provider ? { provider: attachment.provider } : undefined,
-    );
+    const response = await providerFetch(attachment.url, fetchInit);
     if (!response.ok) {
       const contentType = response.headers.get("content-type") || "";
       const body = contentType.includes("application/json")
@@ -1952,22 +1965,23 @@ const withPublicWebhookSetupRoute = <
   TInput extends { url?: string; provider?: Record<string, unknown> },
 >(
   input: TInput,
-  publicRoutes: Pick<DriverPublicRoutes, "webhookUrl" | "lifecycleWebhookUrl">,
+  publicRoutes: DriverPublicRoutes,
 ): TInput => {
+  const webhookUrl = publicRoutes.webhook?.url;
+  const lifecycleNotificationUrl =
+    publicRoutes.webhook?.lifecycleNotificationUrl;
   const provider =
-    publicRoutes.lifecycleWebhookUrl &&
+    lifecycleNotificationUrl &&
     typeof input.provider?.lifecycleNotificationUrl !== "string"
       ? {
           ...(input.provider || {}),
-          lifecycleNotificationUrl: publicRoutes.lifecycleWebhookUrl,
+          lifecycleNotificationUrl,
         }
       : input.provider;
 
   return {
     ...input,
-    ...(input.url || !publicRoutes.webhookUrl
-      ? {}
-      : { url: publicRoutes.webhookUrl }),
+    ...(input.url || !webhookUrl ? {} : { url: webhookUrl }),
     ...(provider ? { provider } : {}),
   };
 };
@@ -2929,7 +2943,11 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
             : undefined;
           const driverPublicRoutes: DriverPublicRoutes = {
             ...driverWebhookRoutes,
-            ...(connectCallbackUrl ? { connectCallbackUrl } : {}),
+            ...(connectCallbackUrl
+              ? {
+                  callback: { url: connectCallbackUrl },
+                }
+              : {}),
             ...(connectLandingUrl ? { connectLandingUrl } : {}),
             ...(connectFailureUrl ? { connectFailureUrl } : {}),
           };
@@ -3355,7 +3373,11 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
         : undefined;
       const publicRoutes: DriverPublicRoutes = {
         ...resolveDriverWebhookRoutes(config.publicRoutes, driver),
-        ...(callbackUrl ? { connectCallbackUrl: callbackUrl } : {}),
+        ...(callbackUrl
+          ? {
+              callback: { url: callbackUrl },
+            }
+          : {}),
         ...(landingUrl ? { connectLandingUrl: landingUrl } : {}),
         ...(failureUrl ? { connectFailureUrl: failureUrl } : {}),
       };

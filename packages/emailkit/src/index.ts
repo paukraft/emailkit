@@ -83,10 +83,13 @@ export type {
   DriverCapabilities,
   DriverDomainCapabilities,
   DriverEventTrackingCapabilities,
+  DriverConnectCallbackPublicRoutes,
+  DriverLifecycleWebhookPublicRoutes,
   DriverPublicRoutes,
   DriverPublicRouteCapabilities,
   DriverSendTrackingCapabilities,
   DriverSyncCapabilities,
+  DriverWebhookPublicRoutes,
   DriverWebhookCapabilities,
   EmailTag,
   EmailDriverSelector,
@@ -171,7 +174,6 @@ export type {
   DriverAccountWebhooksAPI,
   DriverCapabilitiesType,
   DriverAuthUpdate,
-  DriverConfig,
   DriverCallbackResult,
   DriverDomainWebhooksAPI,
   DriverDomainsAPI,
@@ -212,7 +214,7 @@ export type {
 export { EmailKitError, EmailKitSyncError } from "./types";
 
 // Export package version constant (keep in sync with package.json)
-export const VERSION = "2.0.2";
+export const VERSION = "3.0.0";
 
 // Export drivers
 export {
@@ -232,11 +234,14 @@ export type { AIInbxCapabilities, AIInbxDriverConfig } from "./drivers/aiinbx";
 export { RESEND_CAPABILITIES, ResendDriver } from "./drivers/resend";
 export type { ResendCapabilities, ResendDriverConfig } from "./drivers/resend";
 
-export { GMAIL_CAPABILITIES, GmailDriver } from "./drivers/gmail";
+export { GMAIL_CAPABILITIES, GmailDriver, isGmailAuth } from "./drivers/gmail";
 export type {
   GmailAuthUpdate,
   GmailCapabilities,
   GmailDriverConfig,
+  GmailDriverConfigBase,
+  GmailInboundDriverConfig,
+  GmailSendOnlyDriverConfig,
   GmailMailboxAuth,
   GmailNotification,
   GmailSendEmailResult,
@@ -249,6 +254,7 @@ export {
   OUTLOOK_CAPABILITIES,
   OUTLOOK_DRAFT_CAPABILITIES,
   OutlookDriver,
+  isOutlookAuth,
 } from "./drivers/outlook";
 export type {
   OutlookCapabilities,
@@ -258,6 +264,8 @@ export type {
   OutlookMailboxAuth,
   OutlookSendEmailMode,
   OutlookSendEmailResult,
+  OutlookWebhookAuthResolver,
+  OutlookWebhookAuthResolverContext,
 } from "./drivers/outlook";
 
 // Export Next.js helpers

@@ -2,25 +2,20 @@ import {
   EmailKit,
   MAILGUN_CAPABILITIES,
   OutlookDriver,
+  isGmailAuth,
+  isOutlookAuth,
   type EmailDriver,
+  type GmailMailboxAuth,
+  type OutlookMailboxAuth,
 } from "../src";
 import type { WebhookLifecycleTarget, WebhookScope } from "../src";
 
-declare const plainDriver: EmailDriver<any, {}, "plain-driver">;
-declare const fetchDriver: EmailDriver<
-  any,
-  { providerFetch: true },
-  "fetch-driver"
+declare const plainDriver: EmailDriver<{}, "plain-driver">;
+declare const fetchDriver: EmailDriver<{ providerFetch: true }, "fetch-driver"
 >;
-declare const senderDriver: EmailDriver<
-  any,
-  { senderAuth: true; senderMailbox: true },
-  "sender-driver"
+declare const senderDriver: EmailDriver<{ senderAuth: true; senderMailbox: true }, "sender-driver"
 >;
-declare const accountWebhookSetupDriver: EmailDriver<
-  any,
-  { webhooks: { account: { setup: true } } },
-  "account-setup-driver"
+declare const accountWebhookSetupDriver: EmailDriver<{ webhooks: { account: { setup: true } } }, "account-setup-driver"
 >;
 
 const providerFetchClient = EmailKit({
@@ -92,15 +87,9 @@ accountWebhookSetupClient.webhooks.setup({
 // @ts-expect-error refresh is absent unless a driver declares account webhook refresh support.
 accountWebhookSetupClient.webhooks.refresh({ id: "webhook_123" });
 
-declare const mailboxSyncDriver: EmailDriver<
-  any,
-  { sync: { mailbox: true } },
-  "mailbox-sync-driver"
+declare const mailboxSyncDriver: EmailDriver<{ sync: { mailbox: true } }, "mailbox-sync-driver"
 >;
-declare const accountSyncDriver: EmailDriver<
-  any,
-  { sync: { account: true } },
-  "account-sync-driver"
+declare const accountSyncDriver: EmailDriver<{ sync: { account: true } }, "account-sync-driver"
 >;
 
 const mailboxSyncClient = EmailKit({
@@ -142,10 +131,21 @@ const addressScope: WebhookScope = "address";
 // @ts-expect-error address is not a public webhook lifecycle target.
 const addressTarget: WebhookLifecycleTarget = { address: "sender@example.com" };
 
-declare const mailgunSendDriver: EmailDriver<
-  any,
-  typeof MAILGUN_CAPABILITIES,
-  "mailgun"
+declare const persistedAuth: unknown;
+if (isGmailAuth(persistedAuth)) {
+  const gmailAuth: GmailMailboxAuth = persistedAuth;
+  const accessToken: string = persistedAuth.accessToken;
+  void gmailAuth;
+  void accessToken;
+}
+if (isOutlookAuth(persistedAuth)) {
+  const outlookAuth: OutlookMailboxAuth = persistedAuth;
+  const accessToken: string = persistedAuth.accessToken;
+  void outlookAuth;
+  void accessToken;
+}
+
+declare const mailgunSendDriver: EmailDriver<typeof MAILGUN_CAPABILITIES, "mailgun"
 >;
 
 const outlookDraftDriver = OutlookDriver({

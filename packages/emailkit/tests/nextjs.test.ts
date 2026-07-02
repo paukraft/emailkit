@@ -37,6 +37,19 @@ describe("Next.js helpers", () => {
     });
   });
 
+  it("preserves rawBody for form-encoded requests", async () => {
+    const request = nextRequest("https://app.test/api/email/mailgun", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "timestamp=123&token=abc",
+    });
+
+    const result = await toEmailKitRequest(request);
+
+    expect(result.rawBody).toBe("timestamp=123&token=abc");
+    expect(result.body).toMatchObject({ timestamp: "123", token: "abc" });
+  });
+
   it("creates route handlers that resolve dynamic driver ids", async () => {
     const emailkitHandler = vi.fn().mockResolvedValue({
       status: 202,

@@ -770,6 +770,21 @@ describe("ResendDriver", () => {
     });
   });
 
+  it("returns false for requests without svix headers before requiring rawBody", async () => {
+    const driver = ResendDriver({
+      apiKey: "re_test",
+      webhookSecret: testResendWebhookSecret,
+    });
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: { "content-type": "multipart/form-data" },
+        body: { junk: true },
+      }),
+    ).resolves.toBe(false);
+  });
+
   it("rejects webhook verification without rawBody", async () => {
     const driver = ResendDriver({
       apiKey: "re_test",

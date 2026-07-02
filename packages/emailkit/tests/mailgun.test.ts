@@ -12,9 +12,13 @@ afterEach(() => {
 const testWebhookSigningKey = "key-test-webhook-signing";
 let mailgunSignatureCounter = 0;
 
-const signedMailgunEventBody = <T extends Record<string, unknown>>(body: T): T => {
+const currentUnixTimestamp = () => String(Math.floor(Date.now() / 1000));
+
+const signedMailgunEventBody = <T extends Record<string, unknown>>(
+  body: T,
+): T => {
   mailgunSignatureCounter += 1;
-  const timestamp = String(1_529_006_854 + mailgunSignatureCounter);
+  const timestamp = currentUnixTimestamp();
   const token = `token-${mailgunSignatureCounter}`;
   return {
     ...body,
@@ -28,9 +32,11 @@ const signedMailgunEventBody = <T extends Record<string, unknown>>(body: T): T =
   };
 };
 
-const signedMailgunRouteBody = <T extends Record<string, unknown>>(body: T): T => {
+const signedMailgunRouteBody = <T extends Record<string, unknown>>(
+  body: T,
+): T => {
   mailgunSignatureCounter += 1;
-  const timestamp = String(1_529_006_854 + mailgunSignatureCounter);
+  const timestamp = currentUnixTimestamp();
   const token = `token-${mailgunSignatureCounter}`;
   return {
     ...body,
@@ -1241,7 +1247,7 @@ describe("MailgunDriver webhooks", () => {
 
   it("verifies Mailgun event signatures from JSON payloads", async () => {
     const signingKey = "key-55c5c5c5c55f55ca5cd5f55d5c555c55";
-    const timestamp = "1529006854";
+    const timestamp = currentUnixTimestamp();
     const token = "a8ce0edb2dd8301dee6c2405235584e45aa91d1e9f979f3de0";
     const signature = createHmac("sha256", signingKey)
       .update(timestamp + token)
@@ -1262,6 +1268,31 @@ describe("MailgunDriver webhooks", () => {
         },
       }),
     ).resolves.toBe(true);
+  });
+
+  it("rejects stale Mailgun webhook timestamps", async () => {
+    const signingKey = "key-55c5c5c5c55f55ca5cd5f55d5c555c55";
+    const timestamp = String(Math.floor(Date.now() / 1000) - 301);
+    const token = "stale-token";
+    const signature = createHmac("sha256", signingKey)
+      .update(timestamp + token)
+      .digest("hex");
+
+    const driver = MailgunDriver({
+      apiKey: "key-test",
+      webhookSigningKey: signingKey,
+    });
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: {},
+        body: {
+          signature: { timestamp, token, signature },
+          "event-data": { event: "opened" },
+        },
+      }),
+    ).resolves.toBe(false);
   });
 
   it("rejects public Mailgun webhooks when no signing key is configured", async () => {
@@ -1596,7 +1627,8 @@ describe("MailgunDriver sync", () => {
 
   it("replays account sync across all listed domains oldest-first", async () => {
     const { since, until } = syncWindow();
-    const alphaEventsUrl = "https://api.mailgun.net/v3/alpha.example.com/events";
+    const alphaEventsUrl =
+      "https://api.mailgun.net/v3/alpha.example.com/events";
     const betaEventsUrl = "https://api.mailgun.net/v3/beta.example.com/events";
     const alphaDeliveredAt = new Date(since.getTime() + 120_000);
     const betaDeliveredAt = new Date(since.getTime() + 60_000);
@@ -1649,7 +1681,8 @@ describe("MailgunDriver sync", () => {
 
   it("dispatches account sync through the top-level client API", async () => {
     const { since, until } = syncWindow();
-    const alphaEventsUrl = "https://api.mailgun.net/v3/alpha.example.com/events";
+    const alphaEventsUrl =
+      "https://api.mailgun.net/v3/alpha.example.com/events";
     const betaEventsUrl = "https://api.mailgun.net/v3/beta.example.com/events";
     const alphaDeliveredAt = new Date(since.getTime() + 120_000);
     const betaDeliveredAt = new Date(since.getTime() + 60_000);
@@ -1856,9 +1889,56 @@ describe("MailgunDriver sync", () => {
       "mailgun content",
     );
     const [, init] = fetchMock.mock.calls.at(-1)!;
-    expect(new Headers(init?.headers).get("authorization")).toMatch(
-      /^Basic /,
-    );
+    expect(new Headers(init?.headers).get("authorization")).toMatch(/^Basic /);
+  });
+
+  it("rejects in-flight stored attachment hydration when the sync signal aborts", async () => {
+    const { since, until } = syncWindow();
+    const storedAt = new Date(since.getTime() + 120_000);
+    const attachmentUrl =
+      "https://storage.mailgun.net/v3/domains/mg.example.com/messages/stored_key_1/attachments/0";
+    const storedMessageWithAttachment = {
+      ...storedMessageJson,
+      attachments: [
+        {
+          filename: "invoice.pdf",
+          url: attachmentUrl,
+          "content-type": "application/pdf",
+          size: 42,
+        },
+      ],
+    };
+    const controller = new AbortController();
+
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      if (href.startsWith(`${eventsUrl}?`)) {
+        return jsonResponse({
+          items: [storedItem("evt_stored_1", storedAt)],
+          paging: {},
+        });
+      }
+      if (href === storageUrl) {
+        return jsonResponse(storedMessageWithAttachment);
+      }
+      if (href === attachmentUrl) {
+        expect(init?.signal).toBe(controller.signal);
+        controller.abort();
+        throw new DOMException("This operation was aborted", "AbortError");
+      }
+      throw new Error(`Unexpected fetch ${href}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const driver = MailgunDriver({ apiKey: "key-test" });
+    const stream = driver.sync!.domain!({
+      domain: "mg.example.com",
+      since,
+      until,
+      signal: controller.signal,
+    });
+
+    await expect(stream.next()).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("dedupes repeated stored events for the same stored message", async () => {
@@ -1997,7 +2077,10 @@ describe("MailgunDriver sync", () => {
     const fetchMock = vi.fn(async () => jsonResponse({ items: [] }));
     vi.stubGlobal("fetch", fetchMock);
 
-    const driver = MailgunDriver({ apiKey: "key-test", eventsRetentionDays: 30 });
+    const driver = MailgunDriver({
+      apiKey: "key-test",
+      eventsRetentionDays: 30,
+    });
     const { events, result } = await drainSync(
       driver.sync!.domain!({ domain: "mg.example.com", since }),
     );
@@ -2066,18 +2149,16 @@ describe("MailgunDriver sync", () => {
     const deliveredAt = new Date(since.getTime() + 60_000);
     const page2Url = `${eventsUrl}/page-2`;
 
-    const fetchMock = vi.fn(
-      async (_url: string | URL, init?: RequestInit) => {
-        // Real fetch rejects when called with an already-aborted signal.
-        if (init?.signal?.aborted) {
-          throw new DOMException("This operation was aborted", "AbortError");
-        }
-        return jsonResponse({
-          items: [deliveredItem("evt_delivered_1", deliveredAt)],
-          paging: { next: page2Url },
-        });
-      },
-    );
+    const fetchMock = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      // Real fetch rejects when called with an already-aborted signal.
+      if (init?.signal?.aborted) {
+        throw new DOMException("This operation was aborted", "AbortError");
+      }
+      return jsonResponse({
+        items: [deliveredItem("evt_delivered_1", deliveredAt)],
+        paging: { next: page2Url },
+      });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     const controller = new AbortController();

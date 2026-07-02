@@ -57,8 +57,27 @@ interface MimePart {
   body: string;
 }
 
+/** RFC 5322 field name: printable ASCII except colon. */
+export const isValidHeaderName = (name: string): boolean =>
+  /^[!-9;-~]+$/.test(name);
+
+const sanitizeHeaderName = (name: string): string => {
+  if (!isValidHeaderName(name)) {
+    throw new TypeError(`Invalid MIME header name: ${JSON.stringify(name)}`);
+  }
+  return name;
+};
+
+const sanitizeHeaderValue = (value: string): string =>
+  value.replace(/[\r\n]+/g, " ");
+
 const renderPart = (part: MimePart): string =>
-  `${part.headers.map(([name, value]) => `${name}: ${value}`).join(CRLF)}${CRLF}${CRLF}${part.body}`;
+  `${part.headers
+    .map(
+      ([name, value]) =>
+        `${sanitizeHeaderName(name)}: ${sanitizeHeaderValue(value)}`,
+    )
+    .join(CRLF)}${CRLF}${CRLF}${part.body}`;
 
 const multipart = (subtype: string, parts: MimePart[]): MimePart => {
   const boundary = `emailkit-${randomBytes(12).toString("hex")}`;
@@ -156,7 +175,7 @@ export const buildMimeMessage = (input: BuildMimeMessageInput): string => {
     ]);
   }
   for (const [name, value] of Object.entries(input.headers || {})) {
-    headers.push([name, String(value).replace(/[\r\n]+/g, " ")]);
+    headers.push([name, String(value)]);
   }
 
   const bodies: MimePart[] = [];

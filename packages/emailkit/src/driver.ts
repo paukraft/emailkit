@@ -18,7 +18,7 @@
  *
  * export const MyProviderDriver = <const TId extends string = 'my-provider'>(
  *   config: MyProviderConfig<TId>
- * ): EmailDriver<MyProviderConfig<TId>, DriverCapabilities, TId> => {
+ * ): EmailDriver<DriverCapabilities, TId> => {
  *   return {
  *     id: (config.id || 'my-provider') as TId,
  *     name: 'my-provider',
@@ -203,7 +203,6 @@ export type DriverCallbackResult = WebhookResponse | MailboxConnectionResult;
  * Base driver interface that all email providers must implement
  */
 export interface EmailDriver<
-  TConfig extends EmailDriverConfig = EmailDriverConfig,
   TCapabilities extends DriverCapabilities = DriverCapabilities,
   TId extends string = string,
 > {
@@ -298,12 +297,6 @@ export interface EmailDriver<
    */
   providerFetch?: ProviderFetch;
 }
-
-/**
- * Type helper to extract driver config type
- */
-export type DriverConfig<TDriver extends EmailDriver> =
-  TDriver extends EmailDriver<infer TConfig, any, any> ? TConfig : never;
 
 /**
  * Type helper to extract driver capabilities type

@@ -55,7 +55,12 @@ import type {
 } from "../types";
 import { EmailKitError } from "../types";
 import { base64ToBytes, stringToBase64 } from "../utils/base64";
+import {
+  isAbortError,
+  retrieveAttachmentsInParallel,
+} from "../utils/attachments";
 import { createProviderFetch } from "../utils/provider-fetch";
+import { isFreshWebhookTimestamp } from "../utils/webhook";
 import {
   buildReplyContext,
   hasReplyData,
@@ -604,18 +609,22 @@ const withMailgunStoredAttachmentMetadata = ({
 const fetchMailgunStoredMessage = async ({
   storageUrl,
   apiKey,
+  signal,
 }: {
   storageUrl: string;
   apiKey: string;
+  signal?: AbortSignal;
 }): Promise<MailgunStoredMessage | null> => {
   try {
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
     const res = await fetch(storageUrl, {
       headers: { Authorization: basic },
+      signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return (await res.json()) as MailgunStoredMessage;
   } catch (error) {
+    if (isAbortError(error, signal)) throw error;
     console.error("Failed to retrieve stored message:", error);
     return null;
   }
@@ -890,6 +899,7 @@ const transformMailgunEvent = async ({
   apiKey,
   autoFetchAttachments = true,
   storedMessage: prefetchedStoredMessage,
+  signal,
 }: {
   payload: MailgunWebhookPayload;
   attachmentHandling?: InboundAttachmentHandling;
@@ -897,6 +907,7 @@ const transformMailgunEvent = async ({
   autoFetchAttachments?: boolean;
   /** Already-fetched stored message, skips the storage URL fetch. */
   storedMessage?: MailgunStoredMessage | null;
+  signal?: AbortSignal;
 }): Promise<OutboundEmailEvent | InboundEmailEvent> => {
   const eventData = payload["event-data"] || payload;
   const event = eventData.event || payload.event || "unknown";
@@ -1027,6 +1038,7 @@ const transformMailgunEvent = async ({
       storedMessage = await fetchMailgunStoredMessage({
         storageUrl,
         apiKey,
+        signal,
       });
       if (storedMessage) {
         if (!bodyPlain && typeof storedMessage["body-plain"] === "string") {
@@ -1079,6 +1091,7 @@ const transformMailgunEvent = async ({
             apiKey,
             attachmentMetadata: storedAttachmentMetadata,
             storedMessage,
+            signal,
           });
           // Only replace if we successfully fetched at least one attachment with content
           if (fetchedAttachments.length > 0) {
@@ -1088,6 +1101,7 @@ const transformMailgunEvent = async ({
             storedMessage = messageFromFetch;
           }
         } catch (error) {
+          if (isAbortError(error, signal)) throw error;
           console.error(
             "Failed to fetch stored attachments, using metadata only:",
             error,
@@ -1295,62 +1309,55 @@ const retrieveStoredAttachments = async ({
   apiKey,
   attachmentMetadata,
   storedMessage,
+  signal,
 }: {
   storageUrl: string;
   apiKey: string;
   attachmentMetadata: Attachment[];
   storedMessage?: MailgunStoredMessage | null;
+  signal?: AbortSignal;
 }): Promise<{
   attachments: Attachment[];
   storedMessage?: MailgunStoredMessage | null;
 }> => {
-  const attachments: Attachment[] = [];
   let messageData: MailgunStoredMessage | null =
     storedMessage !== undefined ? storedMessage : null;
 
   // If attachment metadata already has URLs, fetch directly from those URLs
   // This is more efficient than fetching the message first
-  const attachmentsWithUrls = attachmentMetadata
-    .map((att) => {
-      const metadata = mailgunAttachmentProviderMetadata(att.provider);
-      const directUrl =
-        metadata?.attachmentUrl ||
-        (isDirectMailgunAttachmentUrl(att.url, storageUrl)
-          ? att.url
-          : undefined);
-      return { attachment: att, directUrl };
-    })
-    .filter(
-      (entry): entry is { attachment: Attachment; directUrl: string } =>
-        entry.directUrl !== undefined,
-    );
+  const directAttachmentUrl = (att: Attachment): string | undefined =>
+    mailgunAttachmentProviderMetadata(att.provider)?.attachmentUrl ||
+    (isDirectMailgunAttachmentUrl(att.url, storageUrl) ? att.url : undefined);
 
-  if (attachmentsWithUrls.length > 0) {
+  if (attachmentMetadata.some((att) => directAttachmentUrl(att) !== undefined)) {
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
-    for (const {
-      attachment: attachmentMeta,
-      directUrl,
-    } of attachmentsWithUrls) {
-      try {
+    const attachments = await retrieveAttachmentsInParallel({
+      attachments: attachmentMetadata,
+      signal,
+      retrieve: async (attachmentMeta) => {
+        const directUrl = directAttachmentUrl(attachmentMeta);
+        if (!directUrl) return attachmentMeta;
+
         const res = await fetch(directUrl, {
           headers: { Authorization: basic },
+          signal,
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const buf = new Uint8Array(await res.arrayBuffer());
 
-        attachments.push({
+        return {
           ...attachmentMeta,
           content: buf,
           url: directUrl,
-        });
-      } catch (error) {
+        };
+      },
+      onError: (attachmentMeta, error) => {
         console.error(
           `Failed to retrieve attachment ${attachmentMeta.filename}:`,
           error,
         );
-        attachments.push(attachmentMeta);
-      }
-    }
+      },
+    });
 
     if (attachments.length > 0) {
       return { attachments, storedMessage: messageData };
@@ -1360,40 +1367,52 @@ const retrieveStoredAttachments = async ({
   // Fallback: Try fetching from message storage URL
   // This handles cases where attachment URLs aren't directly available
   if (!messageData) {
-    messageData = await fetchMailgunStoredMessage({ storageUrl, apiKey });
+    messageData = await fetchMailgunStoredMessage({
+      storageUrl,
+      apiKey,
+      signal,
+    });
   }
 
+  let attachments: Attachment[] = [];
   if (messageData?.attachments && Array.isArray(messageData.attachments)) {
+    const storedAttachments = messageData.attachments;
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
-    for (const attachmentMeta of attachmentMetadata) {
-      const attachment = findMailgunStoredAttachment(
-        messageData.attachments,
-        attachmentMeta,
-      );
-      const filename = attachment.filename || attachment.name;
-      if (attachment.url && filename) {
-        try {
+    attachments = await retrieveAttachmentsInParallel({
+      attachments: attachmentMetadata,
+      signal,
+      retrieve: async (attachmentMeta) => {
+        const attachment = findMailgunStoredAttachment(
+          storedAttachments,
+          attachmentMeta,
+        );
+        const filename = attachment.filename || attachment.name;
+        if (attachment.url && filename) {
           const ares = await fetch(attachment.url, {
             headers: { Authorization: basic },
+            signal,
           });
           if (!ares.ok) throw new Error(`HTTP ${ares.status}`);
           const buf = new Uint8Array(await ares.arrayBuffer());
 
-          attachments.push({
+          return {
             ...attachmentMeta,
             content: buf,
             contentType: attachment["content-type"],
             url: attachment.url,
             size: attachment.size,
-          });
-        } catch (error) {
-          console.error(`Failed to retrieve attachment ${filename}:`, error);
-          attachments.push(attachmentMeta);
+          };
         }
-      } else {
-        attachments.push(attachmentMeta);
-      }
-    }
+
+        return attachmentMeta;
+      },
+      onError: (attachmentMeta, error) => {
+        console.error(
+          `Failed to retrieve attachment ${attachmentMeta.filename}:`,
+          error,
+        );
+      },
+    });
   }
 
   return {
@@ -1733,10 +1752,12 @@ const fetchMailgunStoredAttachmentUrl = async ({
   url,
   apiKey,
   filename,
+  signal,
 }: {
   url: string;
   apiKey: string;
   filename?: string;
+  signal?: AbortSignal;
 }): Promise<Response> => {
   if (!apiKey) {
     throw new EmailKitError(
@@ -1748,6 +1769,7 @@ const fetchMailgunStoredAttachmentUrl = async ({
 
   const res = await fetch(url, {
     headers: { Authorization: `Basic ${stringToBase64(`api:${apiKey}`)}` },
+    signal,
   });
   if (!res.ok) {
     const raw = await readMailgunApiResponse(res);
@@ -1766,15 +1788,18 @@ const fetchMailgunStoredAttachmentUrl = async ({
 const fetchMailgunAttachmentFromMetadata = async ({
   metadata,
   apiKey,
+  signal,
 }: {
   metadata: MailgunAttachmentProviderMetadata;
   apiKey: string;
+  signal?: AbortSignal;
 }): Promise<Response> => {
   if (metadata.attachmentUrl) {
     return fetchMailgunStoredAttachmentUrl({
       url: metadata.attachmentUrl,
       apiKey,
       filename: metadata.filename,
+      signal,
     });
   }
 
@@ -1799,6 +1824,7 @@ const fetchMailgunAttachmentFromMetadata = async ({
 
   const storageResponse = await fetch(metadata.storageUrl, {
     headers: { Authorization: `Basic ${stringToBase64(`api:${apiKey}`)}` },
+    signal,
   });
   const storedMessageBody = await readMailgunApiResponse(storageResponse);
   if (!storageResponse.ok) {
@@ -1844,6 +1870,7 @@ const fetchMailgunAttachmentFromMetadata = async ({
     url: matchingAttachment.url,
     apiKey,
     filename: metadata.filename,
+    signal,
   });
 };
 
@@ -2158,7 +2185,7 @@ export type MailgunCapabilities = typeof MAILGUN_CAPABILITIES;
 
 export const MailgunDriver = <const TId extends string = "mailgun">(
   config: MailgunDriverConfig<TId>,
-): EmailDriver<MailgunDriverConfig<TId>, typeof MAILGUN_CAPABILITIES, TId> => {
+): EmailDriver<typeof MAILGUN_CAPABILITIES, TId> => {
   const driverId = (config.id || "mailgun") as TId;
   // Determine region (default to 'us')
   const region = config.region || "us";
@@ -2297,7 +2324,10 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
   ): SyncStream {
     const domain = input.domain;
     if (!domain) {
-      throw new EmailKitError("Mailgun domain sync requires a domain", "mailgun");
+      throw new EmailKitError(
+        "Mailgun domain sync requires a domain",
+        "mailgun",
+      );
     }
 
     const now = new Date();
@@ -2387,11 +2417,14 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
             apiKey: config.apiKey,
             autoFetchAttachments: config.autoFetchInboundAttachments ?? true,
             storedMessage,
+            signal: input.signal,
           })) as InboundEmailEvent;
           yield {
             type: "inbound",
             data:
-              typeof item.id === "string" ? { ...data, eventId: item.id } : data,
+              typeof item.id === "string"
+                ? { ...data, eventId: item.id }
+                : data,
           };
           continue;
         }
@@ -2513,11 +2546,7 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
     };
   };
 
-  const driver: EmailDriver<
-    MailgunDriverConfig<TId>,
-    typeof MAILGUN_CAPABILITIES,
-    TId
-  > = {
+  const driver: EmailDriver<typeof MAILGUN_CAPABILITIES, TId> = {
     id: driverId,
     name: "mailgun",
     capabilities: MAILGUN_CAPABILITIES,
@@ -2529,6 +2558,7 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
         return fetchMailgunAttachmentFromMetadata({
           metadata: attachmentMetadata,
           apiKey: config.apiKey,
+          signal: init?.signal ?? undefined,
         });
       }
 
@@ -3120,6 +3150,10 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
       const timestampStr = String(timestamp);
       const tokenStr = String(token);
 
+      if (!isFreshWebhookTimestamp(timestampStr, "mailgun")) {
+        return false;
+      }
+
       // Calculate HMAC-SHA256 signature
       // Per Mailgun docs: concatenate timestamp + token with no separator
       const hmac = createHmac("sha256", signingKey);
@@ -3140,8 +3174,8 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
     },
 
     webhookResponse: async (
-      request: WebhookRequest,
-      handled: boolean,
+      _request: WebhookRequest,
+      _handled: boolean,
     ): Promise<WebhookResponse> => {
       // Mailgun expects a 200 OK response
       return {

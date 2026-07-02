@@ -144,8 +144,9 @@ export const toEmailKitRequest = async (
       contentType.includes('application/x-www-form-urlencoded') ||
       contentType.includes('multipart/form-data')
     ) {
-      // Parse form data
-      const formData = await req.formData()
+      // Parse form data from a clone so the raw bytes stay available for
+      // drivers that verify signatures over the exact request body.
+      const formData = await req.clone().formData()
       const formObject: Record<string, unknown> = {}
       for (const [key, value] of formData.entries()) {
         // Handle File objects (attachments) - read content
@@ -162,6 +163,7 @@ export const toEmailKitRequest = async (
         }
       }
       body = formObject
+      rawBody = await req.text()
     } else {
       // Fallback to text
       rawBody = await req.text()

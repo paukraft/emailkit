@@ -6,7 +6,7 @@ import {
   GMAIL_CAPABILITIES,
   GmailDriver,
   type ConnectMailboxInput,
-  type GmailDriverConfig,
+  type GmailInboundDriverConfig,
   type GmailMailboxAuth,
   type GmailSendEmailResult,
   type SyncStream,
@@ -30,11 +30,14 @@ const connectInput = (input: ConnectMailboxInput = {}) =>
     ...input,
   }) as ConnectMailboxInput & { callbackUrl: string };
 
-const createDriver = (overrides: Partial<GmailDriverConfig<"gmail">> = {}) =>
+const createDriver = (
+  overrides: Partial<GmailInboundDriverConfig<"gmail">> = {},
+) =>
   GmailDriver({
     clientId: "client_123",
     clientSecret: "secret_123",
     pubsubTopic: TOPIC,
+    verificationToken: "tok_123",
     ...overrides,
   });
 
@@ -118,7 +121,9 @@ const gmailMessage = (overrides: Record<string, unknown> = {}) => ({
 });
 
 const fetchRouter = (
-  routes: Array<[RegExp, (url: string, init?: RequestInit) => Response]>,
+  routes: Array<
+    [RegExp, (url: string, init?: RequestInit) => Response | Promise<Response>]
+  >,
 ) => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   const mock = vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -367,7 +372,7 @@ describe("GmailDriver", () => {
     const driver = createDriver({ autoSubscribeInbound: true });
     const connect = await driver.mailboxes!.connect!(connectInput(), {
       secret: "emailkit-secret",
-      publicRoutes: { webhookUrl: WEBHOOK_URL },
+      publicRoutes: { webhook: { url: WEBHOOK_URL } },
     });
     const callback = await driver.handleCallback!(
       {
@@ -684,6 +689,22 @@ describe("GmailDriver", () => {
       ).rejects.toMatchObject({ code: "INVALID_ATTACHMENT" });
     });
 
+    it("rejects invalid custom header names with an EmailKitError", async () => {
+      const driver = createDriver();
+      await expect(
+        driver.sendEmail(
+          {
+            from: { email: "pau@gmail.com" },
+            to: { email: "to@example.com" },
+            subject: "Hi",
+            text: "x",
+            headers: { "X-My Header": "v" },
+          },
+          { auth: auth() },
+        ),
+      ).rejects.toMatchObject({ code: "INVALID_HEADER", provider: "gmail" });
+    });
+
     it("refreshes expired auth before sending and reports it through onAuthUpdated", async () => {
       const { calls } = fetchRouter([
         [
@@ -751,7 +772,7 @@ describe("GmailDriver", () => {
       expect(result).toEqual({ type: "unknown", data: { hello: "world" } });
     });
 
-    it("enforces the verification token via verifyWebhook when configured", async () => {
+    it("enforces the verification token via verifyWebhook", async () => {
       const driver = createDriver({ verificationToken: "tok_123" });
 
       await expect(
@@ -779,13 +800,60 @@ describe("GmailDriver", () => {
       await expect(
         driver.verifyWebhook!({ method: "GET", headers: {}, body: null }),
       ).resolves.toBe(true);
+    });
 
-      const openDriver = createDriver();
+    it("rejects inbound configuration without a verificationToken at construction", () => {
+      expect(() =>
+        GmailDriver({
+          clientId: "client_123",
+          clientSecret: "secret_123",
+          pubsubTopic: TOPIC,
+          // @ts-expect-error inbound config requires verificationToken
+          verificationToken: undefined,
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "MISSING_VERIFICATION_TOKEN" }),
+      );
+      expect(() =>
+        GmailDriver({
+          clientId: "client_123",
+          clientSecret: "secret_123",
+          webhookAuth: auth(),
+          verificationToken: [],
+        }),
+      ).toThrowError(
+        expect.objectContaining({ code: "MISSING_VERIFICATION_TOKEN" }),
+      );
+    });
+
+    it("rejects webhook POSTs on drivers without inbound configuration", async () => {
+      const onInbound = vi.fn();
+      const sendOnly = GmailDriver({
+        clientId: "client_123",
+        clientSecret: "secret_123",
+      });
+
       await expect(
-        openDriver.verifyWebhook!(
+        sendOnly.verifyWebhook!(
           pubsubRequest({ emailAddress: "pau@gmail.com", historyId: 2000 }),
         ),
+      ).resolves.toBe(false);
+      // OAuth callback GETs validate through encrypted state, not the token.
+      await expect(
+        sendOnly.verifyWebhook!({ method: "GET", headers: {}, body: null }),
       ).resolves.toBe(true);
+
+      const client = EmailKit({
+        emailDrivers: [sendOnly],
+        secret: "emailkit-secret",
+        hooks: { email: { onInbound } },
+      });
+      const response = await client.handler()(
+        pubsubRequest({ emailAddress: "pau@gmail.com", historyId: 2000 }),
+      );
+
+      expect(response.status).toBe(401);
+      expect(onInbound).not.toHaveBeenCalled();
     });
 
     it("hydrates history into inbound events and advances the cursor through onAuthUpdated", async () => {
@@ -892,6 +960,64 @@ describe("GmailDriver", () => {
         previousAuth: { historyId: "1000" },
         mailbox: { email: "pau@gmail.com" },
       });
+    });
+
+    it("hydrates multiple history messages concurrently without reordering events", async () => {
+      let activeMessageFetches = 0;
+      let maxActiveMessageFetches = 0;
+      const delayedMessage = async (id: string) => {
+        activeMessageFetches += 1;
+        maxActiveMessageFetches = Math.max(
+          maxActiveMessageFetches,
+          activeMessageFetches,
+        );
+        await Promise.resolve();
+        activeMessageFetches -= 1;
+        return json(gmailMessage({ id }));
+      };
+
+      fetchRouter([
+        [
+          /\/users\/me\/history/,
+          () =>
+            json({
+              historyId: "2100",
+              history: [
+                {
+                  id: "2050",
+                  messagesAdded: [
+                    { message: { id: "msg_1", labelIds: ["INBOX"] } },
+                    { message: { id: "msg_2", labelIds: ["INBOX"] } },
+                    { message: { id: "msg_3", labelIds: ["INBOX"] } },
+                  ],
+                },
+              ],
+            }),
+        ],
+        [/\/users\/me\/messages\/msg_1/, () => delayedMessage("msg_1")],
+        [/\/users\/me\/messages\/msg_2/, () => delayedMessage("msg_2")],
+        [/\/users\/me\/messages\/msg_3/, () => delayedMessage("msg_3")],
+      ]);
+
+      const driver = createDriver({
+        webhookAuth: auth({
+          historyId: "1000",
+          watchExpiresAt: Date.now() + 6 * 24 * 60 * 60 * 1000,
+        }),
+      });
+
+      const result = await driver.handleWebhook(
+        pubsubRequest({ emailAddress: "pau@gmail.com", historyId: 2000 }),
+      );
+
+      expect(Array.isArray(result)).toBe(true);
+      const events = result as WebhookDriverEvent[];
+      expect(events.map((event) => event.data.providerId)).toEqual([
+        "msg_1",
+        "msg_2",
+        "msg_3",
+      ]);
+      expect(maxActiveMessageFetches).toBeGreaterThan(1);
     });
 
     it("degrades to sync_required when the cursor is missing and seeds it from the notification", async () => {
@@ -1085,6 +1211,18 @@ describe("GmailDriver", () => {
     it("replays a time window oldest-first, filtering self-sent mail", async () => {
       const since = new Date("2026-06-30T00:00:00.000Z");
       const until = new Date("2026-07-01T00:00:00.000Z");
+      let activeMessageFetches = 0;
+      let maxActiveMessageFetches = 0;
+      const delayedMessage = async (overrides: Record<string, unknown>) => {
+        activeMessageFetches += 1;
+        maxActiveMessageFetches = Math.max(
+          maxActiveMessageFetches,
+          activeMessageFetches,
+        );
+        await Promise.resolve();
+        activeMessageFetches -= 1;
+        return json(gmailMessage(overrides));
+      };
       const { calls } = fetchRouter([
         [
           /\/users\/me\/messages\?/,
@@ -1096,41 +1234,35 @@ describe("GmailDriver", () => {
         [
           /\/users\/me\/messages\/msg_new/,
           () =>
-            json(
-              gmailMessage({
-                id: "msg_new",
-                internalDate: String(Date.parse("2026-06-30T20:00:00.000Z")),
-              }),
-            ),
+            delayedMessage({
+              id: "msg_new",
+              internalDate: String(Date.parse("2026-06-30T20:00:00.000Z")),
+            }),
         ],
         [
           /\/users\/me\/messages\/msg_self/,
           () =>
-            json(
-              gmailMessage({
-                id: "msg_self",
-                internalDate: String(Date.parse("2026-06-30T12:00:00.000Z")),
-                payload: {
-                  mimeType: "text/plain",
-                  headers: [
-                    { name: "From", value: "pau@gmail.com" },
-                    { name: "To", value: "someone@example.com" },
-                    { name: "Subject", value: "self" },
-                  ],
-                  body: { data: b64url("self body") },
-                },
-              }),
-            ),
+            delayedMessage({
+              id: "msg_self",
+              internalDate: String(Date.parse("2026-06-30T12:00:00.000Z")),
+              payload: {
+                mimeType: "text/plain",
+                headers: [
+                  { name: "From", value: "pau@gmail.com" },
+                  { name: "To", value: "someone@example.com" },
+                  { name: "Subject", value: "self" },
+                ],
+                body: { data: b64url("self body") },
+              },
+            }),
         ],
         [
           /\/users\/me\/messages\/msg_old/,
           () =>
-            json(
-              gmailMessage({
-                id: "msg_old",
-                internalDate: String(Date.parse("2026-06-30T08:00:00.000Z")),
-              }),
-            ),
+            delayedMessage({
+              id: "msg_old",
+              internalDate: String(Date.parse("2026-06-30T08:00:00.000Z")),
+            }),
         ],
       ]);
 
@@ -1159,6 +1291,7 @@ describe("GmailDriver", () => {
         "msg_old",
         "msg_new",
       ]);
+      expect(maxActiveMessageFetches).toBeGreaterThan(1);
       expect(
         (events[0] as { data: { eventId?: string } }).data.eventId,
       ).toBe("sync:msg_old");
