@@ -332,7 +332,9 @@ const res = await handle({ method, headers, body });
 Provider webhooks are verified before dispatch. Configure each driver's
 webhook signing secret (`webhookSecret`, `webhookSigningKey`, or Outlook
 `webhookClientState`) before accepting production webhook traffic; unsigned
-webhook requests are rejected.
+webhook requests are rejected. Drivers that sign the request body (Resend,
+AIInbx) require `rawBody` on the webhook request — the unparsed request text;
+the built-in Next.js adapter provides it automatically.
 
 ### Provider fetch helper
 

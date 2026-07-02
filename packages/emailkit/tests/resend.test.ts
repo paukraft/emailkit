@@ -1,3 +1,4 @@
+import { Webhook } from "svix";
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import { EmailKit, EmailKitError, ResendDriver } from "../src";
@@ -5,6 +6,10 @@ import { EmailKit, EmailKitError, ResendDriver } from "../src";
 afterEach(() => {
   vi.unstubAllGlobals();
 });
+
+const testResendWebhookSecret = `whsec_${Buffer.from(
+  "resend-webhook-secret-32-bytes!!",
+).toString("base64")}`;
 
 describe("ResendDriver", () => {
   it("defaults to the resend literal id and preserves custom literal ids", () => {
@@ -763,5 +768,53 @@ describe("ResendDriver", () => {
       category: "delivery_delayed",
       reason: "Remote server deferred delivery",
     });
+  });
+
+  it("rejects webhook verification without rawBody", async () => {
+    const driver = ResendDriver({
+      apiKey: "re_test",
+      webhookSecret: testResendWebhookSecret,
+    });
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: {
+          "svix-id": "msg_123",
+          "svix-timestamp": "1775124000",
+          "svix-signature": "v1,abc",
+        },
+        body: { type: "email.sent" },
+      }),
+    ).rejects.toMatchObject({ code: "MISSING_RAW_BODY" });
+  });
+
+  it("verifies svix-signed webhooks from rawBody", async () => {
+    const driver = ResendDriver({
+      apiKey: "re_test",
+      webhookSecret: testResendWebhookSecret,
+    });
+
+    const rawBody = JSON.stringify({ type: "email.sent", data: {} });
+    const msgId = "msg_123";
+    const timestamp = new Date();
+    const signature = new Webhook(testResendWebhookSecret).sign(
+      msgId,
+      timestamp,
+      rawBody,
+    );
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: {
+          "svix-id": msgId,
+          "svix-timestamp": String(Math.floor(timestamp.getTime() / 1000)),
+          "svix-signature": signature,
+        },
+        body: JSON.parse(rawBody),
+        rawBody,
+      }),
+    ).resolves.toBe(true);
   });
 });

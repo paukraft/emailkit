@@ -301,6 +301,27 @@ describe("AIInbxDriver webhooks", () => {
     expect(onClicked).not.toHaveBeenCalled();
   });
 
+  it("rejects webhook verification without rawBody", async () => {
+    const driver = AIInbxDriver({
+      apiKey: "ai_test",
+      webhookSecret: testAIInbxWebhookSecret,
+    });
+
+    const body = { event: "outbound.email.clicked", attempt: 1 };
+    const timestamp = "1775124000";
+
+    await expect(
+      driver.verifyWebhook!({
+        method: "POST",
+        headers: {
+          "x-aiinbx-timestamp": timestamp,
+          "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
+        },
+        body,
+      }),
+    ).rejects.toMatchObject({ code: "MISSING_RAW_BODY" });
+  });
+
   it("fetches stored signed attachment URLs without AIInbx bearer auth", async () => {
     const signedUrl =
       "https://signed-bucket.s3.amazonaws.com/report.txt?X-Amz-Signature=abc";
@@ -381,6 +402,7 @@ describe("AIInbxDriver webhooks", () => {
         "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
       },
       body,
+      rawBody: JSON.stringify(body),
     });
 
     expect(response.status).toBe(200);
@@ -434,6 +456,7 @@ describe("AIInbxDriver webhooks", () => {
         "x-aiinbx-signature": signAIInbxWebhookBody(body, timestamp),
       },
       body,
+      rawBody: JSON.stringify(body),
     });
 
     expect(response.status).toBe(200);

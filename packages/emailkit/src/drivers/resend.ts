@@ -1504,12 +1504,21 @@ export const ResendDriver = <const TId extends string = "resend">(
         return false;
       }
 
+      // Signatures are computed over the exact raw request bytes; a
+      // re-stringified parsed body cannot reproduce them.
+      if (request.rawBody === undefined) {
+        throw new EmailKitError(
+          "Webhook signature verification requires the raw request body. Pass rawBody on WebhookRequest (the unparsed request text).",
+          "resend",
+          "MISSING_RAW_BODY",
+          500,
+        );
+      }
+
           // Resend uses Svix for webhook signing
           // Use the Svix library to verify webhooks
           try {
-            // Use rawBody if available (CRITICAL: must be raw, unmodified body)
-            // If rawBody is not available, fallback to stringified body (may fail verification)
-            const payload = request.rawBody || JSON.stringify(request.body);
+            const payload = request.rawBody;
 
             // Extract Svix headers
             const headers = {

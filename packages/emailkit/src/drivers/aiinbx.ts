@@ -1118,10 +1118,19 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
             return false;
           }
 
+          // Signatures are computed over the exact raw request bytes; a
+          // re-stringified parsed body cannot reproduce them.
+          if (request.rawBody === undefined) {
+            throw new EmailKitError(
+              "Webhook signature verification requires the raw request body. Pass rawBody on WebhookRequest (the unparsed request text).",
+              "aiinbx",
+              "MISSING_RAW_BODY",
+              500,
+            );
+          }
+
           try {
-            // Use rawBody if available (for signature verification), otherwise fallback to stringified body
-            // The rawBody is the original string before JSON parsing, which is what we need for verification
-            const bodyString = request.rawBody || JSON.stringify(request.body);
+            const bodyString = request.rawBody;
 
             // Create expected signature: sha256=HMAC_SHA256(timestamp.body, secret)
             // Note the dot between timestamp and body
