@@ -1,0 +1,45 @@
+---
+import Slashes from "./slashes.astro";
+
+const SPONSORS = [
+  {
+    href: "https://www.iic-ag.com",
+    logo: "/logos/iic-packaging.png",
+    name: "IIC AG",
+  },
+];
+---
+
+<section class="border-border border-t">
+  <div class="mx-auto max-w-6xl px-6 py-20">
+    <p class="section-eyebrow flex items-center gap-3">
+      <Slashes />
+      Sponsors
+    </p>
+    <div class="mt-8 flex flex-col gap-8 sm:flex-row sm:items-center sm:justify-between">
+      <p class="max-w-[44ch] text-pretty text-muted-foreground leading-relaxed">
+        emailkit is free and open source. Development is supported by these
+        companies.
+      </p>
+      <div class="flex flex-wrap items-center gap-x-12 gap-y-8">
+        {
+          SPONSORS.map((s) => (
+            <a
+              class="opacity-70 transition-opacity hover:opacity-100"
+              href={s.href}
+              rel="noreferrer"
+              target="_blank"
+              title={s.name}
+            >
+              <img
+                alt={s.name}
+                class="h-7 w-auto dark:brightness-0 dark:invert"
+                src={s.logo}
+              />
+            </a>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+</section>

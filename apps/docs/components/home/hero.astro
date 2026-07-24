@@ -1,0 +1,214 @@
+---
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+import Icon from "blume/components/Icon.astro";
+import { highlightCode } from "blume/markdown";
+
+import InstallCommand from "./install-command.astro";
+import Slashes from "./slashes.astro";
+
+// Walk up from the build cwd to the workspace root; the isolated build runs
+// from a mounted copy of the docs app, so file-relative paths don't hold.
+let root = process.cwd();
+while (!existsSync(join(root, "packages/emailkit/package.json"))) {
+  const parent = dirname(root);
+  if (parent === root) throw new Error("emailkit package.json not found");
+  root = parent;
+}
+const pkg = JSON.parse(
+  readFileSync(join(root, "packages/emailkit/package.json"), "utf8")
+) as { version: string };
+const releaseUrl = `https://github.com/paukraft/emailkit/releases/tag/v${pkg.version}`;
+
+const HERO_CODE = `export const emailkit = EmailKit({
+  emailDrivers: [
+    // your email API + your users' inboxes
+    ResendDriver({ apiKey }),
+    GmailDriver({ clientId, clientSecret }),
+  ],
+  hooks: {
+    email: {
+      onInbound: async (email) => {
+        await saveToInbox(email);
+        await answerWithAIAgent(email);
+      },
+      onBounced: async (event) => suppress(event.recipient),
+    },
+  },
+});
+
+await emailkit.sendEmail({
+  from: { email: "hello@acme.dev" },
+  to: { email: "ada@example.com" },
+  subject: "Welcome",
+  text: "Your account is ready.",
+});`;
+const heroCodeHtml = await highlightCode(HERO_CODE, "ts", { icons: false });
+
+const PROVIDER_GROUPS = [
+  {
+    label: "Email APIs",
+    providers: [
+      { href: "/providers/resend", name: "Resend", src: "/logos/resend-sidebar.svg" },
+      { href: "/providers/mailgun", name: "Mailgun", src: "/logos/mailgun.svg" },
+      { href: "/providers/aiinbx", name: "AIInbx", src: "/logos/aiinbx-sidebar.svg" },
+    ],
+  },
+  {
+    label: "Mailboxes",
+    providers: [
+      { href: "/providers/gmail", name: "Gmail", src: "/logos/gmail.svg" },
+      { href: "/providers/outlook", name: "Outlook", src: "/logos/outlook.svg" },
+    ],
+  },
+];
+---
+
+<section class="hero-glow relative overflow-hidden">
+  <header
+    class="relative mx-auto grid max-w-6xl items-center gap-12 px-6 pt-16 pb-14 sm:pt-20 lg:grid-cols-[1.05fr_0.95fr] lg:gap-10 lg:pt-24"
+  >
+    <div class="relative">
+      <p
+        class="flex items-center gap-3 font-mono text-muted-foreground text-xs uppercase tracking-[0.3em]"
+      >
+        <Slashes />
+        Open-source email toolkit for TypeScript
+      </p>
+
+      <h1
+        class="mt-6 font-display font-bold text-[3.25rem]/[0.85] text-foreground uppercase italic tracking-tight sm:text-7xl xl:text-8xl"
+      >
+        All of email.<br />
+        <span class="lp-glow text-accent">One API.</span>
+      </h1>
+
+      <p
+        class="mt-7 max-w-xl text-pretty text-base text-muted-foreground leading-relaxed sm:text-lg"
+      >
+        One client — like Prisma for your database or Better Auth for auth —
+        holds your providers, webhooks, and mailboxes. Everything email, one
+        clean API. That's the whole setup <Icon
+          class="inline size-4 rotate-90 align-[-0.125em] text-accent lg:rotate-0"
+          name="arrow-right"
+        />
+      </p>
+
+      <div class="mt-9 flex flex-wrap items-center gap-4">
+        <a
+          class="lp-clip inline-flex h-12 items-center gap-2 bg-accent px-7 font-bold text-black text-sm uppercase tracking-wide transition-opacity hover:opacity-90"
+          href="/introduction"
+        >
+          Read the docs
+          <Icon class="size-4" name="arrow-right" />
+        </a>
+        <a
+          class="lp-clip inline-flex h-12 items-center gap-2 border border-border px-7 font-bold text-foreground text-sm uppercase tracking-wide transition-colors hover:border-accent/60 hover:bg-accent/10"
+          href="https://github.com/paukraft/emailkit"
+          rel="noreferrer"
+          target="_blank"
+        >
+          GitHub
+        </a>
+      </div>
+
+      <div class="mt-5 flex flex-wrap items-center gap-4">
+        <InstallCommand />
+        <a
+          class="font-mono text-muted-foreground text-xs uppercase tracking-widest transition-colors hover:text-foreground"
+          href={releaseUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          Free and open source. MIT. v{pkg.version} · what's new
+        </a>
+      </div>
+    </div>
+
+    <div class="relative">
+      <div
+        class="relative overflow-hidden rounded-xl border border-border bg-card shadow-[0_0_60px_-20px] shadow-accent/25"
+      >
+        <div
+          class="flex items-center justify-between border-border border-b px-4 py-2.5"
+        >
+          <span class="font-mono text-muted-foreground text-xs">
+            emailkit.ts
+          </span>
+          <span
+            class="font-mono text-[0.65rem] text-accent uppercase tracking-[0.25em]"
+          >
+            send + receive + events
+          </span>
+        </div>
+        <div
+          class="prose flush-code hero-code max-w-none overflow-x-auto"
+          set:html={heroCodeHtml}
+        />
+      </div>
+      <p class="mt-3 text-center font-mono text-muted-foreground text-xs">
+        The whole email layer. Nothing scattered, nothing else to wire.
+      </p>
+    </div>
+  </header>
+
+  <div class="relative mx-auto max-w-4xl px-6 pb-20 sm:pb-24">
+    <div
+      class="flex flex-wrap items-start justify-center gap-x-12 gap-y-8 sm:gap-x-16"
+    >
+      {
+        PROVIDER_GROUPS.map((group) => (
+          <div class="flex flex-col items-center gap-3">
+            <p class="font-mono text-[0.65rem] text-muted-foreground uppercase tracking-[0.25em]">
+              {group.label}
+            </p>
+            <div class="flex flex-wrap justify-center gap-x-1 gap-y-2">
+              {group.providers.map((p) => (
+                <a
+                  class="group flex items-center gap-2.5 rounded-lg px-3 py-1.5 transition-colors hover:bg-muted"
+                  href={p.href}
+                >
+                  <img
+                    alt=""
+                    class="size-6 rounded transition-transform duration-200 group-hover:-translate-y-0.5"
+                    height="24"
+                    loading="lazy"
+                    src={p.src}
+                    width="24"
+                  />
+                  <span class="font-medium text-foreground text-sm">
+                    {p.name}
+                  </span>
+                </a>
+              ))}
+            </div>
+          </div>
+        ))
+      }
+    </div>
+    <p class="mt-8 text-center text-muted-foreground text-sm">
+      Mix them freely and route by sender.{" "}
+      <a
+        class="text-foreground underline-offset-4 hover:underline"
+        href="/providers"
+      >
+        Compare providers
+      </a>
+    </p>
+  </div>
+</section>
+
+<style>
+  .hero-glow {
+    background: radial-gradient(
+      52rem 26rem at 50% -10rem,
+      color-mix(in oklab, var(--blume-accent) 9%, transparent),
+      transparent
+    );
+  }
+  .hero-code :global(pre) {
+    font-size: 0.8125rem;
+    line-height: 1.55;
+  }
+</style>

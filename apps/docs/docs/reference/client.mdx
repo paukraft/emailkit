@@ -1,0 +1,94 @@
+---
+title: Client API
+description: The emailkit client options, methods, message types, results, and errors.
+sidebar:
+  label: Client
+  icon: brackets-curly
+---
+
+This page lists the full client API. For a guided setup, start with the [Quickstart](/quickstart).
+
+## Set up emailkit
+
+```ts
+import { EmailKit } from "emailkit";
+
+const emailkit = EmailKit({
+  emailDrivers: [driver],
+  hooks,
+  secret,
+  publicRoutes,
+  resolveEmailDriver,
+});
+```
+
+| Option               |       Required        | Purpose                                                                          |
+| -------------------- | :-------------------: | -------------------------------------------------------------------------------- |
+| `emailDrivers`       |           ✓           | One or more configured providers                                                 |
+| `hooks`              |           —           | Handles email events and connects mailbox, domain, and webhook changes to your app |
+| `secret`             |   For OAuth drivers   | Signs callback state; defaults to `EMAILKIT_SECRET`                              |
+| `publicRoutes`       |           —           | Public origin and route templates; `PUBLIC_BASE_URL` supplies the default origin |
+| `resolveEmailDriver` | With multiple drivers | Selects a provider and loads mailbox login details from your storage              |
+
+emailkit does not persist these values itself. Resolvers load state from your database; mailbox, domain, and webhook hooks tell your app when that state changes.
+
+## Core methods
+
+| API                                  | Purpose                                                    |
+| ------------------------------------ | ---------------------------------------------------------- |
+| `sendEmail(message, options?)`       | Send through a selected driver                             |
+| `handler()`                          | Create the framework-agnostic webhook and callback handler |
+| `getDriver(id)`                      | Access the configured driver instance                      |
+| `attachments.getContent(attachment)` | Retrieve inline or provider-stored content                 |
+| `providerFetch(path, init?)`         | Call a provider-only endpoint with the saved login details |
+
+## Domain, mailbox, and webhook methods
+
+Methods appear only when one of your configured providers supports them.
+
+| Facade      | Methods                                                                                                    |
+| ----------- | ---------------------------------------------------------------------------------------------------------- |
+| `domains`   | `list`, `create`, `get`, `getOrNull`, `ensure`, `update`, `verify`, `delete`, `remove`, `webhooks`, `sync` |
+| `mailboxes` | `connect`, `create`, `list`, `get`, `delete`, `webhooks`, `sync`                                           |
+| `webhooks`  | account-level `setup`, `refresh`, `delete`                                                                 |
+| root client | account-level `sync`                                                                                       |
+
+## Message types
+
+Every provider shares the base message. TypeScript adds more fields when your selected provider supports them.
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="BaseEmailMessage"
+/>
+
+Common optional fields include `cc`, `bcc`, `reply`, `attachments`, `headers`, `tags`, `metadata`, `templateId`, `templateData`, `sendAt`, `track`, `sandbox`, `idempotencyKey`, and `tenantId`.
+
+## Send result
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="SendEmailResult"
+/>
+
+## Attachments
+
+<AutoTypeTable path="../../packages/emailkit/src/types.ts" name="Attachment" />
+
+## Errors
+
+`EmailKitError` gives every provider error the same fields: `provider`, `code`, `httpStatus`, `cause`, and the original provider data. `EmailKitSyncError` also tells you how many recovered events were handled and where a failed sync can continue.
+
+```ts
+try {
+  await emailkit.sendEmail(message);
+} catch (error) {
+  if (error instanceof EmailKitError) {
+    logger.error({
+      provider: error.provider,
+      code: error.code,
+      status: error.httpStatus,
+    });
+  }
+}
+```

@@ -1,0 +1,17 @@
+{
+  "name": "docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "check": "blume check",
+    "doctor": "blume doctor",
+    "validate": "blume validate"
+  },
+  "dependencies": {
+    "@iconify-json/ph": "^1.2.2",
+    "ajv": "^8.17.1",
+    "blume": "^1.1.4"
+  }
+}

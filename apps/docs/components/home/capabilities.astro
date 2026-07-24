@@ -1,0 +1,205 @@
+---
+import { highlightCode } from "blume/markdown";
+
+import Slashes from "./slashes.astro";
+
+const CAPABILITIES = [
+  {
+    code: `export const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({ apiKey, webhookSecret }),
+    GmailDriver({ clientId, clientSecret }),
+  ],
+  hooks: {
+    email: {
+      onInbound: async (email) => saveToInbox(email),
+      onDelivered: async (event) => markDelivered(event.messageId),
+      onBounced: async (event) => suppress(event.recipient),
+    },
+  },
+});
+
+// app/api/email/route.ts — the whole route
+export const { GET, POST } = createNextEmailKitHandler(emailkit);`,
+    description:
+      "One client is your whole email layer. Providers, webhook handling, lifecycle hooks — declared in one file, not scattered across route handlers and provider dashboards. emailkit verifies and normalizes every event before your code sees it; the route is one line.",
+    docHref: "/quickstart",
+    eyebrow: "The client",
+    linkLabel: "Quickstart",
+    titleAccent: "in one place",
+    titleStart: "Everything email,",
+  },
+  {
+    code: `export const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({ apiKey: resendKey }),     // email API
+    GmailDriver({ clientId, clientSecret }), // users' inboxes
+    OutlookDriver({ clientId: msId, clientSecret: msSecret }),
+  ],
+  // route by sender — connected inboxes send as themselves,
+  // everything else goes through your email API
+  resolveEmailDriver: async (ctx) => {
+    if (ctx.operation !== "sendEmail") return "resend";
+    return (await findMailbox(ctx.message.from.email)) ?? "resend";
+  },
+});`,
+    description:
+      "Transactional APIs like Resend and Mailgun next to real inboxes like Gmail and Outlook — in the same client. Mix them freely and route by sender; the rest of your code never knows the difference.",
+    docHref: "/guides/multiple-providers",
+    eyebrow: "Providers",
+    linkLabel: "Multiple providers",
+    titleAccent: "same client",
+    titleStart: "Email APIs and mailboxes,",
+  },
+  {
+    code: `// their domain, on your email API
+const { domain } = await emailkit.domains.ensure({
+  emailDriver: "resend",
+  domain: "acme.com",
+});
+// show domain.verification.records in your UI, then:
+await emailkit.domains.verify({
+  emailDriver: "resend",
+  domain: "acme.com",
+});
+
+// or their inbox — OAuth, refresh, notifications handled
+const { redirectUrl } = await emailkit.mailboxes.connect({
+  emailDriver: "gmail",
+  email: "acme.support@gmail.com",
+});`,
+    description:
+      "Your users connect a whole domain to your email API, or sign into their Gmail or Outlook. Either way it's a couple of calls — DNS records, OAuth flows, token refresh, and inbound notifications are emailkit's problem. After that, both look identical to your app.",
+    docHref: "/use-cases/bring-your-own-email",
+    eyebrow: "Connect",
+    linkLabel: "Bring-your-own email",
+    titleAccent: "one call each",
+    titleStart: "Domains and inboxes,",
+  },
+  {
+    code: `await emailkit.sendEmail({
+  from: { email: "hello@acme.dev" },
+  to: { email: "ada@example.com" },
+  subject: "Tomorrow's reminder",
+  text: "Your meeting starts at 10:00.",
+  sendAt: new Date("2026-07-16T08:00:00Z"), // Resend has scheduling,
+  idempotencyKey: "meeting-reminder-42", //    so these type-check
+  sender: { emailDriver: "resend" },
+});`,
+    description:
+      "Configure Resend and sendAt appears. Configure Gmail and mailbox methods appear. Use a feature your provider doesn't have, and your code doesn't compile — capability gaps surface in your editor, not in production.",
+    docHref: "/concepts",
+    eyebrow: "Type safety",
+    linkLabel: "How it works",
+    titleAccent: "knows your providers",
+    titleStart: "TypeScript",
+  },
+];
+
+const MINIS = [
+  {
+    body: "A library, not a platform. No queue, no required schema, no second copy of your data — your database stays the source of truth.",
+    title: "Nothing new to run",
+  },
+  {
+    body: "Replies stay threaded on every provider, and sync() replays webhook events you missed through your existing hooks — no separate recovery path.",
+    title: "Nothing gets lost",
+  },
+  {
+    body: "Need something only one provider offers? providerFetch() calls its API with your configured credentials.",
+    title: "Escape hatch included",
+  },
+];
+
+const cards = await Promise.all(
+  CAPABILITIES.map(async (cap) => ({
+    ...cap,
+    html: await highlightCode(cap.code, "ts", { icons: false }),
+  }))
+);
+---
+
+<section>
+  <div class="mx-auto max-w-6xl px-6 py-24 md:pt-28">
+    <p class="section-eyebrow flex items-center gap-3">
+      <Slashes />
+      Why emailkit
+    </p>
+    <h2
+      class="mt-4 max-w-[22ch] text-balance font-display font-bold text-4xl text-foreground uppercase italic leading-[0.95] tracking-tight sm:text-6xl"
+    >
+      Your entire email layer.<br />
+      <span class="text-accent">One client.</span>
+    </h2>
+    <p
+      class="mt-6 max-w-[62ch] text-pretty text-base text-muted-foreground leading-relaxed sm:text-lg"
+    >
+      No webhook routes scattered across your codebase, no provider SDKs with
+      five different shapes, no OAuth glue. Providers, hooks, and mailboxes are
+      configured in one client — and one intuitive API hides each provider's
+      weirdness behind it.
+    </p>
+
+    <div class="mt-20 flex flex-col gap-20 sm:gap-28">
+      {
+        cards.map((cap, i) => (
+          <div class="grid items-center gap-8 lg:grid-cols-5 lg:gap-12">
+            <div
+              class:list={["lg:col-span-2", i % 2 === 1 && "lg:order-2"]}
+            >
+              <div class="flex items-baseline gap-4">
+                <span class="lp-outline font-display font-bold text-6xl italic leading-none">
+                  0{i + 1}
+                </span>
+                <p class="font-mono text-accent text-xs uppercase tracking-[0.25em]">
+                  {cap.eyebrow}
+                </p>
+              </div>
+              <h3 class="mt-4 text-balance font-display font-bold text-3xl text-foreground uppercase italic leading-[0.95] tracking-tight sm:text-4xl">
+                {cap.titleStart}{" "}
+                <span class="text-accent">{cap.titleAccent}</span>
+              </h3>
+              <p class="mt-4 text-pretty text-base text-muted-foreground leading-relaxed">
+                {cap.description}
+              </p>
+              <a
+                class="mt-5 inline-flex items-center gap-1.5 font-mono text-accent text-xs uppercase tracking-widest underline-offset-4 hover:underline"
+                href={cap.docHref}
+              >
+                {cap.linkLabel} →
+              </a>
+            </div>
+            <div
+              class:list={[
+                "overflow-hidden rounded-lg border border-border bg-card lg:col-span-3",
+                i % 2 === 1 && "lg:order-1",
+              ]}
+            >
+              <div
+                class="prose flush-code max-w-none overflow-x-auto"
+                set:html={cap.html}
+              />
+            </div>
+          </div>
+        ))
+      }
+    </div>
+
+    <div
+      class="mt-24 grid gap-px overflow-hidden border border-border bg-border sm:grid-cols-3"
+    >
+      {
+        MINIS.map((m) => (
+          <div class="bg-background p-6">
+            <h3 class="font-display font-bold text-accent text-lg uppercase italic tracking-wide">
+              {m.title}
+            </h3>
+            <p class="mt-2 text-muted-foreground text-sm leading-relaxed">
+              {m.body}
+            </p>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>

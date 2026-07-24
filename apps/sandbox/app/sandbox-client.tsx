@@ -1,6 +1,7 @@
 "use client"
 
 import { Trash2 } from "lucide-react"
+import Image from "next/image"
 import { startTransition, useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 
@@ -62,7 +63,8 @@ export function SandboxClient({ initialSnapshot }: { initialSnapshot: SandboxSna
   return (
     <div className="flex h-screen flex-col">
       <header className="flex h-11 shrink-0 items-center gap-3 border-b px-3">
-        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">EmailKit Sandbox</span>
+        <Image alt="" className="size-4 select-none" height={16} src="/emailkit-logo.png" width={16} />
+        <span className="text-xs font-semibold tracking-wide text-muted-foreground">emailkit sandbox</span>
         <ProviderTabs drivers={snapshot.drivers} selected={driver.id} onSelect={setSelectedDriverId} />
         <div className="flex-1" />
         <div className="flex items-center gap-1 font-mono text-xs tabular-nums text-muted-foreground">

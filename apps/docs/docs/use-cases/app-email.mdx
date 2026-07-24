@@ -1,0 +1,90 @@
+---
+title: Send email from your app
+description: Welcome emails, notifications, receipts — one driver and a few lines.
+sidebar:
+  label: Email from your app
+  icon: paper-plane-tilt
+---
+
+The classic case: your app emails your users. Welcome messages, notifications, receipts, password resets. This needs one provider, no resolver, and no state.
+
+## Set up once
+
+```ts title="src/emailkit.ts"
+import { EmailKit, ResendDriver } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({
+      apiKey: process.env.RESEND_API_KEY!,
+      webhookSecret: process.env.RESEND_WEBHOOK_SECRET!,
+    }),
+  ],
+  hooks: {
+    email: {
+      onBounced: async (event) => {
+        await prisma.suppression.upsert({
+          where: { email: event.recipient },
+          create: { email: event.recipient },
+          update: {},
+        });
+      },
+      onInbound: async (email) => {
+        await prisma.inboundEmail.create({
+          data: {
+            messageId: email.messageId,
+            from: email.from.email,
+            subject: email.subject,
+            text: email.text,
+          },
+        });
+      },
+    },
+  },
+});
+```
+
+With one driver there's nothing to resolve — emailkit knows where everything goes.
+
+## Send anywhere in your app
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "hello@yourapp.com", name: "YourApp" },
+  to: { email: user.email },
+  subject: "Welcome to YourApp",
+  html: welcomeTemplate(user),
+});
+```
+
+## Keep your sender reputation clean
+
+The `onBounced` hook above is the whole suppression story: check the list before sending, or let your provider handle repeated bounces. Add `onComplained` the same way for spam reports.
+
+## Let users reply
+
+Point the provider's webhook at your route (see [Receiving](/guides/receiving)) and replies to `hello@yourapp.com` land in `onInbound` — parsed, verified, with attachments you can fetch in one call. Answer them in the same thread:
+
+```ts
+onInbound: async (email) => {
+  await emailkit.sendEmail({
+    from: { email: "hello@yourapp.com" },
+    to: email.from,
+    subject: `Re: ${email.subject}`,
+    text: "Thanks — a human will get back to you shortly.",
+    reply: {
+      messageId: email.messageId,
+      references: email.reply.references,
+    },
+  });
+},
+```
+
+## Grow without rewrites
+
+Everything above keeps working when you later:
+
+- swap Resend for Mailgun — change the driver line, nothing else
+- react to opens and clicks — add `onOpened` / `onClicked` hooks
+- schedule sends — `sendAt: tomorrow`
+- let users bring their own email — see the [next use case](/use-cases/bring-your-own-email)

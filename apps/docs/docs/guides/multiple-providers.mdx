@@ -1,0 +1,93 @@
+---
+title: Use multiple providers
+description: Route each message to the right provider from one function.
+sidebar:
+  label: Multiple providers
+  icon: arrows-split
+---
+
+Connect several providers and keep the choice between them in one function: `resolveEmailDriver`. The rest of your app never mentions a provider.
+
+## One resolver, one lookup
+
+In practice, which provider sends a message is a fact your database already knows — which provider is this sender address connected through? So the resolver is a lookup, not a rulebook:
+
+```ts
+const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({
+      id: "resend",
+      apiKey: process.env.RESEND_API_KEY!,
+    }),
+    GmailDriver({
+      id: "gmail",
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+    OutlookDriver({
+      id: "outlook",
+      clientId: process.env.OUTLOOK_CLIENT_ID!,
+      clientSecret: process.env.OUTLOOK_CLIENT_SECRET!,
+    }),
+  ],
+  resolveEmailDriver: async (context) => {
+    // Mailbox and domain calls name their driver explicitly ({ emailDriver: "gmail" }),
+    // so this resolver only routes sends — anything else falls back to the API driver.
+    if (context.operation !== "sendEmail") return "resend";
+
+    // a connected inbox: driver plus its mailbox and saved login
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: context.message.from.email },
+    });
+    if (connected) {
+      return {
+        emailDriver: connected.emailDriver, // "gmail" or "outlook"
+        mailbox: connected.mailbox,
+        auth: decrypt(connected.auth),
+      };
+    }
+
+    // everything else sends through the API driver
+    return "resend";
+  },
+});
+```
+
+TypeScript knows your configured IDs and catches invalid ones. Loading the mailbox and login here means no other call site ever handles credentials.
+
+This is the core of the [users bring their own email](/use-cases/bring-your-own-email) use case — that page shows the onboarding flows around it.
+
+## Override for one message
+
+`sender.emailDriver` skips the resolver when one message must use a specific provider — say, a send that needs a feature only one of them has:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "news@example.com" },
+  to: { email: "reader@example.com" },
+  subject: "July newsletter",
+  text: "This month's news...",
+  sendAt: tomorrow,
+  sender: { emailDriver: "resend" },
+});
+```
+
+Domain and mailbox methods take the provider at the top level instead:
+
+```ts
+await emailkit.domains.verify({
+  emailDriver: "resend",
+  domain: "example.com",
+});
+```
+
+## Same provider, twice
+
+Driver IDs also let you connect one provider more than once — a Mailgun account in the EU and one in the US, or separate accounts for transactional and marketing mail:
+
+```ts
+emailDrivers: [
+  MailgunDriver({ id: "mailgun-eu", region: "eu", apiKey: euKey }),
+  MailgunDriver({ id: "mailgun-us", region: "us", apiKey: usKey }),
+],
+```

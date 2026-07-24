@@ -1,0 +1,13 @@
+---
+interface Props {
+  class?: string;
+}
+
+const { class: className } = Astro.props;
+---
+
+<span aria-hidden class:list={["inline-flex items-center gap-1", className]}>
+  <span class="h-3.5 w-[3px] -skew-x-[30deg] bg-accent"></span>
+  <span class="h-3.5 w-[3px] -skew-x-[30deg] bg-accent/60"></span>
+  <span class="h-3.5 w-[3px] -skew-x-[30deg] bg-accent/30"></span>
+</span>

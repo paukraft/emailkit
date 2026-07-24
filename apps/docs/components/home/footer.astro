@@ -1,0 +1,54 @@
+---
+const LINKS = [
+  { href: "/introduction", label: "Docs" },
+  { href: "/quickstart", label: "Quickstart" },
+  { href: "/providers", label: "Providers" },
+  { external: true, href: "https://github.com/paukraft/emailkit", label: "GitHub" },
+  { external: true, href: "https://www.npmjs.com/package/emailkit", label: "npm" },
+];
+---
+
+<footer class="border-border border-t">
+  <div
+    class="mx-auto flex max-w-6xl flex-col gap-6 px-6 py-12 sm:flex-row sm:items-center sm:justify-between"
+  >
+    <div class="flex items-center gap-2.5">
+      <img alt="" class="size-5 select-none" src="/emailkit-logo.png" />
+      <span class="font-display font-semibold text-foreground">emailkit</span>
+      <span class="text-muted-foreground text-sm"
+        >— all of email, one intuitive API</span
+      >
+    </div>
+    <nav
+      class="flex flex-wrap items-center gap-x-6 gap-y-2 font-mono text-muted-foreground text-xs uppercase tracking-wider"
+    >
+      {
+        LINKS.map((l) => (
+          <a
+            class="transition-colors hover:text-foreground"
+            href={l.href}
+            rel={l.external ? "noreferrer" : undefined}
+            target={l.external ? "_blank" : undefined}
+          >
+            {l.label}
+          </a>
+        ))
+      }
+    </nav>
+  </div>
+  <div class="border-border border-t">
+    <div
+      class="mx-auto flex max-w-6xl items-center justify-between px-6 py-5 text-muted-foreground text-xs"
+    >
+      <p>
+        &copy; 2026 <a
+          class="transition-colors hover:text-foreground"
+          href="https://paukraft.com"
+          rel="noreferrer"
+          target="_blank">Pau Kraft</a
+        >
+      </p>
+      <p class="font-mono">MIT License</p>
+    </div>
+  </div>
+</footer>

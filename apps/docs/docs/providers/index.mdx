@@ -1,0 +1,98 @@
+---
+title: Choose a provider
+description: Pick an email API, connect user inboxes, or combine both behind the same emailkit API.
+sidebar:
+  label: Overview
+  icon: plugs-connected
+---
+
+Pick whatever fits your product — your app code looks the same either way, and you can add or swap providers later without rewrites.
+
+## Email APIs
+
+For product emails, notifications, campaigns, and addresses your app manages. Connect with an API key and send from a domain you own.
+
+<Columns cols={3}>
+  <Column>
+    <Tile
+      title="Resend"
+      description="The quickest way to send product email, receive messages, and manage domains."
+      href="/providers/resend"
+    >
+      <span class="provider-logo">
+        <img src="/logos/resend.svg" alt="Resend logo" />
+      </span>
+    </Tile>
+  </Column>
+  <Column>
+    <Tile
+      title="Mailgun"
+      description="Flexible inbound routing, detailed tracking, EU hosting, and domain management."
+      href="/providers/mailgun"
+    >
+      <span class="provider-logo">
+        <img src="/logos/mailgun.svg" alt="Mailgun logo" />
+      </span>
+    </Tile>
+  </Column>
+  <Column>
+    <Tile
+      title="AIInbx"
+      description="Create inboxes through an API, keep conversations threaded, manage domains."
+      href="/providers/aiinbx"
+    >
+      <span class="provider-logo">
+        <img src="/logos/aiinbx.svg" alt="AIInbx logo" />
+      </span>
+    </Tile>
+  </Column>
+</Columns>
+
+## Mailbox providers
+
+For when users connect their own inbox. They sign in with Google or Microsoft, and your app sends and receives through their account with the same API.
+
+<Columns cols={2}>
+  <Column>
+    <Tile
+      title="Gmail"
+      description="Connect Gmail inboxes, keep replies threaded, receive new messages."
+      href="/providers/gmail"
+    >
+      <span class="provider-logo">
+        <img src="/logos/gmail.svg" alt="Gmail logo" />
+      </span>
+    </Tile>
+  </Column>
+  <Column>
+    <Tile
+      title="Outlook"
+      description="Connect Microsoft 365 inboxes, receive new mail, reply natively."
+      href="/providers/outlook"
+    >
+      <span class="provider-logo">
+        <img src="/logos/outlook.svg" alt="Microsoft Outlook logo" />
+      </span>
+    </Tile>
+  </Column>
+</Columns>
+
+## Capability map
+
+| Capability           | Resend  |    Mailgun     | AIInbx  |  Gmail  | Outlook |
+| -------------------- | :-----: | :------------: | :-----: | :-----: | :-----: |
+| Send                 |    ✓    |       ✓        |    ✓    |    ✓    |    ✓    |
+| Inbound email        |    ✓    |       ✓        |    ✓    |    ✓    |    ✓    |
+| Open & click events  |    ✓    |       ✓        |    ✓    |    —    |    —    |
+| Attachments          |    ✓    |       ✓        |    ✓    |    ✓    |    ✓    |
+| Templates            |    ✓    |       ✓        |    —    |    —    |    —    |
+| Scheduling           |    ✓    |       ✓        |    —    |    —    |    —    |
+| Domain management    |    ✓    |       ✓        |    ✓    |    —    |    —    |
+| Connect mailboxes    |    —    |       —        |    —    |    ✓    |    ✓    |
+| Replay missed events | Account | Account/domain | Account | Mailbox | Mailbox |
+
+Once a provider is configured, TypeScript shows you everything else it can do — reply threading, duplicate-send protection, custom headers, and more.
+
+:::note
+You can connect the same provider twice — for example, one Mailgun account in the EU and one in the US.
+:::

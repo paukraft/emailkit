@@ -1,0 +1,36 @@
+---
+const ITEMS = [
+  "ONE CENTRAL CLIENT",
+  "ONE UNIFIED API",
+  "EMAIL APIS + MAILBOXES",
+  "CONNECT DOMAINS",
+  "CONNECT INBOXES",
+  "VERIFIED WEBHOOKS",
+  "TYPE-SAFE SENDS",
+  "FREE. MIT.",
+];
+---
+
+<div
+  class="-mx-2 -rotate-1 overflow-hidden border-y border-accent/40 bg-accent py-2.5"
+>
+  <div class="lp-marquee flex w-max">
+    {
+      [0, 1].map((copy) => (
+        <div
+          aria-hidden={copy === 1 ? "true" : undefined}
+          class="flex shrink-0 items-center font-display font-bold text-black text-lg uppercase italic tracking-wide"
+        >
+          {ITEMS.map((word) => (
+            <span class="flex items-center">
+              <span class="px-5">{word}</span>
+              <span aria-hidden class="-skew-x-[30deg] font-bold">
+                {"//"}
+              </span>
+            </span>
+          ))}
+        </div>
+      ))
+    }
+  </div>
+</div>

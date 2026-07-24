@@ -1,0 +1,74 @@
+diff --git a/dist/cli/index.js b/dist/cli/index.js
+index eb5fcc4ac5b1ceb255580c252d059c531881994c..6e22b3a73d4ec82976ebca9eda15ae2e9c8a21cc 100755
+--- a/dist/cli/index.js
++++ b/dist/cli/index.js
+@@ -8263,11 +8263,13 @@ import { getIconData, iconToSVG } from "@iconify/utils";
+ var requireJson = createRequire2(import.meta.url);
+ var loadSet = (pkg) => requireJson(pkg);
+ var SETS = {
+-  lucide: loadSet("@iconify-json/lucide/icons.json")
++  lucide: loadSet("@iconify-json/lucide/icons.json"),
++  ph: loadSet("@iconify-json/ph/icons.json")
+ };
+-var DEFAULT_SET = "lucide";
++var SET_ORDER = ["ph", "lucide"];
+ var PREFIX_SETS = {
+-  lucide: "lucide"
++  lucide: "lucide",
++  ph: "ph"
+ };
+ var ownEntry = (map, key) => Object.hasOwn(map, key) ? map[key] : undefined;
+ var normalize = (name) => name.trim().toLowerCase().replaceAll(/[\s_]+/gu, "-");
+@@ -8287,7 +8289,13 @@ var resolveIcon = (name) => {
+     const setName = ownEntry(PREFIX_SETS, normalized.slice(0, colon));
+     return setName ? fromSet(setName, normalized.slice(colon + 1)) : null;
+   }
+-  return fromSet(DEFAULT_SET, normalized);
++  for (const setName of SET_ORDER) {
++    const resolved = fromSet(setName, normalized);
++    if (resolved) {
++      return resolved;
++    }
++  }
++  return null;
+ };
+ var hasIcon = (name) => resolveIcon(name) !== null;
+ 
+diff --git a/src/theme/icons.ts b/src/theme/icons.ts
+index 6b27837abb6431f52fbc85b3bfd2df60fd885de8..7eb968a223cbc9cc5ad627eff03af342da30dcf6 100644
+--- a/src/theme/icons.ts
++++ b/src/theme/icons.ts
+@@ -21,14 +21,16 @@ const loadSet = (pkg: string): IconifyJSON => requireJson(pkg) as IconifyJSON;
+ 
+ const SETS: Record<string, IconifyJSON> = {
+   lucide: loadSet("@iconify-json/lucide/icons.json"),
++  ph: loadSet("@iconify-json/ph/icons.json"),
+ };
+ 
+-/** Blume's only icon library. */
+-const DEFAULT_SET = "lucide";
++/** Bare-name resolution order: Phosphor first, Lucide as fallback. */
++const SET_ORDER = ["ph", "lucide"];
+ 
+ /** Explicit `prefix:name` prefixes. Lucide is the only bundled set. */
+ const PREFIX_SETS: Record<string, string> = {
+   lucide: "lucide",
++  ph: "ph",
+ };
+ 
+ /**
+@@ -76,7 +78,13 @@ export const resolveIcon = (name: string): ResolvedIcon | null => {
+     const setName = ownEntry(PREFIX_SETS, normalized.slice(0, colon));
+     return setName ? fromSet(setName, normalized.slice(colon + 1)) : null;
+   }
+-  return fromSet(DEFAULT_SET, normalized);
++  for (const setName of SET_ORDER) {
++    const resolved = fromSet(setName, normalized);
++    if (resolved) {
++      return resolved;
++    }
++  }
++  return null;
+ };
+ 
+ /**

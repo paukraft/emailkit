@@ -1,0 +1,59 @@
+---
+import Slashes from "./slashes.astro";
+
+const CASES = [
+  {
+    body: "Think AI email support: your customer connects support@theirco.com — their Gmail, their Outlook, or their whole domain — and your app reads every message, drafts replies, keeps threads intact, and sends as them. emailkit is the entire email layer under a product like that.",
+    eyebrow: "Full power",
+    href: "/use-cases/bring-your-own-email",
+    linkLabel: "Users bring their email",
+    title: "Automate your users' inboxes",
+  },
+  {
+    body: "Welcome emails, receipts, notifications. No platform to adopt, no boilerplate to paste: install, add a driver, send. And when you later want inbound, mailboxes, or a second provider, it's the same client — not a rewrite.",
+    eyebrow: "Just sending?",
+    href: "/use-cases/app-email",
+    linkLabel: "Email from your app",
+    title: "Still the fastest setup",
+  },
+];
+---
+
+<section class="border-border border-t">
+  <div class="mx-auto max-w-6xl px-6 py-24">
+    <p class="section-eyebrow flex items-center gap-3">
+      <Slashes />
+      What it's for
+    </p>
+    <h2
+      class="mt-4 max-w-[24ch] text-balance font-display font-bold text-4xl text-foreground uppercase italic leading-[0.95] tracking-tight sm:text-6xl"
+    >
+      From your first send<br />
+      <span class="text-accent">to a full email product.</span>
+    </h2>
+
+    <div class="mt-12 grid gap-px overflow-hidden border border-border bg-border md:grid-cols-2">
+      {
+        CASES.map((c) => (
+          <div class="flex flex-col bg-background p-8">
+            <p class="font-mono text-accent text-xs uppercase tracking-[0.25em]">
+              {c.eyebrow}
+            </p>
+            <h3 class="mt-3 font-display font-bold text-2xl text-foreground uppercase italic tracking-tight">
+              {c.title}
+            </h3>
+            <p class="mt-3 flex-1 text-muted-foreground text-sm leading-relaxed">
+              {c.body}
+            </p>
+            <a
+              class="mt-5 inline-flex items-center gap-1.5 font-mono text-accent text-xs uppercase tracking-widest underline-offset-4 hover:underline"
+              href={c.href}
+            >
+              {c.linkLabel} →
+            </a>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>

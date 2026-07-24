@@ -1,0 +1,133 @@
+---
+import { highlightCode } from "blume/markdown";
+
+import Slashes from "./slashes.astro";
+
+// The same client setup and send rendered per provider.
+const DEMO = [
+  {
+    config: `ResendDriver({ apiKey: process.env.RESEND_API_KEY! })`,
+    from: `{ email: "hello@acme.dev", name: "Acme" }`,
+    import: `import { EmailKit, ResendDriver } from "emailkit";`,
+    label: "Resend",
+  },
+  {
+    config: `MailgunDriver({ apiKey: process.env.MAILGUN_API_KEY! })`,
+    from: `{ email: "hello@acme.dev", name: "Acme" }`,
+    import: `import { EmailKit, MailgunDriver } from "emailkit";`,
+    label: "Mailgun",
+  },
+  {
+    config: `AIInbxDriver({ apiKey: process.env.AIINBX_API_KEY! })`,
+    from: `{ email: "hello@acme.dev", name: "Acme" }`,
+    import: `import { AIInbxDriver, EmailKit } from "emailkit";`,
+    label: "AIInbx",
+  },
+  {
+    config: `GmailDriver({ clientId: googleId, clientSecret: googleSecret })`,
+    from: `{ email: "acme.support@gmail.com" }`,
+    import: `import { EmailKit, GmailDriver } from "emailkit";`,
+    label: "Gmail",
+  },
+  {
+    config: `OutlookDriver({ clientId: msId, clientSecret: msSecret })`,
+    from: `{ email: "acme.support@outlook.com" }`,
+    import: `import { EmailKit, OutlookDriver } from "emailkit";`,
+    label: "Outlook",
+  },
+];
+
+const code = (p: (typeof DEMO)[number]) => `${p.import}
+
+const emailkit = EmailKit({
+  emailDrivers: [${p.config}],
+});
+
+await emailkit.sendEmail({
+  from: ${p.from},
+  to: { email: "ada@example.com" },
+  subject: "Welcome",
+  text: "Your account is ready.",
+});`;
+
+const panels = await Promise.all(
+  DEMO.map(async (p) => ({
+    html: await highlightCode(code(p), "ts", { icons: false }),
+    label: p.label,
+  }))
+);
+---
+
+<section class="border-border border-t">
+  <div class="mx-auto max-w-6xl px-6 py-24">
+    <p class="section-eyebrow flex items-center gap-3">
+      <Slashes />
+      One API everywhere
+    </p>
+    <h2
+      class="mt-4 max-w-[24ch] text-balance font-display font-bold text-4xl text-foreground uppercase italic leading-[0.95] tracking-tight sm:text-6xl"
+    >
+      The provider becomes<br />
+      <span class="text-accent">an implementation detail.</span>
+    </h2>
+    <p
+      class="mt-6 max-w-[60ch] text-pretty text-base text-muted-foreground leading-relaxed sm:text-lg"
+    >
+      Pick a provider — or several. Payload shapes, auth schemes, thread
+      formats: each provider's quirks stay under the hood, so swapping is just
+      the driver line. Click through — everything below it stays identical,
+      even when the "provider" is a user's own inbox.
+    </p>
+    <div
+      class="mt-12 overflow-hidden rounded-xl border border-border bg-card"
+      data-demo
+    >
+      <div
+        class="flex flex-wrap items-center justify-between gap-3 border-border border-b px-4 py-2.5"
+      >
+        <span class="font-mono text-muted-foreground text-xs">email.ts</span>
+        <div aria-label="Provider" class="flex flex-wrap gap-1" role="group">
+          {
+            panels.map((p, i) => (
+              <button
+                aria-pressed={i === 0 ? "true" : "false"}
+                class="lp-clip cursor-pointer px-3 py-1 font-mono text-muted-foreground text-xs uppercase tracking-wide transition-colors hover:text-foreground aria-[pressed=true]:bg-accent aria-[pressed=true]:font-bold aria-[pressed=true]:text-black"
+                data-demo-chip={p.label}
+                type="button"
+              >
+                {p.label}
+              </button>
+            ))
+          }
+        </div>
+      </div>
+      {
+        panels.map((p, i) => (
+          <div
+            class="prose flush-code max-w-none overflow-x-auto"
+            data-demo-panel={p.label}
+            hidden={i !== 0}
+            set:html={p.html}
+          />
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<script>
+  for (const root of document.querySelectorAll("[data-demo]")) {
+    const chips = root.querySelectorAll<HTMLButtonElement>("[data-demo-chip]");
+    const panels = root.querySelectorAll<HTMLElement>("[data-demo-panel]");
+    for (const chip of chips) {
+      chip.addEventListener("click", () => {
+        for (const c of chips) {
+          c.setAttribute("aria-pressed", String(c === chip));
+        }
+        for (const p of panels) {
+          p.hidden = p.dataset.demoPanel !== chip.dataset.demoChip;
+        }
+      });
+    }
+  }
+</script>

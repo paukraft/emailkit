@@ -1,0 +1,150 @@
+---
+title: AIInbx
+description: Set up AIInbx for programmatic inboxes, threads, and verified webhooks.
+sidebar:
+  label: AIInbx
+  icon: /logos/aiinbx-sidebar.svg
+---
+
+Choose AIInbx when your app needs inboxes of its own — think AI agents with email addresses — without asking users to connect Gmail or Outlook. Conversations stay threaded, and every event flows through the same hooks as any other provider.
+
+## 1. Create the AIInbx credentials
+
+In AIInbx:
+
+1. Create an API key.
+2. Add a webhook pointing to `https://your-app.com/api/email/aiinbx` with secret signing enabled.
+3. Copy the signing secret right away — AIInbx shows it once.
+
+```bash title=".env"
+AIINBX_API_KEY="..."
+AIINBX_WEBHOOK_SECRET="..."
+PUBLIC_BASE_URL="https://your-app.com"
+```
+
+## 2. Configure emailkit
+
+```ts title="src/emailkit.ts"
+import { AIInbxDriver, EmailKit } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    AIInbxDriver({
+      id: "aiinbx",
+      apiKey: process.env.AIINBX_API_KEY!,
+      webhookSecret: process.env.AIINBX_WEBHOOK_SECRET!,
+      autoFetchInboundAttachments: true,
+    }),
+  ],
+  publicRoutes: {
+    baseUrl: process.env.PUBLIC_BASE_URL!,
+  },
+  hooks: {
+    email: {
+      onInbound: async (email) => {
+        await prisma.inboundEmail.upsert({
+          where: { messageId: email.messageId },
+          create: {
+            messageId: email.messageId,
+            from: email.from.email,
+            subject: email.subject,
+            text: email.text,
+          },
+          update: {},
+        });
+      },
+      onDelivered: async (event) => {
+        await prisma.sentEmail.updateMany({
+          where: { messageId: event.messageId },
+          data: { status: "delivered" },
+        });
+      },
+    },
+  },
+});
+```
+
+The upsert by `messageId` makes retried webhooks harmless.
+
+## 3. Add the public route
+
+```ts title="app/api/email/[emailDriver]/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit, {
+  emailDriver: async (_request, context) =>
+    (await context.params).emailDriver,
+});
+```
+
+AIInbx signs the exact request body with a freshness timestamp. The adapter preserves the body; emailkit rejects invalid or stale requests.
+
+## 4. Send and reply
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "agent@inbox.example.com" },
+  to: { email: "customer@example.com" },
+  subject: "How can we help?",
+  text: "Reply directly to this message.",
+  track: { opens: true, clicks: true },
+});
+```
+
+Reply with the details from an inbound event and the conversation stays in one thread:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "agent@inbox.example.com" },
+  to: inbound.from,
+  subject: `Re: ${inbound.subject}`,
+  text: "Thanks for the context.",
+  reply: {
+    messageId: inbound.messageId,
+    references: inbound.reply.references,
+    threadId: inbound.reply.threadId,
+  },
+});
+```
+
+## 5. Store inbound attachments
+
+With `autoFetchInboundAttachments: true`, attachment content usually arrives already downloaded. Use the shared retrieval method either way:
+
+```ts
+for (const attachment of inbound.attachments ?? []) {
+  const content = await emailkit.attachments.getContent(attachment);
+  await files.save(attachment.filename, content);
+}
+```
+
+## 6. Add and verify a domain
+
+```ts
+const { domain } = await emailkit.domains.ensure({
+  emailDriver: "aiinbx",
+  domain: "inbox.example.com",
+});
+
+// add domain.verification.records at your DNS host, then:
+await emailkit.domains.verify({
+  emailDriver: "aiinbx",
+  domainId: domain.id,
+});
+```
+
+## Recover missed inbound email
+
+```ts
+await emailkit.sync({
+  emailDriver: "aiinbx",
+  since: outageStartedAt,
+});
+```
+
+Recovered messages run through the same `onInbound` hook as live webhooks.
+
+## Extras
+
+AIInbx supports native threads, open and click tracking, domain management, inbound sync, and provider-only endpoints through `providerFetch()`. It doesn't offer templates, scheduling, tags, metadata, or custom headers — TypeScript hides those fields for you.

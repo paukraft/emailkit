@@ -1,0 +1,103 @@
+---
+title: How emailkit works
+description: The few ideas behind emailkit's simple, universal API.
+sidebar:
+  icon: stack
+  order: 3
+---
+
+You don't need this page to start — the [Quickstart](/quickstart) is enough. These are the four ideas that keep emailkit simple as your setup grows.
+
+## 1. Drivers connect providers
+
+A driver plugs one provider into emailkit. Add one, or several:
+
+```ts
+EmailKit({
+  emailDrivers: [
+    ResendDriver({ id: "resend", apiKey: process.env.RESEND_API_KEY! }),
+    GmailDriver({
+      id: "gmail",
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+  ],
+  // with several drivers, tell emailkit which one to use —
+  // usually a lookup in your own database by sender address
+  resolveEmailDriver: async (context) => {
+    if (context.operation !== "sendEmail") return "resend";
+
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: context.message.from.email },
+    });
+
+    return connected
+      ? {
+          emailDriver: "gmail",
+          mailbox: connected.mailbox,
+          auth: decrypt(connected.auth),
+        }
+      : "resend";
+  },
+});
+```
+
+You pick the IDs. TypeScript remembers them and catches typos before your code runs.
+
+## 2. Features follow your providers
+
+Providers differ, but you don't manage the differences — TypeScript does. Configure Resend and `sendAt` shows up on `sendEmail()`. Configure Gmail and `mailboxes.connect()` appears. Try a field your provider doesn't support and it won't compile.
+
+With several providers, a message gets the features they all share. Want one provider's special feature? Say so with `sender: { emailDriver: "transactional" }`.
+
+## 3. Every event, one format
+
+Every provider reports events differently. Your app never sees that — it sees hooks:
+
+```ts
+hooks: {
+  email: {
+    onInbound: saveMessage,
+    onDelivered: recordDelivery,
+    onBounced: suppressRecipient,
+  },
+}
+```
+
+Received mail, deliveries, opens, clicks, bounces — same shape everywhere. Providers may send an event twice, so save by `messageId` and ignore repeats.
+
+## 4. Your database stays yours
+
+emailkit keeps no state and requires no schema. When a provider needs something remembered — a connected inbox's OAuth tokens, a webhook that expires — emailkit asks your app for it or hands it to your app to save:
+
+- **Resolvers are getters.** `resolveEmailDriver` loads the mailbox and its login when emailkit needs them.
+- **Hooks are setters.** `mailbox.onConnected`, `onAuthUpdated`, and the `webhook` hooks tell you what to save.
+
+```ts
+GmailDriver({
+  clientId,
+  clientSecret,
+  onAuthUpdated: async ({ mailbox, auth }) => {
+    if (!mailbox?.email) return;
+    await prisma.connectedMailbox.updateMany({
+      where: { email: mailbox.email },
+      data: { auth: encrypt(auth) },
+    });
+  },
+});
+```
+
+Plain database calls — Prisma here, but anything works. emailkit handles the OAuth flows and token refreshes in between; it just never owns the data.
+
+## The escape hatch
+
+The shared API covers everyday email work. For anything unique to one provider, call its API directly with your already-configured credentials:
+
+```ts
+const response = await emailkit.providerFetch("/v4/domains", {
+  emailDriver: "mailgun",
+  searchParams: { limit: 25 },
+});
+```
+
+One simple API for the common work, full provider access when you want it.

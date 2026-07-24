@@ -1,0 +1,162 @@
+---
+title: Mailgun
+description: Set up Mailgun for sending, inbound routes, verified events, and domains.
+sidebar:
+  icon: /logos/mailgun.svg
+---
+
+Choose Mailgun for flexible inbound routing, detailed delivery events, or EU hosting. Mailgun has separate APIs for messages, domains, routes, and webhooks — emailkit hides all of that behind one setup.
+
+## 1. Choose a region and create credentials
+
+Pick `us` or `eu` first — Mailgun keeps the regions fully separate. Then in Mailgun:
+
+1. Create a sending API key.
+2. Copy the **HTTP webhook signing key** from the Mailgun Send settings (it's a different key).
+3. Add the domain you'll send or receive with.
+
+```bash title=".env"
+MAILGUN_API_KEY="key-..."
+MAILGUN_WEBHOOK_SIGNING_KEY="..."
+MAILGUN_REGION="eu"
+PUBLIC_BASE_URL="https://your-app.com"
+```
+
+## 2. Configure emailkit
+
+```ts title="src/emailkit.ts"
+import { EmailKit, MailgunDriver } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    MailgunDriver({
+      id: "mailgun",
+      apiKey: process.env.MAILGUN_API_KEY!,
+      webhookSigningKey: process.env.MAILGUN_WEBHOOK_SIGNING_KEY!,
+      region: process.env.MAILGUN_REGION === "eu" ? "eu" : "us",
+      inboundAttachmentHandling: "stored",
+    }),
+  ],
+  publicRoutes: {
+    baseUrl: process.env.PUBLIC_BASE_URL!,
+  },
+  hooks: {
+    email: {
+      onInbound: async (email) => {
+        await prisma.inboundEmail.upsert({
+          where: { messageId: email.messageId },
+          create: {
+            messageId: email.messageId,
+            from: email.from.email,
+            subject: email.subject,
+            text: email.text,
+          },
+          update: {},
+        });
+      },
+      onBounced: async (event) => {
+        await prisma.suppression.upsert({
+          where: { email: event.recipient },
+          create: { email: event.recipient },
+          update: {},
+        });
+      },
+    },
+  },
+});
+```
+
+The upsert by `messageId` makes retried webhooks harmless.
+
+:::note
+`"stored"` attachment handling needs Mailgun message storage access. Use `"inline"` if your plan doesn't include it. Set `eventsRetentionDays` to your plan's event history so recovery sync knows its coverage.
+:::
+
+## 3. Add the public route
+
+```ts title="app/api/email/[emailDriver]/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit, {
+  emailDriver: async (_request, context) =>
+    (await context.params).emailDriver,
+});
+```
+
+The adapter handles Mailgun's JSON, URL-encoded, and multipart requests, including attachments.
+
+## 4. Add and verify the domain
+
+```ts
+const { domain } = await emailkit.domains.ensure({
+  emailDriver: "mailgun",
+  domain: "mg.example.com",
+});
+
+for (const record of domain.verification?.records ?? []) {
+  console.log(record.type, record.name, record.value, record.priority);
+}
+```
+
+Add the returned records at your DNS host, then:
+
+```ts
+await emailkit.domains.verify({
+  emailDriver: "mailgun",
+  domain: "mg.example.com",
+});
+```
+
+## 5. Let emailkit create the webhooks
+
+After deploying the public route, one call sets up the delivery webhooks and inbound route in Mailgun:
+
+```ts
+await emailkit.domains.webhooks.setup({
+  emailDriver: "mailgun",
+  domain: "mg.example.com",
+  events: ["inbound", "delivered", "opened", "clicked", "bounced", "complained"],
+  inbound: {
+    recipients: ["support@mg.example.com"],
+  },
+});
+```
+
+emailkit fills in the URL from `PUBLIC_BASE_URL`. Be explicit about inbound recipients — use `recipients: "all"` only when you really want a catch-all.
+
+## 6. Send a test email
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "hello@mg.example.com", name: "Acme" },
+  to: { email: "ada@example.com" },
+  subject: "emailkit is connected",
+  text: "This message was sent through Mailgun.",
+  track: { opens: true, clicks: true },
+});
+```
+
+Then send a message to `support@mg.example.com` and watch `onInbound` fire.
+
+## Attachments and recovery
+
+Retrieve inline and stored attachments the same way:
+
+```ts
+const content = await emailkit.attachments.getContent(attachment);
+```
+
+And replay missed events within your plan's retention window:
+
+```ts
+await emailkit.domains.sync({
+  emailDriver: "mailgun",
+  domain: "mg.example.com",
+  since: outageStartedAt,
+});
+```
+
+## Extras
+
+Mailgun also supports templates, scheduling, tags, metadata, sandbox mode, account-level webhooks (`emailkit.webhooks.setup()`), and provider-only endpoints through `providerFetch()`.

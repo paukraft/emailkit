@@ -1,0 +1,143 @@
+---
+title: Receive email and events
+description: One route, one clean event format — emailkit verifies and normalizes every provider webhook.
+sidebar:
+  label: Receiving & events
+  icon: webhooks-logo
+---
+
+Add one public route and pick the events you care about. emailkit verifies each provider request, parses whatever format it arrives in, and calls your hooks with the same clean shape every time.
+
+## Pick your hooks
+
+```ts
+export const emailkit = EmailKit({
+  emailDrivers: [driver],
+  hooks: {
+    email: {
+      onInbound: async (email) => {
+        await prisma.inboundEmail.upsert({
+          where: { messageId: email.messageId },
+          create: {
+            messageId: email.messageId,
+            from: email.from.email,
+            subject: email.subject,
+            text: email.text,
+          },
+          update: {},
+        });
+      },
+      onDelivered: async (event) => {
+        await prisma.sentEmail.updateMany({
+          where: { messageId: event.messageId },
+          data: { status: "delivered" },
+        });
+      },
+      onBounced: async (event) => {
+        await prisma.suppression.upsert({
+          where: { email: event.recipient },
+          create: { email: event.recipient },
+          update: {},
+        });
+      },
+    },
+  },
+});
+```
+
+There's a hook for received and sent mail, deliveries, opens, clicks, bounces, complaints, and rejections — plus `onAll` when you want everything. See the [event reference](/reference/events).
+
+## Add one public route
+
+<Tabs>
+  <Tab title="Next.js">
+
+Use a dynamic route when several drivers share one endpoint:
+
+```ts title="app/api/email/[emailDriver]/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit, {
+  emailDriver: async (_request, context) =>
+    (await context.params).emailDriver,
+});
+```
+
+  </Tab>
+  <Tab title="Any framework">
+
+Pass your framework's request to `emailkit.handler()` in a small, shared format. Here's the whole route in Hono:
+
+```ts title="src/routes/email.ts"
+import { Hono } from "hono";
+import { emailkit } from "../emailkit";
+
+const handleEmail = emailkit.handler();
+
+export const emailRoutes = new Hono().all("/api/email/:emailDriver", async (c) => {
+  const rawBody = await c.req.text();
+  const contentType = c.req.header("content-type") ?? "";
+
+  const response = await handleEmail({
+    method: c.req.method,
+    headers: Object.fromEntries(c.req.raw.headers),
+    query: { ...c.req.query(), emailDriver: c.req.param("emailDriver") },
+    body: contentType.includes("application/json")
+      ? JSON.parse(rawBody)
+      : contentType.includes("application/x-www-form-urlencoded")
+        ? Object.fromEntries(new URLSearchParams(rawBody))
+        : rawBody,
+    rawBody,
+    raw: c.req.raw,
+  });
+
+  return c.body(
+    typeof response.body === "string"
+      ? response.body
+      : response.body !== undefined
+        ? JSON.stringify(response.body)
+        : null,
+    response.status,
+    { ...response.headers },
+  );
+});
+```
+
+The pieces that matter in any framework: pass the unparsed `rawBody` (some providers sign the exact request body), and name the driver via `query.emailDriver` or an `x-emailkit-driver` header. Multipart uploads — Mailgun inbound attachments — additionally need their files read into `{ filename, content }` objects, as the Next.js adapter does.
+
+  </Tab>
+</Tabs>
+
+Then set the public URL emailkit should hand to providers:
+
+```bash title=".env"
+PUBLIC_BASE_URL="https://app.example.com"
+```
+
+Each provider gets `https://app.example.com/api/email/:emailDriverId` by default. A different route? Configure `publicRoutes.route`.
+
+## Get inbound attachments
+
+Providers deliver attachments in wildly different ways — inline, stored, behind signed URLs. Your app retrieves all of them the same way:
+
+```ts
+onInbound: async (email) => {
+  for (const attachment of email.attachments ?? []) {
+    const content =
+      attachment.content ?? (await emailkit.attachments.getContent(attachment));
+
+    await files.save(attachment.filename, content);
+  }
+};
+```
+
+emailkit remembers which provider owns each attachment, so you can fetch the file later without any provider logic.
+
+## Verification is handled
+
+emailkit rejects any webhook it can't verify — Resend and AIInbx signatures, Mailgun signed timestamps, Gmail push tokens, Outlook subscription state. You configure the secret once per driver; there's no verification code to write.
+
+:::warning
+Providers may send the same event more than once. Save received mail by `messageId` and ignore repeated `eventId` values when present.
+:::

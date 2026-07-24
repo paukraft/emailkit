@@ -1,0 +1,50 @@
+---
+import PageLayout from "blume/components/layout/PageLayout.astro";
+import data from "blume:data";
+
+import Capabilities from "../components/home/capabilities.astro";
+import Demo from "../components/home/demo.astro";
+import FinalCta from "../components/home/final-cta.astro";
+import Footer from "../components/home/footer.astro";
+import GetStarted from "../components/home/get-started.astro";
+import Hero from "../components/home/hero.astro";
+import Marquee from "../components/home/marquee.astro";
+import Sponsors from "../components/home/sponsors.astro";
+import UseCases from "../components/home/use-cases.astro";
+
+const { config } = data;
+---
+
+<PageLayout
+  analytics={config.analytics}
+  banner={config.banner}
+  favicon={config.favicon}
+  fontCssVars={data.fontCssVars}
+  logo={config.logo}
+  navigation={{
+    ...data.navigation,
+    tabs: [{ label: "Docs", path: "/introduction" }],
+  }}
+  ogEnabled={config.og.enabled}
+  page={{
+    description: config.description,
+    title: "emailkit — all of email, one intuitive API",
+  }}
+  searchEnabled={config.search.enabled}
+  site={{ title: config.title, description: config.description }}
+  siteUrl={config.site}
+  themeMode={config.theme.mode}
+  ui={data.ui}
+>
+  <div class="lp overflow-x-clip">
+    <Hero />
+    <Marquee />
+    <Capabilities />
+    <Demo />
+    <UseCases />
+    <GetStarted />
+    <Sponsors />
+    <FinalCta />
+  </div>
+  <Footer slot="footer" />
+</PageLayout>

@@ -1,4 +1,8 @@
-# EmailKit
+<p align="center">
+  <img src="https://raw.githubusercontent.com/paukraft/emailkit/main/apps/docs/public/emailkit-logo.png" alt="emailkit" width="96" />
+</p>
+
+# emailkit
 
 Unified email SDK with pluggable drivers (Gmail, Mailgun, Resend, AIInbx, Outlook) and optional Next.js helpers.
 

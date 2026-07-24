@@ -1,0 +1,64 @@
+---
+title: Next.js adapter
+description: Add one Next.js route for provider webhooks, login callbacks, and verification requests.
+sidebar:
+  label: Next.js
+  icon: triangle
+---
+
+The optional `emailkit/nextjs` adapter connects the Next.js App Router to emailkit. It handles request conversion and keeps the exact request body needed to verify provider webhooks.
+
+## Single driver
+
+```ts title="app/api/email/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit);
+```
+
+## Multiple drivers
+
+```ts title="app/api/email/[emailDriver]/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit, {
+  emailDriver: async (_request, context) => {
+    const params = await context.params;
+    return typeof params?.emailDriver === "string"
+      ? params.emailDriver
+      : undefined;
+  },
+});
+```
+
+Set `PUBLIC_BASE_URL=https://app.example.com`. emailkit uses it with `/api/email/:emailDriverId` to create the callback URL for each provider.
+
+## What emailkit handles for you
+
+- Reads JSON, URL-encoded forms, file uploads, and text request bodies.
+- Preserves the exact body needed to verify Resend and AIInbx signatures.
+- Converts Mailgun file uploads to `Uint8Array` content.
+- Selects a provider from route params, the query string, or the `x-emailkit-driver` header.
+- Turns emailkit responses into Next.js responses.
+- Returns a clean `400` response for malformed request bodies.
+
+## Lower-level helpers
+
+Import `toEmailKitRequest` and `toNextResponse` when you need custom routing or middleware:
+
+```ts
+import { toEmailKitRequest, toNextResponse } from "emailkit/nextjs";
+
+const normalized = await toEmailKitRequest(request, {
+  emailDriver: "resend",
+  headers: { "x-request-id": requestId },
+});
+
+return toNextResponse(await emailkit.handler()(normalized));
+```
+
+:::warning
+Do not call `request.json()` before the adapter. Reading the body first prevents emailkit from verifying the exact request.
+:::

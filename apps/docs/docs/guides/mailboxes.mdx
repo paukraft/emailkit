@@ -1,0 +1,144 @@
+---
+title: Connect mailboxes
+description: Let users connect Gmail or Outlook and send and receive through their own inboxes.
+sidebar:
+  icon: tray
+---
+
+Users connect Gmail or Outlook once, then your app sends and receives through their inbox with the exact same emailkit API. emailkit runs the OAuth flow, refreshes tokens, and subscribes to new mail — your app only stores the login when emailkit hands it over.
+
+## Configure the public route
+
+```bash title=".env"
+PUBLIC_BASE_URL="https://app.example.com"
+EMAILKIT_SECRET="a-long-random-application-secret"
+```
+
+Register `https://app.example.com/api/email/gmail` (or `/outlook`) as the OAuth redirect URI in the provider console.
+
+## Set up login storage once
+
+Store the OAuth login when emailkit gives it to you, and load it back in `resolveEmailDriver`. That's the whole contract — getters and setters around one Prisma model:
+
+```prisma title="schema.prisma"
+model ConnectedMailbox {
+  id          String @id @default(cuid())
+  emailDriver String
+  email       String @unique
+  mailbox     Json   // the Mailbox object emailkit hands you
+  auth        String // encrypted OAuth tokens
+  userId      String
+}
+```
+
+```ts
+export const emailkit = EmailKit({
+  emailDrivers: [
+    GmailDriver({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      onAuthUpdated: async ({ mailbox, auth }) => {
+        if (!mailbox?.email) return;
+        await prisma.connectedMailbox.updateMany({
+          where: { email: mailbox.email },
+          data: { auth: encrypt(auth) },
+        });
+      },
+    }),
+  ],
+  resolveEmailDriver: async (context) => {
+    if (context.operation !== "sendEmail") return "gmail";
+
+    const connected = await prisma.connectedMailbox.findUniqueOrThrow({
+      where: { email: context.message.from.email },
+    });
+
+    return {
+      emailDriver: "gmail",
+      mailbox: connected.mailbox,
+      auth: decrypt(connected.auth),
+    };
+  },
+  hooks: {
+    mailbox: {
+      onConnected: async ({ emailDriver, mailbox, auth, context }) => {
+        if (!auth) return;
+        await prisma.connectedMailbox.upsert({
+          where: { email: mailbox.email },
+          create: {
+            emailDriver,
+            email: mailbox.email,
+            mailbox,
+            auth: encrypt(auth),
+            userId: context.userId,
+          },
+          update: { mailbox, auth: encrypt(auth) },
+        });
+      },
+      onAuthUpdated: async ({ mailbox, auth }) => {
+        if (!mailbox?.email) return;
+        await prisma.connectedMailbox.updateMany({
+          where: { email: mailbox.email },
+          data: { auth: encrypt(auth) },
+        });
+      },
+    },
+  },
+});
+```
+
+`encrypt()`/`decrypt()` are two small helpers of yours (Node `crypto`, AES-256-GCM) — the auth holds OAuth tokens, so don't store it readable. Providers refresh logins while sending, syncing, or receiving events; the `updateMany` always replaces the saved value with the newest one.
+
+## Start the connection
+
+```ts
+const connection = await emailkit.mailboxes.connect({
+  emailDriver: "gmail",
+  email: "acme.support@gmail.com",
+  context: { userId: "user_123" },
+});
+
+redirect(connection.redirectUrl!);
+```
+
+The user approves access, emailkit calls `mailbox.onConnected`, and sends them back to your configured page.
+
+## Send through the mailbox
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "acme.support@gmail.com" },
+  to: { email: "customer@example.com" },
+  subject: "How can we help?",
+  text: "Reply directly to this message.",
+});
+```
+
+Nothing mailbox-specific in the call. emailkit finds the inbox from the `from` address, loads its saved login, and sends through the connected account.
+
+## Receive their new mail
+
+Turn on `autoSubscribeInbound` and new messages arrive through your normal `onInbound` hook. emailkit creates the Gmail watch or Outlook subscription right after login:
+
+```ts
+OutlookDriver({
+  clientId,
+  clientSecret,
+  autoSubscribeInbound: true,
+  webhookAuthResolver: async ({ subscriptionId }) => {
+    if (!subscriptionId) return undefined;
+    const webhook = await prisma.emailWebhook.findUnique({
+      where: { providerId: subscriptionId },
+    });
+    if (!webhook) return undefined;
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: webhook.mailboxEmail },
+    });
+    return connected ? decrypt(connected.auth) : undefined;
+  },
+});
+```
+
+Outlook needs nothing else per inbox. Gmail needs one Pub/Sub topic for your whole Google Cloud project — every connected inbox shares it.
+
+The provider guides cover the platform setup and keeping subscriptions alive: [Gmail](/providers/gmail) and [Outlook](/providers/outlook).

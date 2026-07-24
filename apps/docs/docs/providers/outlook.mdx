@@ -1,0 +1,317 @@
+---
+title: Outlook
+description: Connect Microsoft 365 inboxes with OAuth and receive new mail through Graph subscriptions.
+sidebar:
+  icon: /logos/outlook.svg
+---
+
+Use Outlook when users should send and receive through their Microsoft 365 inbox. emailkit handles OAuth, Microsoft Graph messages, change notifications, endpoint validation, and native replies. Your job is one Entra app registration and two Prisma models.
+
+One thing to know up front: Graph subscriptions expire after a few days. emailkit tells you when to renew — you just run a small scheduled job.
+
+## 1. Configure Microsoft Entra
+
+Create an app registration:
+
+1. Add `https://your-app.com/api/email/outlook` as a **Web** redirect URI.
+2. Create a client secret.
+3. Add the delegated Graph permissions `offline_access`, `User.Read`, `Mail.Send`, and `Mail.Read`.
+4. Add `Mail.ReadWrite` for native threaded replies (used with `sendEmailMode: "draft"`).
+
+```bash title=".env"
+EMAILKIT_SECRET="a-long-random-application-secret"
+PUBLIC_BASE_URL="https://your-app.com"
+OUTLOOK_CLIENT_ID="..."
+OUTLOOK_CLIENT_SECRET="..."
+OUTLOOK_WEBHOOK_CLIENT_STATE="another-long-random-secret"
+```
+
+`EMAILKIT_SECRET` signs the OAuth callback state; `OUTLOOK_WEBHOOK_CLIENT_STATE` is stamped on Graph subscriptions and verified on every notification. Use two different secrets.
+
+## 2. Add the two models
+
+One row per connected inbox, one row per Graph subscription. The `mailboxEmail` link matters: Graph notifications identify themselves by subscription ID, and that's how you find the inbox's auth.
+
+```prisma title="schema.prisma"
+model ConnectedMailbox {
+  id          String @id @default(cuid())
+  emailDriver String
+  email       String @unique
+  mailbox     Json   // the Mailbox object emailkit hands you
+  auth        String // encrypted OAuth tokens
+  userId      String
+}
+
+model EmailWebhook {
+  id           String    @id @default(cuid())
+  providerId   String    @unique // the Graph subscription ID
+  mailboxEmail String
+  expiresAt    DateTime?
+  renewAfter   DateTime?
+
+  @@index([renewAfter])
+}
+```
+
+`encrypt()`/`decrypt()` in the examples are two small helpers of yours — the auth column holds OAuth tokens, so don't store it readable ([Connect mailboxes](/guides/mailboxes) covers them).
+
+## 3. Configure emailkit
+
+```ts title="src/emailkit.ts"
+import { EmailKit, OutlookDriver, isOutlookAuth } from "emailkit";
+import { prisma } from "./db";
+import { encrypt, decrypt } from "./crypto";
+
+const saveWebhook = async ({ webhook, target }) => {
+  if (!webhook?.providerId || !target?.mailboxEmail) return;
+
+  await prisma.emailWebhook.upsert({
+    where: { providerId: webhook.providerId },
+    create: {
+      providerId: webhook.providerId,
+      mailboxEmail: target.mailboxEmail,
+      expiresAt: webhook.expiresAt,
+      renewAfter: webhook.renewAfter,
+    },
+    update: {
+      expiresAt: webhook.expiresAt,
+      renewAfter: webhook.renewAfter,
+    },
+  });
+};
+
+const outlook = OutlookDriver({
+  id: "outlook",
+  clientId: process.env.OUTLOOK_CLIENT_ID!,
+  clientSecret: process.env.OUTLOOK_CLIENT_SECRET!,
+  scopes: [
+    "offline_access",
+    "User.Read",
+    "Mail.Send",
+    "Mail.Read",
+    "Mail.ReadWrite",
+  ],
+  sendEmailMode: "draft",
+  autoSubscribeInbound: true,
+  autoRenewOnLifecycle: true,
+  webhookClientState: process.env.OUTLOOK_WEBHOOK_CLIENT_STATE!,
+  webhookAuthResolver: async ({ subscriptionId }) => {
+    if (!subscriptionId) return undefined;
+
+    const record = await prisma.emailWebhook.findUnique({
+      where: { providerId: subscriptionId },
+    });
+    if (!record) return undefined;
+
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: record.mailboxEmail },
+    });
+    if (!connected) return undefined;
+
+    const auth = decrypt(connected.auth);
+    return isOutlookAuth(auth) ? auth : undefined;
+  },
+});
+
+export const emailkit = EmailKit({
+  emailDrivers: [outlook],
+  secret: process.env.EMAILKIT_SECRET!,
+  publicRoutes: {
+    baseUrl: process.env.PUBLIC_BASE_URL!,
+    connectLandingRoutes: {
+      success: "/settings/email?connected=true",
+      failure: "/settings/email?connected=false",
+    },
+  },
+  resolveEmailDriver: async (context) => {
+    if (context.operation !== "sendEmail") return "outlook";
+
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: context.message.from.email },
+    });
+    if (!connected) throw new Error("Outlook mailbox is not connected");
+
+    return {
+      emailDriver: "outlook",
+      mailbox: connected.mailbox,
+      auth: decrypt(connected.auth),
+    };
+  },
+  hooks: {
+    mailbox: {
+      onConnected: async ({ emailDriver, mailbox, auth, context }) => {
+        if (!auth) return;
+        await prisma.connectedMailbox.upsert({
+          where: { email: mailbox.email },
+          create: {
+            emailDriver,
+            email: mailbox.email,
+            mailbox,
+            auth: encrypt(auth),
+            userId: context.userId,
+          },
+          update: { mailbox, auth: encrypt(auth) },
+        });
+      },
+      onAuthUpdated: async ({ mailbox, auth }) => {
+        if (!mailbox?.email) return;
+        await prisma.connectedMailbox.updateMany({
+          where: { email: mailbox.email },
+          data: { auth: encrypt(auth) },
+        });
+      },
+    },
+    webhook: {
+      onCreated: saveWebhook,
+      onUpdated: saveWebhook,
+      onSyncRequired: async (event) => {
+        // a notification gap — run emailkit.mailboxes.sync() for this mailbox
+        await queueMailboxSync(event);
+      },
+    },
+    email: {
+      onInbound: async (email) => {
+        await prisma.inboundEmail.upsert({
+          where: { messageId: email.messageId },
+          create: {
+            messageId: email.messageId,
+            from: email.from.email,
+            subject: email.subject,
+            text: email.text,
+          },
+          update: {},
+        });
+      },
+    },
+  },
+});
+```
+
+Outlook may refresh tokens while sending, syncing, or handling a notification. The `updateMany` on `onAuthUpdated` always replaces the saved auth with the newest value.
+
+## 4. Add the public route
+
+```ts title="app/api/email/[emailDriver]/route.ts"
+import { createNextEmailKitHandler } from "emailkit/nextjs";
+import { emailkit } from "@/src/emailkit";
+
+export const { GET, POST } = createNextEmailKitHandler(emailkit, {
+  emailDriver: async (_request, context) =>
+    (await context.params).emailDriver,
+});
+```
+
+The `GET` handler answers Microsoft's endpoint validation challenge; the `POST` handler verifies `clientState`, fetches the full message, and calls your hooks.
+
+## 5. Connect an Outlook inbox
+
+Call this from a protected server action, passing your own user or workspace ID as `context`:
+
+```ts
+const connection = await emailkit.mailboxes.connect({
+  emailDriver: "outlook",
+  email: "acme.support@outlook.com",
+  context: { userId: user.id },
+});
+
+redirect(connection.redirectUrl!);
+```
+
+The user approves access, and emailkit exchanges the tokens, creates the Graph subscription, and calls `mailbox.onConnected` and `webhook.onCreated`. New mail now arrives in your `onInbound` hook.
+
+## 6. Send and reply
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "acme.support@outlook.com" },
+  to: { email: "customer@example.com" },
+  subject: "How can we help?",
+  text: "Reply directly to this message.",
+});
+```
+
+Replies use the same call — emailkit runs Graph's native reply flow behind it, so the message lands in the recipient's existing thread:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "acme.support@outlook.com" },
+  to: inbound.from,
+  subject: `Re: ${inbound.subject}`,
+  text: "We are looking into this.",
+  reply: { messageId: inbound.messageId },
+});
+```
+
+## 7. Renew subscriptions on a schedule
+
+Graph subscriptions expire. emailkit saves `renewAfter` on every webhook it creates — run a job (hourly is plenty) that refreshes the due ones:
+
+```ts title="src/jobs/renew-outlook-webhooks.ts"
+export const renewOutlookWebhooks = async () => {
+  const due = await prisma.emailWebhook.findMany({
+    where: { renewAfter: { lte: new Date() } },
+  });
+
+  for (const record of due) {
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: record.mailboxEmail },
+    });
+    if (!connected) continue;
+
+    const auth = decrypt(connected.auth);
+    if (!isOutlookAuth(auth)) continue;
+
+    await emailkit.mailboxes.webhooks.refresh({
+      emailDriver: "outlook",
+      providerId: record.providerId,
+      mailbox: connected.mailbox,
+      auth,
+    });
+  }
+};
+```
+
+Each refresh calls your `webhook.onUpdated` hook (and `mailbox.onAuthUpdated` if tokens were refreshed too), so everything stays saved automatically. Lifecycle notifications with `autoRenewOnLifecycle` add extra protection, but the scheduled job is the reliable path.
+
+## If notifications ever slip
+
+When Microsoft reports missed notifications or a subscription lapses, emailkit calls `webhook.onSyncRequired` — recover with a mailbox sync from your last safe time:
+
+```ts
+const connected = await prisma.connectedMailbox.findUnique({
+  where: { email: mailboxEmail },
+});
+
+await emailkit.mailboxes.sync({
+  emailDriver: "outlook",
+  mailbox: connected!.mailbox,
+  auth: decrypt(connected!.auth),
+  since: lastSuccessfulInboundAt,
+});
+```
+
+Recovered messages run through the same `onInbound` hook.
+
+## Disconnect cleanly
+
+Delete the Graph subscription before removing the stored auth:
+
+```ts
+const record = await prisma.emailWebhook.findFirst({
+  where: { mailboxEmail },
+});
+const connected = await prisma.connectedMailbox.findUnique({
+  where: { email: mailboxEmail },
+});
+
+if (record && connected) {
+  await emailkit.mailboxes.webhooks.delete({
+    emailDriver: "outlook",
+    providerId: record.providerId,
+    mailbox: connected.mailbox,
+    auth: decrypt(connected.auth),
+  });
+}
+
+await prisma.connectedMailbox.delete({ where: { email: mailboxEmail } });
+```

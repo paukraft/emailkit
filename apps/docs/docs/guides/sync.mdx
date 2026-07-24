@@ -1,0 +1,88 @@
+---
+title: Recover missed events
+description: Replay missed provider events through your existing hooks with sync().
+sidebar:
+  label: Sync & recovery
+  icon: arrows-clockwise
+---
+
+Server was down? Webhook never arrived? `sync()` asks the provider for the events from that window and runs them through your existing hooks, oldest first. No separate recovery code path — the same hooks handle live and replayed events.
+
+<CodeGroup>
+
+```ts Account
+const result = await emailkit.sync({
+  emailDriver: "resend",
+  since: outageStartedAt,
+});
+```
+
+```ts Domain
+const result = await emailkit.domains.sync({
+  emailDriver: "mailgun",
+  domain: "mg.example.com",
+  since: outageStartedAt,
+});
+```
+
+```ts Mailbox
+const result = await emailkit.mailboxes.sync({
+  emailDriver: "outlook",
+  mailbox,
+  auth,
+  since: outageStartedAt,
+});
+```
+
+</CodeGroup>
+
+The result tells you how many events were replayed and `syncedFrom` — how far back the provider could actually look. Pass `until` to limit the range and `signal` to cancel a long sync.
+
+## Replays are safe by design
+
+Sync can deliver events your app already saw. The same rules that make webhooks safe make sync safe:
+
+- Save received mail by `messageId` so an existing message updates instead of duplicating.
+- Ignore repeated `eventId` values when present.
+- Pass a `context` flag to skip side effects you don't want during recovery, like auto-replies:
+
+```ts
+await emailkit.sync({
+  emailDriver: "aiinbx",
+  since,
+  context: { replay: true },
+});
+```
+
+## Continue after a failure
+
+If one of your hooks throws mid-sync, emailkit tells you where to pick up:
+
+```ts
+import { EmailKitSyncError } from "emailkit";
+
+try {
+  await emailkit.sync({ emailDriver: "resend", since });
+} catch (error) {
+  if (error instanceof EmailKitSyncError) {
+    await emailkit.sync({
+      emailDriver: "resend",
+      since: error.lastEventTimestamp ?? since,
+    });
+  }
+}
+```
+
+## What each provider can replay
+
+| Provider | Scope             | Recoverable history                          |
+| -------- | ----------------- | -------------------------------------------- |
+| Resend   | Account           | Inbound email                                |
+| AIInbx   | Account           | Inbound email                                |
+| Mailgun  | Account or domain | Inbound and tracking events within retention |
+| Gmail    | Mailbox           | Inbound mailbox history                      |
+| Outlook  | Mailbox           | Received mailbox messages                    |
+
+:::note
+Sync is a backup for webhooks, not a replacement — providers only keep events for so long.
+:::

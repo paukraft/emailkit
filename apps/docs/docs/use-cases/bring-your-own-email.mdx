@@ -1,0 +1,210 @@
+---
+title: Let users bring their own email
+description: Users connect their own domain or their Gmail/Outlook — your app sends as them through one API.
+sidebar:
+  label: Users bring their email
+  icon: users
+---
+
+Building an email agent platform, a CRM, an outreach tool? Your users want mail to come from *their* address, not yours. Some will connect a whole domain, others will sign into their Gmail or Outlook. emailkit makes both look identical to the rest of your app.
+
+## The shape
+
+Two tables in your database answer the only routing question that exists — "how is this address connected?":
+
+```prisma title="schema.prisma"
+model Domain {
+  id          String  @id @default(cuid())
+  domain      String  @unique
+  emailDriver String
+  verified    Boolean @default(false)
+  userId      String
+}
+
+model ConnectedMailbox {
+  id          String @id @default(cuid())
+  emailDriver String
+  email       String @unique
+  mailbox     Json   // the Mailbox object emailkit hands you
+  auth        String // encrypted OAuth tokens
+  userId      String
+}
+```
+
+`resolveEmailDriver` is just a lookup in those tables. That's the entire routing logic — no address parsing, no special cases:
+
+```ts title="src/emailkit.ts"
+import { EmailKit, GmailDriver, OutlookDriver, ResendDriver } from "emailkit";
+import { prisma } from "./db";
+import { encrypt, decrypt } from "./crypto";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({
+      id: "resend",
+      apiKey: process.env.RESEND_API_KEY!,
+      webhookSecret: process.env.RESEND_WEBHOOK_SECRET!,
+    }),
+    GmailDriver({
+      id: "gmail",
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+    OutlookDriver({
+      id: "outlook",
+      clientId: process.env.OUTLOOK_CLIENT_ID!,
+      clientSecret: process.env.OUTLOOK_CLIENT_SECRET!,
+    }),
+  ],
+  resolveEmailDriver: async (context) => {
+    // Mailbox and domain calls name their driver explicitly ({ emailDriver: "gmail" }),
+    // so this resolver only routes sends — anything else falls back to the API driver.
+    if (context.operation !== "sendEmail") return "resend";
+
+    const from = context.message.from.email.toLowerCase();
+
+    // Their own inbox — sends through their connected account
+    const connected = await prisma.connectedMailbox.findUnique({
+      where: { email: from },
+    });
+    if (connected) {
+      return {
+        emailDriver: connected.emailDriver, // "gmail" or "outlook"
+        mailbox: connected.mailbox,
+        auth: decrypt(connected.auth),
+      };
+    }
+
+    // Their own domain — sends through your email API account
+    const domain = await prisma.domain.findUnique({
+      where: { domain: from.split("@")[1] },
+    });
+    if (domain?.verified) return domain.emailDriver;
+
+    throw new Error(`${from} is not connected`);
+  },
+});
+```
+
+`encrypt()`/`decrypt()` are two small helpers of yours — the auth column holds OAuth tokens, so don't store it readable ([Connect mailboxes](/guides/mailboxes) covers them).
+
+## Way in #1: they connect a domain
+
+The user owns `acme.com` and wants to send as `agent@acme.com` through your provider account. Create the domain, show them the DNS records, verify:
+
+```ts
+await prisma.domain.create({
+  data: { domain: "acme.com", emailDriver: "resend", userId: user.id },
+});
+
+const { domain } = await emailkit.domains.ensure({
+  emailDriver: "resend",
+  domain: "acme.com",
+});
+
+// render domain.verification.records in your UI, then poll:
+const { status } = await emailkit.domains.verify({
+  emailDriver: "resend",
+  domain: "acme.com",
+});
+
+if (status === "verified") {
+  await prisma.domain.update({
+    where: { domain: "acme.com" },
+    data: { verified: true },
+  });
+}
+```
+
+## Way in #2: they connect their inbox
+
+The user clicks "Connect Gmail" and signs in. emailkit runs the OAuth flow and hands you what to save:
+
+```ts
+const { redirectUrl } = await emailkit.mailboxes.connect({
+  emailDriver: "gmail",
+  email: userProvidedEmail,
+  context: { userId: user.id },
+});
+
+redirect(redirectUrl!);
+```
+
+```ts
+hooks: {
+  mailbox: {
+    onConnected: async ({ emailDriver, mailbox, auth, context }) => {
+      await prisma.connectedMailbox.upsert({
+        where: { email: mailbox.email },
+        create: {
+          emailDriver,
+          email: mailbox.email,
+          mailbox,
+          auth: encrypt(auth),
+          userId: context.userId,
+        },
+        update: { mailbox, auth: encrypt(auth) },
+      });
+    },
+    onAuthUpdated: async ({ mailbox, auth }) => {
+      if (!mailbox?.email) return;
+      await prisma.connectedMailbox.updateMany({
+        where: { email: mailbox.email },
+        data: { auth: encrypt(auth) },
+      });
+    },
+  },
+},
+```
+
+Same flow for Outlook — only the `emailDriver` differs. Details, including keeping inbound subscriptions alive, in [Gmail](/providers/gmail) and [Outlook](/providers/outlook).
+
+## Now sending is identical everywhere
+
+Your agent, your campaign runner, your notification code — none of it knows or cares how the address is connected:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "sara@brightco.io" },
+  to: { email: "lead@example.com" },
+  subject: "Following up",
+  text: "Hi! Just checking in on last week's demo.",
+});
+```
+
+The resolver looks up `sara@brightco.io`, finds a Gmail connection, and the message goes out from her real inbox — threaded, in her sent folder.
+
+## Receiving stays unified too
+
+Replies to a connected Gmail, a connected Outlook, and a connected domain all arrive in the same `onInbound` hook. Route them to the right user with the same two tables:
+
+```ts
+hooks: {
+  email: {
+    onInbound: async (email) => {
+      const to = email.to[0].email.toLowerCase();
+
+      const owner =
+        (await prisma.connectedMailbox.findUnique({ where: { email: to } })) ??
+        (await prisma.domain.findUnique({
+          where: { domain: to.split("@")[1] },
+        }));
+      if (!owner) return;
+
+      await prisma.inboundEmail.upsert({
+        where: { messageId: email.messageId },
+        create: {
+          messageId: email.messageId,
+          userId: owner.userId,
+          from: email.from.email,
+          subject: email.subject,
+          text: email.text,
+        },
+        update: {},
+      });
+    },
+  },
+},
+```
+
+This is the whole pattern: two tables, one resolver, one send call, one inbound hook — for every way your users bring their email.

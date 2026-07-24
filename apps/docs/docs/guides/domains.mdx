@@ -1,0 +1,85 @@
+---
+title: Manage domains
+description: Add and verify sending domains through one API across Resend, Mailgun, and AIInbx.
+sidebar:
+  icon: globe
+---
+
+Add, verify, and remove sending domains without learning each provider's domain API. Same methods, same status values, everywhere.
+
+## Ensure a domain exists
+
+`ensure()` returns the domain if it exists or creates it if it doesn't — safe to call as often as you like:
+
+```ts
+const { domain, created } = await emailkit.domains.ensure({
+  emailDriver: "resend",
+  domain: "mail.example.com",
+  context: { workspaceId: "ws_123" },
+});
+
+console.log(domain.status, created);
+```
+
+## Show the DNS records to your users
+
+```ts
+const domain = await emailkit.domains.get({
+  emailDriver: "resend",
+  domain: "mail.example.com",
+});
+
+for (const record of domain.verification?.records ?? []) {
+  console.log(record.type, record.name, record.value, record.purpose);
+}
+```
+
+`get()` throws when the domain doesn't exist; use `getOrNull()` when missing is expected.
+
+## Check verification
+
+```ts
+const { status } = await emailkit.domains.verify({
+  emailDriver: "resend",
+  domain: "mail.example.com",
+});
+
+if (status === "verified") {
+  await enableSending();
+}
+```
+
+Status is always one of `pending`, `verified`, `unverified`, `disabled`, or `unknown` — no provider-specific states to map.
+
+## React when a domain changes
+
+```ts
+hooks: {
+  domain: {
+    onVerified: async ({ domain }) => {
+      await prisma.domain.update({
+        where: { domain: domain.domain },
+        data: { verified: true },
+      });
+    },
+    onDeleted: async ({ domain }) => {
+      if (!domain?.domain) return;
+      await prisma.domain.deleteMany({ where: { domain: domain.domain } });
+    },
+  },
+}
+```
+
+`context` carries your tenant or workspace ID through the operation and back to your hook — emailkit never sends it to the provider.
+
+## Provider differences
+
+| Capability        | Resend | Mailgun | AIInbx |
+| ----------------- | :----: | :-----: | :----: |
+| List, create, get |   ✓    |    ✓    |   ✓    |
+| Update            |   ✓    |    ✓    |   —    |
+| Verify, delete    |   ✓    |    ✓    |   ✓    |
+| Domain webhooks   |   —    |    ✓    |   —    |
+| Domain sync       |   —    |    ✓    |   —    |
+
+Domain methods only appear when a configured provider supports them. Pass a domain name or its provider ID — emailkit finds the right record either way.

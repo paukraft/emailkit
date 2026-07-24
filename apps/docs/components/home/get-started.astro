@@ -1,0 +1,151 @@
+---
+import CodeBlock from "blume/components/content/CodeBlock.astro";
+import Tab from "blume/components/content/Tab.astro";
+import Tabs from "blume/components/content/Tabs.astro";
+import { highlightCode } from "blume/markdown";
+
+import Slashes from "./slashes.astro";
+
+const INSTALL = [
+  { code: "npm install emailkit", label: "npm" },
+  { code: "pnpm add emailkit", label: "pnpm" },
+  { code: "bun add emailkit", label: "bun" },
+  { code: "yarn add emailkit", label: "yarn" },
+];
+const installTabs = await Promise.all(
+  INSTALL.map(async (i) => ({
+    html: await highlightCode(i.code, "bash", { icons: false }),
+    label: i.label,
+  }))
+);
+
+const FIRST_SEND = `import { EmailKit, ResendDriver } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [
+    ResendDriver({ apiKey: process.env.RESEND_API_KEY! }),
+  ],
+});
+
+await emailkit.sendEmail({
+  from: { email: "hello@acme.dev", name: "Acme" },
+  to: { email: "ada@example.com" },
+  subject: "Welcome",
+  text: "Your account is ready.",
+});`;
+
+const RECEIVE = `export const emailkit = EmailKit({
+  emailDrivers: [/* ... */],
+  hooks: {
+    email: { onInbound: async (email) => saveToInbox(email) },
+  },
+});
+
+// app/api/email/route.ts
+export const { GET, POST } = createNextEmailKitHandler(emailkit);`;
+---
+
+<section class="border-border border-t bg-muted">
+  <div class="mx-auto max-w-6xl px-6 py-24">
+    <p class="section-eyebrow flex items-center gap-3">
+      <Slashes />
+      Setup
+    </p>
+    <h2
+      class="mt-4 font-display font-bold text-4xl text-foreground uppercase italic leading-[0.95] tracking-tight sm:text-6xl"
+    >
+      Install. Send. <span class="text-accent">Receive.</span>
+    </h2>
+    <p
+      class="mt-6 max-w-[56ch] text-pretty text-base text-muted-foreground leading-relaxed sm:text-lg"
+    >
+      Your first send takes a minute. Inbound isn't much more.
+    </p>
+
+    <div class="mt-16 flex flex-col gap-16 sm:gap-20">
+      <div class="grid items-center gap-6 lg:grid-cols-5 lg:gap-12">
+        <div class="lg:col-span-2">
+          <div class="flex items-baseline gap-4">
+            <span
+              class="lp-outline font-display font-bold text-5xl italic leading-none"
+            >
+              01
+            </span>
+            <h3
+              class="font-display font-bold text-2xl text-foreground uppercase italic tracking-tight"
+            >
+              Install
+            </h3>
+          </div>
+          <p class="mt-3 text-muted-foreground text-sm leading-relaxed">
+            One package, every driver included — providers are config, not
+            extra dependencies. Node.js 20.19 or newer.
+          </p>
+        </div>
+        <div class="min-w-0 lg:col-span-3">
+          <Tabs hash={false} sync={false}>
+            {
+              installTabs.map((tab) => (
+                <Tab class="prose flush-code max-w-none" title={tab.label}>
+                  <Fragment set:html={tab.html} />
+                </Tab>
+              ))
+            }
+          </Tabs>
+        </div>
+      </div>
+
+      <div class="grid items-center gap-6 lg:grid-cols-5 lg:gap-12">
+        <div class="lg:col-span-2">
+          <div class="flex items-baseline gap-4">
+            <span
+              class="lp-outline font-display font-bold text-5xl italic leading-none"
+            >
+              02
+            </span>
+            <h3
+              class="font-display font-bold text-2xl text-foreground uppercase italic tracking-tight"
+            >
+              Send
+            </h3>
+          </div>
+          <p class="mt-3 text-muted-foreground text-sm leading-relaxed">
+            Construct the client with a driver and send. More drivers later
+            won't touch this call site.
+          </p>
+        </div>
+        <div class="min-w-0 lg:col-span-3">
+          <CodeBlock code={FIRST_SEND} icons={false} lang="ts" />
+        </div>
+      </div>
+
+      <div class="grid items-center gap-6 lg:grid-cols-5 lg:gap-12">
+        <div class="lg:col-span-2">
+          <div class="flex items-baseline gap-4">
+            <span
+              class="lp-outline font-display font-bold text-5xl italic leading-none"
+            >
+              03
+            </span>
+            <h3
+              class="font-display font-bold text-2xl text-foreground uppercase italic tracking-tight"
+            >
+              Receive
+            </h3>
+          </div>
+          <p class="mt-3 text-muted-foreground text-sm leading-relaxed">
+            Add a hook, mount the route, point your provider's webhook at it —
+            inbound email and delivery events arrive verified and normalized.
+            The <a
+              class="text-foreground underline-offset-4 hover:underline"
+              href="/quickstart">quickstart</a
+            > walks through mailboxes and domains too.
+          </p>
+        </div>
+        <div class="min-w-0 lg:col-span-3">
+          <CodeBlock code={RECEIVE} icons={false} lang="ts" />
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

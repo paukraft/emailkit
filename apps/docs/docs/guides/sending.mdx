@@ -1,0 +1,107 @@
+---
+title: Send email
+description: One message format for every provider — attachments, replies, scheduling included.
+sidebar:
+  label: Sending
+  icon: paper-plane-tilt
+---
+
+The same message object sends through Resend, Mailgun, Gmail, Outlook, or AIInbx. emailkit builds the provider-specific request behind the scenes.
+
+## Send a message
+
+```ts
+const result = await emailkit.sendEmail({
+  from: { email: "hello@example.com", name: "Acme" },
+  to: [
+    { email: "ada@example.com", name: "Ada" },
+    { email: "grace@example.com", name: "Grace" },
+  ],
+  subject: "Quarterly update",
+  text: "The report is attached.",
+  html: "<p>The report is <strong>attached</strong>.</p>",
+});
+
+console.log(result.messageId, result.provider);
+```
+
+Include a text body, an HTML body, or both. The result always tells you which provider sent it and the message ID to save.
+
+## Attach files
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "reports@example.com" },
+  to: { email: "ada@example.com" },
+  subject: "Your report",
+  text: "Attached.",
+  attachments: [
+    {
+      filename: "report.pdf",
+      content: reportBytes,
+      contentType: "application/pdf",
+    },
+  ],
+});
+```
+
+Pass content directly, or a URL when your provider supports it.
+
+## Reply in the same thread
+
+Take the `reply` details from a received email and send. emailkit produces the right threading for each provider — including Outlook's native reply flow, which it runs for you behind the same `sendEmail()` call.
+
+```ts
+onInbound: async (inbound) => {
+  await emailkit.sendEmail({
+    from: { email: "support@example.com" },
+    to: inbound.from,
+    subject: `Re: ${inbound.subject}`,
+    text: "Thanks — we received your message.",
+    reply: {
+      messageId: inbound.messageId,
+      references: inbound.reply.references,
+      threadId: inbound.reply.threadId,
+    },
+  });
+},
+```
+
+## Use provider extras
+
+Scheduling, templates, tracking, tags, duplicate-send protection — they appear in TypeScript when your provider supports them:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "hello@example.com" },
+  to: { email: "ada@example.com" },
+  subject: "Tomorrow's reminder",
+  text: "Your meeting starts at 10:00.",
+  sendAt: new Date("2026-07-16T08:00:00Z"),
+  idempotencyKey: "meeting-reminder-42",
+  sender: { emailDriver: "resend" },
+});
+```
+
+With several providers configured, add `sender.emailDriver` when a message needs a feature only one of them has.
+
+## Send from a connected mailbox
+
+Set up the mailbox lookup once in `resolveEmailDriver` (see [Connect mailboxes](/guides/mailboxes)), and every send call stays this simple:
+
+```ts
+await emailkit.sendEmail({
+  from: { email: "acme.support@gmail.com" },
+  to: { email: "customer@example.com" },
+  subject: "From the support inbox",
+  text: "This message appears in the connected mailbox.",
+});
+```
+
+emailkit finds the inbox from the `from` address and sends through it.
+
+## Abort a send
+
+```ts
+await emailkit.sendEmail(message, { signal: request.signal });
+```

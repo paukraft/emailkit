@@ -1,0 +1,104 @@
+---
+title: Your app's entire email layer, in one client
+description: One central client for providers, webhooks, and mailboxes — and one clean TypeScript API for everything email.
+sidebar:
+  label: Introduction
+  icon: envelope
+  order: 1
+---
+
+emailkit is your app's entire email layer in one client — like Prisma for your database or Better Auth for auth. Providers, webhooks, and mailboxes are all configured in one place, and sending, receiving, and every lifecycle event go through one clean API, no matter which providers you pick.
+
+```package-install
+emailkit
+```
+
+```ts title="emailkit.ts"
+import { EmailKit, ResendDriver } from "emailkit";
+
+export const emailkit = EmailKit({
+  emailDrivers: [ResendDriver({ apiKey: process.env.RESEND_API_KEY! })],
+});
+
+await emailkit.sendEmail({
+  from: { email: "hello@example.com", name: "Acme" },
+  to: { email: "ada@example.com" },
+  subject: "Welcome",
+  text: "Your account is ready.",
+});
+```
+
+That's the whole setup.
+
+## The cool parts
+
+**Everything email lives in the client.** Webhook handling isn't a pile of route files and provider dashboards — it's config on the same client. emailkit verifies and normalizes every event, then calls your hooks; the route itself is one line:
+
+```ts
+export const emailkit = EmailKit({
+  emailDrivers: [driver],
+  hooks: {
+    email: {
+      onInbound: async (email) => saveToInbox(email),
+      onDelivered: async (event) => markDelivered(event.messageId),
+      onBounced: async (event) => suppress(event.recipient),
+    },
+  },
+});
+
+// app/api/email/route.ts — the whole route
+export const { GET, POST } = createNextEmailKitHandler(emailkit);
+```
+
+**Email APIs and mailboxes, same client.** Transactional APIs like Resend, Mailgun, and AIInbx sit next to real inboxes like Gmail and Outlook. Mix them freely and route by sender — the rest of your app never knows the difference.
+
+**Users connect their inbox — or their whole domain.** Gmail and Outlook OAuth, token refresh, and inbound notifications are handled for you; so are DNS records and domain verification on your email API. Each is a couple of calls:
+
+```ts
+// their inbox
+const { redirectUrl } = await emailkit.mailboxes.connect({
+  emailDriver: "gmail",
+  email: "acme.support@gmail.com",
+});
+
+// or their domain
+const { domain } = await emailkit.domains.ensure({
+  emailDriver: "resend",
+  domain: "acme.com",
+});
+```
+
+**Replies stay threaded.** Pass the reply details from an inbound email and emailkit produces the right thread format for whichever provider sends it.
+
+**Missed a webhook? Replay it.** `sync()` asks the provider for the events you missed and runs them through your existing hooks.
+
+**TypeScript knows your providers.** Configure Resend and `sendAt` appears. Configure Gmail and mailbox methods appear. Use a feature your provider doesn't have, and your code doesn't compile.
+
+**Nothing new to run.** emailkit is a library, not a platform. No queue, no required database schema, no second copy of your data. It calls providers and tells your app what happened — your database stays the source of truth.
+
+## What are you building?
+
+<CardGroup cols={2}>
+  <Card
+    title="Users bring their own email"
+    href="/use-cases/bring-your-own-email"
+    icon="users"
+  >
+    AI email support, CRMs, outreach — users connect their domain or their
+    Gmail/Outlook; your app reads, replies, and sends as them.
+  </Card>
+  <Card title="Email from your app" href="/use-cases/app-email" icon="paper-plane-tilt">
+    Welcome emails, notifications, receipts — one driver, a few lines, no
+    boilerplate.
+  </Card>
+</CardGroup>
+
+Or jump straight in: the [Quickstart](/quickstart) has you sending in a few minutes.
+
+:::note
+Need something only one provider offers? `providerFetch()` calls its API with your configured credentials, so you never give up the simple API everywhere else.
+:::
+
+<Card title="How it works" href="/concepts" icon="stack">
+  The few ideas behind emailkit, in five minutes.
+</Card>
