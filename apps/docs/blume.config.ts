@@ -138,8 +138,21 @@ export default defineConfig({
   ai: {
     llmsTxt: true,
   },
+  deployment: {
+    site: "https://emailkit.paukraft.com",
+  },
   seo: {
-    og: { enabled: false },
+    og: {
+      enabled: true,
+      logo: "/emailkit-og-mark.svg",
+      palette: {
+        accent: "#2fa8ff",
+        background: "#0a0a0a",
+        foreground: "#fafafa",
+        muted: "#a3a3a3",
+        border: "#262626",
+      },
+    },
     sitemap: false,
     robots: true,
     structuredData: true,
