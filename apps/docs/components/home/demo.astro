@@ -8,31 +8,31 @@ const DEMO = [
   {
     config: `ResendDriver({ apiKey: process.env.RESEND_API_KEY! })`,
     from: `{ email: "hello@acme.dev", name: "Acme" }`,
-    import: `import { EmailKit, ResendDriver } from "emailkit";`,
+    import: `import { EmailKit, ResendDriver } from "emailkit"`,
     label: "Resend",
   },
   {
     config: `MailgunDriver({ apiKey: process.env.MAILGUN_API_KEY! })`,
     from: `{ email: "hello@acme.dev", name: "Acme" }`,
-    import: `import { EmailKit, MailgunDriver } from "emailkit";`,
+    import: `import { EmailKit, MailgunDriver } from "emailkit"`,
     label: "Mailgun",
   },
   {
     config: `AIInbxDriver({ apiKey: process.env.AIINBX_API_KEY! })`,
     from: `{ email: "hello@acme.dev", name: "Acme" }`,
-    import: `import { AIInbxDriver, EmailKit } from "emailkit";`,
+    import: `import { AIInbxDriver, EmailKit } from "emailkit"`,
     label: "AIInbx",
   },
   {
     config: `GmailDriver({ clientId: googleId, clientSecret: googleSecret })`,
     from: `{ email: "acme.support@gmail.com" }`,
-    import: `import { EmailKit, GmailDriver } from "emailkit";`,
+    import: `import { EmailKit, GmailDriver } from "emailkit"`,
     label: "Gmail",
   },
   {
     config: `OutlookDriver({ clientId: msId, clientSecret: msSecret })`,
     from: `{ email: "acme.support@outlook.com" }`,
-    import: `import { EmailKit, OutlookDriver } from "emailkit";`,
+    import: `import { EmailKit, OutlookDriver } from "emailkit"`,
     label: "Outlook",
   },
 ];
@@ -41,14 +41,14 @@ const code = (p: (typeof DEMO)[number]) => `${p.import}
 
 const emailkit = EmailKit({
   emailDrivers: [${p.config}],
-});
+})
 
 await emailkit.sendEmail({
   from: ${p.from},
   to: { email: "ada@example.com" },
   subject: "Welcome",
   text: "Your account is ready.",
-});`;
+})`;
 
 const panels = await Promise.all(
   DEMO.map(async (p) => ({

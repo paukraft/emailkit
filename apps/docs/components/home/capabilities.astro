@@ -17,10 +17,10 @@ const CAPABILITIES = [
       onBounced: async (event) => suppress(event.recipient),
     },
   },
-});
+})
 
 // app/api/email/route.ts — the whole route
-export const { GET, POST } = createNextEmailKitHandler(emailkit);`,
+export const { GET, POST } = createNextEmailKitHandler(emailkit)`,
     description:
       "One client is your whole email layer. Providers, webhook handling, lifecycle hooks — declared in one file, not scattered across route handlers and provider dashboards. emailkit verifies and normalizes every event before your code sees it; the route is one line.",
     docHref: "/quickstart",
@@ -39,10 +39,10 @@ export const { GET, POST } = createNextEmailKitHandler(emailkit);`,
   // route by sender — connected inboxes send as themselves,
   // everything else goes through your email API
   resolveEmailDriver: async (ctx) => {
-    if (ctx.operation !== "sendEmail") return "resend";
-    return (await findMailbox(ctx.message.from.email)) ?? "resend";
+    if (ctx.operation !== "sendEmail") return "resend"
+    return (await findMailbox(ctx.message.from.email)) ?? "resend"
   },
-});`,
+})`,
     description:
       "Transactional APIs like Resend and Mailgun next to real inboxes like Gmail and Outlook — in the same client. Mix them freely and route by sender; the rest of your code never knows the difference.",
     docHref: "/guides/multiple-providers",
@@ -56,18 +56,18 @@ export const { GET, POST } = createNextEmailKitHandler(emailkit);`,
 const { domain } = await emailkit.domains.ensure({
   emailDriver: "resend",
   domain: "acme.com",
-});
+})
 // show domain.verification.records in your UI, then:
 await emailkit.domains.verify({
   emailDriver: "resend",
   domain: "acme.com",
-});
+})
 
 // or their inbox — OAuth, refresh, notifications handled
 const { redirectUrl } = await emailkit.mailboxes.connect({
   emailDriver: "gmail",
   email: "acme.support@gmail.com",
-});`,
+})`,
     description:
       "Your users connect a whole domain to your email API, or sign into their Gmail or Outlook. Either way it's a couple of calls — DNS records, OAuth flows, token refresh, and inbound notifications are emailkit's problem. After that, both look identical to your app.",
     docHref: "/use-cases/bring-your-own-email",
@@ -85,7 +85,7 @@ const { redirectUrl } = await emailkit.mailboxes.connect({
   sendAt: new Date("2026-07-16T08:00:00Z"), // Resend has scheduling,
   idempotencyKey: "meeting-reminder-42", //    so these type-check
   sender: { emailDriver: "resend" },
-});`,
+})`,
     description:
       "Configure Resend and sendAt appears. Configure Gmail and mailbox methods appear. Use a feature your provider doesn't have, and your code doesn't compile — capability gaps surface in your editor, not in production.",
     docHref: "/concepts",

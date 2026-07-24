@@ -1,0 +1,29 @@
+---
+title: email.onComplained
+description: The recipient marked a message as spam — stop emailing them.
+sidebar:
+  label: onComplained
+---
+
+Fires when the recipient reports a message as spam through their mail provider's feedback loop. Treat it as a hard unsubscribe: keep sending after a complaint and your sender reputation pays for it.
+
+```ts
+hooks: {
+  email: {
+    onComplained: async (event) => {
+      await prisma.suppression.upsert({
+        where: { email: event.recipient },
+        create: { email: event.recipient, reason: "complaint" },
+        update: {},
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailComplainedEvent"
+/>

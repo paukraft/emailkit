@@ -781,6 +781,132 @@ export interface OutboundEmailEvent {
 }
 
 /**
+ * Client, device, and location details attached to open and click events,
+ * plus emailkit's bot classification of the engagement.
+ */
+export interface EmailEngagementDetails {
+  /** IP address of the user who opened/clicked */
+  ip?: string;
+  /** User agent string of the browser/client */
+  userAgent?: string;
+  /** Geolocation information */
+  location?: {
+    /** City name */
+    city?: string;
+    /** Country code or name */
+    country?: string;
+    /** Region/state */
+    region?: string;
+    /** Timezone */
+    timezone?: string;
+  };
+  /** Device type (mobile, desktop, tablet, etc.) */
+  deviceType?: string;
+  /** Email client name (Gmail, Outlook, etc.) */
+  clientType?: string;
+  /** Operating system */
+  os?: string;
+  /** Bot detection result */
+  botDetection?: {
+    /** Whether this is detected as a bot */
+    isBot: boolean;
+    /** Reason for the bot detection decision */
+    reason: string;
+  };
+}
+
+/** Payload for `hooks.email.onDelivered`. */
+export type OutboundEmailDeliveredEvent = OutboundEmailEvent & {
+  /** Response time in milliseconds (if available) */
+  responseTime?: number;
+};
+
+/** Payload for `hooks.email.onOpened`. */
+export type OutboundEmailOpenedEvent = OutboundEmailEvent &
+  EmailEngagementDetails & {
+    /** Milliseconds since send (or delivery), if available */
+    timeSinceSendMs?: number;
+  };
+
+/** Payload for `hooks.email.onClicked`. */
+export type OutboundEmailClickedEvent = OutboundEmailEvent &
+  EmailEngagementDetails & {
+    /** URL that was clicked */
+    url?: string;
+  };
+
+/** Payload for `hooks.email.onBounced`. */
+export type OutboundEmailBouncedEvent = OutboundEmailEvent & {
+  /** Human-readable bounce reason/message */
+  reason?: string;
+  /** Bounce severity: permanent (hard bounce) or temporary (soft bounce) */
+  severity?: "permanent" | "temporary";
+  /** Error code from the email provider */
+  code?: string | number;
+  /** SMTP response code and message */
+  smtpResponse?: string;
+  /** Bounce category/type */
+  category?: string;
+};
+
+/** Payload for `hooks.email.onComplained`. */
+export type OutboundEmailComplainedEvent = OutboundEmailEvent & {
+  /** Type of complaint (spam, abuse, etc.) */
+  feedbackType?: string;
+  /** Feedback loop message */
+  feedback?: string;
+  /** Complaint source (ESP, ISP, etc.) */
+  source?: string;
+};
+
+/** Payload for `hooks.email.onRejected`. */
+export type OutboundEmailRejectedEvent = OutboundEmailEvent & {
+  /** Human-readable rejection reason */
+  reason?: string;
+  /** Error code from the email provider */
+  code?: string | number;
+  /** SMTP response code and message */
+  smtpResponse?: string;
+  /** Rejection category/type */
+  category?: string;
+};
+
+/** Payload for `hooks.email.onUnknown` — a verified event emailkit cannot normalize. */
+export interface UnknownEmailEvent {
+  /** EmailKit driver id that produced this event */
+  emailDriver?: string;
+  /** Always "unknown" */
+  type: "unknown";
+  /** The unnormalized provider payload */
+  data: unknown;
+  /** Provider-specific raw data (for debugging or advanced use cases) */
+  raw?: unknown;
+}
+
+/** Payload for `hooks.email.onAll` — every email event, before its specific hook runs. */
+export interface AnyEmailEvent {
+  /** EmailKit driver id that produced this event */
+  emailDriver?: string;
+  /** Which email event this is */
+  type:
+    | "inbound"
+    | "outbound"
+    | "delivered"
+    | "opened"
+    | "clicked"
+    | "bounced"
+    | "complained"
+    | "rejected"
+    | "unknown";
+  /** The event payload, shaped by `type` */
+  data: unknown;
+  /** Provider-specific raw data (for debugging or advanced use cases) */
+  raw?: unknown;
+  /** User round-trip data from `SyncInput.context`, set only for sync-replayed events. */
+  context?: unknown;
+}
+
+/**
  * Webhook request (generic, provider-specific implementations will extend)
  */
 export interface WebhookRequest {
@@ -811,69 +937,12 @@ export interface WebhookResponse {
 export type WebhookEvent =
   | { type: "inbound"; data: InboundEmailEvent }
   | { type: "outbound"; data: OutboundEmailEvent }
-  | { type: "delivered"; data: OutboundEmailEvent & { responseTime?: number } }
-  | {
-      type: "opened";
-      data: OutboundEmailEvent & {
-        ip?: string;
-        userAgent?: string;
-        timeSinceSendMs?: number;
-        location?: {
-          city?: string;
-          country?: string;
-          region?: string;
-          timezone?: string;
-        };
-        deviceType?: string;
-        clientType?: string;
-        os?: string;
-        botDetection?: { isBot: boolean; reason: string };
-      };
-    }
-  | {
-      type: "clicked";
-      data: OutboundEmailEvent & {
-        url?: string;
-        ip?: string;
-        userAgent?: string;
-        location?: {
-          city?: string;
-          country?: string;
-          region?: string;
-          timezone?: string;
-        };
-        deviceType?: string;
-        clientType?: string;
-        os?: string;
-        botDetection?: { isBot: boolean; reason: string };
-      };
-    }
-  | {
-      type: "bounced";
-      data: OutboundEmailEvent & {
-        reason?: string;
-        severity?: "permanent" | "temporary";
-        code?: string | number;
-        smtpResponse?: string;
-      };
-    }
-  | {
-      type: "complained";
-      data: OutboundEmailEvent & {
-        feedbackType?: string;
-        feedback?: string;
-        source?: string;
-      };
-    }
-  | {
-      type: "rejected";
-      data: OutboundEmailEvent & {
-        reason?: string;
-        code?: string | number;
-        smtpResponse?: string;
-        category?: string;
-      };
-    }
+  | { type: "delivered"; data: OutboundEmailDeliveredEvent }
+  | { type: "opened"; data: OutboundEmailOpenedEvent }
+  | { type: "clicked"; data: OutboundEmailClickedEvent }
+  | { type: "bounced"; data: OutboundEmailBouncedEvent }
+  | { type: "complained"; data: OutboundEmailComplainedEvent }
+  | { type: "rejected"; data: OutboundEmailRejectedEvent }
   | { type: "unknown"; data: unknown };
 
 export type WebhookLifecycleDriverEvent = {
@@ -1000,166 +1069,53 @@ export type OutboundEmailHook = (event: OutboundEmailEvent) => HookResult;
  * Hook for delivered email events
  */
 export type OutboundEmailDeliveredHook = (
-  event: OutboundEmailEvent & {
-    /** Response time in milliseconds (if available) */
-    responseTime?: number;
-  },
+  event: OutboundEmailDeliveredEvent,
 ) => HookResult;
 
 /**
  * Hook for email opened events
  */
 export type OutboundEmailOpenedHook = (
-  event: OutboundEmailEvent & {
-    /** IP address of the user who opened the email */
-    ip?: string;
-    /** User agent string of the browser/client */
-    userAgent?: string;
-    /** Milliseconds since send (or delivery), if available */
-    timeSinceSendMs?: number;
-    /** Geolocation information */
-    location?: {
-      /** City name */
-      city?: string;
-      /** Country code or name */
-      country?: string;
-      /** Region/state */
-      region?: string;
-      /** Timezone */
-      timezone?: string;
-    };
-    /** Device type (mobile, desktop, tablet, etc.) */
-    deviceType?: string;
-    /** Email client name (Gmail, Outlook, etc.) */
-    clientType?: string;
-    /** Operating system */
-    os?: string;
-    /** Bot detection result */
-    botDetection?: {
-      /** Whether this is detected as a bot */
-      isBot: boolean;
-      /** Reason for the bot detection decision */
-      reason: string;
-    };
-  },
+  event: OutboundEmailOpenedEvent,
 ) => HookResult;
 
 /**
  * Hook for email link clicked events
  */
 export type OutboundEmailClickedHook = (
-  event: OutboundEmailEvent & {
-    /** URL that was clicked */
-    url?: string;
-    /** IP address of the user who clicked */
-    ip?: string;
-    /** User agent string of the browser/client */
-    userAgent?: string;
-    /** Geolocation information */
-    location?: {
-      /** City name */
-      city?: string;
-      /** Country code or name */
-      country?: string;
-      /** Region/state */
-      region?: string;
-      /** Timezone */
-      timezone?: string;
-    };
-    /** Device type (mobile, desktop, tablet, etc.) */
-    deviceType?: string;
-    /** Email client name (Gmail, Outlook, etc.) */
-    clientType?: string;
-    /** Operating system */
-    os?: string;
-    /** Bot detection result */
-    botDetection?: {
-      /** Whether this is detected as a bot */
-      isBot: boolean;
-      /** Reason for the bot detection decision */
-      reason: string;
-    };
-  },
+  event: OutboundEmailClickedEvent,
 ) => HookResult;
 
 /**
  * Hook for bounced email events
  */
 export type OutboundEmailBouncedHook = (
-  event: OutboundEmailEvent & {
-    /** Human-readable bounce reason/message */
-    reason?: string;
-    /** Bounce severity: permanent (hard bounce) or temporary (soft bounce) */
-    severity?: "permanent" | "temporary";
-    /** Error code from the email provider */
-    code?: string | number;
-    /** SMTP response code and message */
-    smtpResponse?: string;
-    /** Bounce category/type */
-    category?: string;
-  },
+  event: OutboundEmailBouncedEvent,
 ) => HookResult;
 
 /**
  * Hook for spam complaint events
  */
 export type OutboundEmailComplainedHook = (
-  event: OutboundEmailEvent & {
-    /** Type of complaint (spam, abuse, etc.) */
-    feedbackType?: string;
-    /** Feedback loop message */
-    feedback?: string;
-    /** Complaint source (ESP, ISP, etc.) */
-    source?: string;
-  },
+  event: OutboundEmailComplainedEvent,
 ) => HookResult;
 
 /**
  * Hook for rejected email events
  */
 export type OutboundEmailRejectedHook = (
-  event: OutboundEmailEvent & {
-    /** Human-readable rejection reason */
-    reason?: string;
-    /** Error code from the email provider */
-    code?: string | number;
-    /** SMTP response code and message */
-    smtpResponse?: string;
-    /** Rejection category/type */
-    category?: string;
-  },
+  event: OutboundEmailRejectedEvent,
 ) => HookResult;
 
 /**
  * Hook for unknown/unrecognized events
  */
-export type UnknownEventHook = (event: {
-  emailDriver?: string;
-  type: "unknown";
-  data: unknown;
-  raw?: unknown;
-}) => HookResult;
+export type UnknownEventHook = (event: UnknownEmailEvent) => HookResult;
 
 /**
  * Hook that receives all events (runs before specific hooks)
  */
-export type AllEventsHook = (event: {
-  emailDriver?: string;
-  type:
-    | "inbound"
-    | "outbound"
-    | "delivered"
-    | "opened"
-    | "clicked"
-    | "bounced"
-    | "complained"
-    | "rejected"
-    | "unknown";
-  data: unknown;
-  raw?: unknown;
-  /** User round-trip data from `SyncInput.context`, set only for sync-replayed events. */
-  context?: unknown;
-}) => HookResult;
+export type AllEventsHook = (event: AnyEmailEvent) => HookResult;
 
 export interface MailboxHookEvent {
   emailDriver: string;

@@ -1,0 +1,33 @@
+---
+title: mailbox.onConnected
+description: A user finished connecting their inbox — save the mailbox and its auth.
+sidebar:
+  label: onConnected
+---
+
+Fires when a mailbox is connected — a user finishing the OAuth flow, or your app calling `emailkit.mailboxes.connect()`. The event carries the `mailbox` and, when the driver hands one back, its `auth` — encrypt and store both, so [`resolveEmailDriver`](/guides/multiple-providers) can load them when the mailbox sends or receives.
+
+```ts
+hooks: {
+  mailbox: {
+    onConnected: async ({ emailDriver, mailbox, auth }) => {
+      if (!auth) return;
+      await prisma.connectedMailbox.create({
+        data: {
+          emailDriver,
+          email: mailbox.email,
+          mailbox,
+          auth: encrypt(auth),
+        },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="MailboxConnectedHookEvent"
+/>

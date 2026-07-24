@@ -1,0 +1,33 @@
+---
+title: email.onAll
+description: Every email event in one stream — runs before the specific hooks.
+sidebar:
+  label: onAll
+---
+
+Fires for every email event, before its specific hook runs. `type` says which event it is, `data` holds that event's payload, and `emailDriver` names the driver that produced it. Built for logging, metrics, and one-table event stores.
+
+```ts
+hooks: {
+  email: {
+    onAll: async (event) => {
+      await prisma.emailEvent.create({
+        data: {
+          type: event.type,
+          emailDriver: event.emailDriver,
+          payload: event.data,
+        },
+      });
+    },
+  },
+},
+```
+
+`context` is set only for sync-replayed events — see [Sync & recovery](/guides/sync).
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="AnyEmailEvent"
+/>

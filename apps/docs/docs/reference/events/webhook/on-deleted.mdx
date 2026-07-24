@@ -1,0 +1,27 @@
+---
+title: webhook.onDeleted
+description: A subscription no longer exists — remove what you stored.
+sidebar:
+  label: onDeleted
+---
+
+Fires when a subscription is deleted — through the API, or because the provider removed it (`reason` distinguishes). Remove the stored record.
+
+```ts
+hooks: {
+  webhook: {
+    onDeleted: async (event) => {
+      await prisma.webhook.deleteMany({
+        where: { id: event.webhookId },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

@@ -1,0 +1,28 @@
+---
+title: email.onUnknown
+description: A verified provider event emailkit cannot normalize.
+sidebar:
+  label: onUnknown
+---
+
+Fires for a webhook that passed verification but doesn't map to any shared event — a provider-specific or brand-new event type. Rare, but it means nothing gets silently dropped: the original payload is in `data`.
+
+```ts
+hooks: {
+  email: {
+    onUnknown: async (event) => {
+      logger.info("unhandled email event", {
+        emailDriver: event.emailDriver,
+        data: event.data,
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="UnknownEmailEvent"
+/>

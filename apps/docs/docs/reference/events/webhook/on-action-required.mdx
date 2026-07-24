@@ -1,0 +1,29 @@
+---
+title: webhook.onActionRequired
+description: A subscription needs your app's help — auth revoked, endpoint unreachable.
+sidebar:
+  label: onActionRequired
+---
+
+Fires when emailkit can't fix a subscription on its own — auth was revoked, the endpoint is unreachable, deliveries are failing. `reason` says what happened and `recommendedActions` say what to do next (`reauthorize`, `recreate`, `fix_endpoint`, …).
+
+```ts
+hooks: {
+  webhook: {
+    onActionRequired: async (event) => {
+      if (event.recommendedActions?.includes("reauthorize")) {
+        await askUserToReconnect(event.target?.mailboxEmail);
+      } else {
+        await alertOps("webhook needs attention", event);
+      }
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

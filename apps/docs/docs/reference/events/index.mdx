@@ -1,0 +1,221 @@
+---
+title: Event reference
+description: Every hook emailkit can call — when it fires, what it carries, and what to do with it.
+sidebar:
+  label: Events overview
+  icon: activity
+---
+
+Everything emailkit tells your app arrives through one `hooks` object on the client. Four groups, all optional — handle what you care about, skip the rest:
+
+```ts
+EmailKit({
+  emailDrivers: [...],
+  hooks: {
+    email: { ... }, // messages: received, sent, delivered, opened, clicked…
+    mailbox: { ... }, // inboxes users connect — save what emailkit hands you
+    domain: { ... }, // sending domains as they're created and verified
+    webhook: { ... }, // the provider subscriptions emailkit manages
+  },
+});
+```
+
+Whichever provider produced an event, your hook sees the same shape. This page walks through when each hook fires; every hook links to its own page with the exact payload and a working handler.
+
+## The life of an email
+
+Ten email hooks sounds like a lot, but they tell one story. Sending:
+
+<div class="ev-flow">
+  <div class="ev-step ev-you">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <span class="ev-action">emailkit.sendEmail()</span>
+      <p class="ev-when">Your app sends a message.</p>
+    </div>
+  </div>
+  <div class="ev-step">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <a class="ev-hook" href="/reference/events/email/on-outbound">onOutbound</a>
+      <p class="ev-when">The provider accepted it. Record the send under its <code>messageId</code> — every later event carries the same one.</p>
+    </div>
+  </div>
+  <div class="ev-step">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <a class="ev-hook" href="/reference/events/email/on-delivered">onDelivered</a>
+      <p class="ev-when">The recipient's server took the message, with <code>responseTime</code> when the provider measures it.</p>
+    </div>
+  </div>
+  <div class="ev-step">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <a class="ev-hook" href="/reference/events/email/on-opened">onOpened</a>
+      <p class="ev-when">The message was opened — client, device, and location when available, plus a <code>botDetection</code> verdict so scanners don't count.</p>
+    </div>
+  </div>
+  <div class="ev-step">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <a class="ev-hook" href="/reference/events/email/on-clicked">onClicked</a>
+      <p class="ev-when">A tracked link was followed. <code>url</code> says which one; the same client and bot data comes along.</p>
+    </div>
+  </div>
+</div>
+
+Receiving is one hook:
+
+<div class="ev-flow">
+  <div class="ev-step ev-you">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <span class="ev-action">a message arrives at your address</span>
+    </div>
+  </div>
+  <div class="ev-step">
+    <span class="ev-marker"></span>
+    <div class="ev-body">
+      <a class="ev-hook" href="/reference/events/email/on-inbound">onInbound</a>
+      <p class="ev-when">The full message: addresses, subject, text and HTML bodies, reply context for threading, headers, and attachments.</p>
+    </div>
+  </div>
+</div>
+
+### When sending goes wrong
+
+Three hooks cover the unhappy paths — in a good week, none of them fire:
+
+<div class="ev-grid">
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-bounced">onBounced</a>
+    <p class="ev-when">The message couldn't be delivered. <code>severity</code> separates hard from soft bounces — suppress recipients that bounce <code>permanent</code>.</p>
+  </div>
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-complained">onComplained</a>
+    <p class="ev-when">The recipient marked it as spam. Stop emailing them before it hurts your sender reputation.</p>
+  </div>
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-rejected">onRejected</a>
+    <p class="ev-when">The provider refused the send — blocked address, policy, suppression list. <code>reason</code> and <code>category</code> say why.</p>
+  </div>
+</div>
+
+### Catch-alls
+
+<div class="ev-grid">
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-all">onAll</a>
+    <p class="ev-when">Every email event, before the specific hook runs, tagged with its <code>type</code> and the <code>emailDriver</code> that produced it. Built for logging, metrics, and one-table event stores.</p>
+  </div>
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-unknown">onUnknown</a>
+    <p class="ev-when">A verified provider event emailkit can't normalize. Rare — but nothing gets silently dropped.</p>
+  </div>
+</div>
+
+## Bots don't count
+
+Raw open and click numbers lie: security scanners open every message and follow every link before a human ever sees it. emailkit classifies each open and click and attaches the verdict to the event — no setup, it's on every [`onOpened`](/reference/events/email/on-opened) and [`onClicked`](/reference/events/email/on-clicked) call:
+
+```ts
+onOpened: async (event) => {
+  if (event.botDetection?.isBot) return; // e.g. reason: "known-bot-agent"
+  await markOpened(event.messageId);
+},
+```
+
+The classifier checks known scanner user agents (Barracuda, Outlook safe-link crawlers, HTTP libraries), opens arriving impossibly fast after send, HEAD requests on tracked links, and malformed browser signatures. It also knows the Gmail, Yahoo, and Outlook image proxies are real humans opening mail, so those still count. `reason` tells you which rule decided.
+
+Need the same logic elsewhere? `checkOpenBot` and `checkClickBot` are exported from `emailkit`.
+
+## Resource hooks
+
+Email hooks tell you what happened; resource hooks tell you **what to save**. emailkit keeps no database, so whenever something worth remembering changes — a connected inbox, a domain, a webhook subscription — it hands the new state to your app. Write it down and you're done. ([How emailkit works](/concepts) explains this stateless design.)
+
+<div class="ev-group">
+  <div class="ev-group-head">
+    <span class="ev-group-name">hooks.mailbox</span>
+    <span class="ev-group-desc">Inboxes your users connect</span>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/mailbox/on-connected">onConnected</a>
+    <p class="ev-when">A mailbox was connected — OAuth flow or <code>mailboxes.connect()</code>. Comes with the <code>mailbox</code> and, when the driver returns one, its <code>auth</code> — encrypt and store both.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/mailbox/on-auth-updated">onAuthUpdated</a>
+    <p class="ev-when">emailkit refreshed the tokens. Overwrite the stored <code>auth</code> — the old one is dead.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/mailbox/on-created">onCreated</a>
+    <p class="ev-when">A mailbox was created through the API, on providers that support it.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/mailbox/on-deleted">onDeleted</a>
+    <p class="ev-when">The mailbox is gone — clean up your records.</p>
+  </div>
+</div>
+
+<div class="ev-group">
+  <div class="ev-group-head">
+    <span class="ev-group-name">hooks.domain</span>
+    <span class="ev-group-desc">Sending domains</span>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/domain/on-created">onCreated</a>
+    <p class="ev-when">A domain was registered with the provider. The event carries the DNS records to show your user.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/domain/on-verified">onVerified</a>
+    <p class="ev-when">A <code>domains.verify()</code> check passed — the domain can send.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/domain/on-deleted">onDeleted</a>
+    <p class="ev-when">The domain was removed.</p>
+  </div>
+</div>
+
+<div class="ev-group">
+  <div class="ev-group-head">
+    <span class="ev-group-name">hooks.webhook</span>
+    <span class="ev-group-desc">Subscriptions emailkit manages for you</span>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-created">onCreated</a>
+    <p class="ev-when">emailkit registered a webhook with a provider. Persist it — mailbox subscriptions expire and get renewed.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-updated">onUpdated</a>
+    <p class="ev-when">A subscription was renewed or its status changed. Store the new state; <code>previousWebhook</code> shows what changed.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-deleted">onDeleted</a>
+    <p class="ev-when">The subscription no longer exists.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-action-required">onActionRequired</a>
+    <p class="ev-when">emailkit can't fix this alone — auth revoked, endpoint unreachable. <code>reason</code> plus <code>recommendedActions</code> tell you the next move.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-sync-required">onSyncRequired</a>
+    <p class="ev-when">Notifications were missed or history gapped. Run a <a href="/guides/sync">sync</a> to replay the gap.</p>
+  </div>
+  <div class="ev-row">
+    <a class="ev-hook" href="/reference/events/webhook/on-all">onAll</a>
+    <p class="ev-when">Every webhook lifecycle event in one stream.</p>
+  </div>
+</div>
+
+Every resource event names its `emailDriver`, includes the affected item, and keeps the provider's original payload in `raw`.
+
+## Good to know
+
+- Live webhooks and recovered events both use the same hooks.
+- The same event can arrive more than once, so hooks should safely ignore duplicates.
+- emailkit verifies provider webhooks before running your hooks.
+- A field stays optional when the provider does not supply it; emailkit does not invent a value.
+- The original event stays available in `raw` for debugging and provider-specific work.
+
+:::note
+Build your app around emailkit's shared fields. Use `raw` only in the small areas that need provider-specific data.
+:::

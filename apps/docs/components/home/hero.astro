@@ -22,28 +22,32 @@ const pkg = JSON.parse(
 const releaseUrl = `https://github.com/paukraft/emailkit/releases/tag/v${pkg.version}`;
 
 const HERO_CODE = `export const emailkit = EmailKit({
-  emailDrivers: [
-    // your email API + your users' inboxes
-    ResendDriver({ apiKey }),
-    GmailDriver({ clientId, clientSecret }),
-  ],
+  emailDrivers: [ResendDriver({ apiKey })],
   hooks: {
     email: {
       onInbound: async (email) => {
-        await saveToInbox(email);
-        await answerWithAIAgent(email);
+        await saveToInbox(email)
+        await answerWithAIAgent(email)
       },
-      onBounced: async (event) => suppress(event.recipient),
+      onOpened: async (event) => {
+        // Gmail & co. auto-open emails the user
+        // never read — built-in bot detection
+        // filters that, so you count real opens
+        if (event.botDetection?.isBot) return
+        await markOpened(event)
+      },
+      onBounced: async (event) =>
+        suppress(event.recipient),
     },
   },
-});
+})
 
 await emailkit.sendEmail({
   from: { email: "hello@acme.dev" },
   to: { email: "ada@example.com" },
   subject: "Welcome",
   text: "Your account is ready.",
-});`;
+})`;
 const heroCodeHtml = await highlightCode(HERO_CODE, "ts", { icons: false });
 
 const PROVIDER_GROUPS = [

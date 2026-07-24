@@ -1,0 +1,32 @@
+---
+title: webhook.onAll
+description: Every webhook lifecycle event in one stream.
+sidebar:
+  label: onAll
+---
+
+Fires for every webhook lifecycle event. `action` says what happened — `created`, `updated`, `deleted`, `action_required`, or `sync_required` — so one handler can cover the whole lifecycle instead of four separate hooks.
+
+```ts
+hooks: {
+  webhook: {
+    onAll: async (event) => {
+      await prisma.webhookEvent.create({
+        data: {
+          action: event.action,
+          emailDriver: event.emailDriver,
+          reason: event.reason,
+          payload: event,
+        },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

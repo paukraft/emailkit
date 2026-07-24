@@ -1,0 +1,28 @@
+---
+title: email.onClicked
+description: A tracked link was followed — with the URL, client details, and a bot verdict.
+sidebar:
+  label: onClicked
+---
+
+Fires when a tracked link in a message is followed. `url` says which link; client, device, and location details come along when available, plus emailkit's `botDetection` verdict so link scanners don't count as engagement.
+
+```ts
+hooks: {
+  email: {
+    onClicked: async (event) => {
+      if (event.botDetection?.isBot) return;
+      await recordClick(event.messageId, event.url);
+    },
+  },
+},
+```
+
+How the classifier decides — and the exported `checkClickBot` helper — is covered in [Bots don't count](/reference/events#bots-dont-count).
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailClickedEvent"
+/>

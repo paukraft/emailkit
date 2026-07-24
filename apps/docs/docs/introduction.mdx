@@ -68,6 +68,8 @@ const { domain } = await emailkit.domains.ensure({
 });
 ```
 
+**Open and click stats you can trust.** Security scanners open and click everything before your user does. emailkit ships bot detection on every open and click event — `botDetection.isBot` plus the reason — so your metrics count humans.
+
 **Replies stay threaded.** Pass the reply details from an inbound email and emailkit produces the right thread format for whichever provider sends it.
 
 **Missed a webhook? Replay it.** `sync()` asks the provider for the events you missed and runs them through your existing hooks.

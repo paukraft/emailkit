@@ -1,0 +1,30 @@
+---
+title: email.onDelivered
+description: The recipient's server accepted the message.
+sidebar:
+  label: onDelivered
+---
+
+Fires when the recipient's mail server accepts the message. `responseTime` is included when the provider measures it.
+
+```ts
+hooks: {
+  email: {
+    onDelivered: async (event) => {
+      await prisma.sentEmail.updateMany({
+        where: { messageId: event.messageId },
+        data: { status: "delivered" },
+      });
+    },
+  },
+},
+```
+
+Delivered means the server took the message — whether it landed in the inbox or the spam folder is not observable. When delivery fails instead, [onBounced](/reference/events/email/on-bounced) fires.
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailDeliveredEvent"
+/>

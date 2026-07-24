@@ -1,0 +1,32 @@
+---
+title: email.onOutbound
+description: The provider accepted a message for sending — the start of every outbound story.
+sidebar:
+  label: onOutbound
+---
+
+Fires when the provider accepts a message for sending. Record the send under its `messageId` — every later event for this message ([delivered](/reference/events/email/on-delivered), [opened](/reference/events/email/on-opened), [bounced](/reference/events/email/on-bounced), …) carries the same one.
+
+```ts
+hooks: {
+  email: {
+    onOutbound: async (event) => {
+      await prisma.sentEmail.create({
+        data: {
+          messageId: event.messageId,
+          recipient: event.recipient,
+          subject: event.subject,
+          status: "sent",
+        },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailEvent"
+/>

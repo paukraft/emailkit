@@ -1,0 +1,27 @@
+---
+title: domain.onDeleted
+description: A domain was removed from the provider.
+sidebar:
+  label: onDeleted
+---
+
+Fires when a domain is removed through `emailkit.domains.delete()`. Clean up your record — sends from its addresses will fail from here on.
+
+```ts
+hooks: {
+  domain: {
+    onDeleted: async ({ domain }) => {
+      await prisma.sendingDomain.deleteMany({
+        where: { domain: domain.domain },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="DomainHookEvent"
+/>

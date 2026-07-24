@@ -1,0 +1,33 @@
+---
+title: webhook.onUpdated
+description: A subscription was renewed or its status changed — store the new state.
+sidebar:
+  label: onUpdated
+---
+
+Fires when a subscription is renewed, refreshed, or changes status — `reason` says which. Store the new `webhook` state; `previousWebhook` shows what changed.
+
+```ts
+hooks: {
+  webhook: {
+    onUpdated: async (event) => {
+      await prisma.webhook.update({
+        where: { id: event.webhook.id },
+        data: {
+          expiresAt: event.webhook.expiresAt,
+          data: event.webhook,
+        },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+`webhook` is always set for this action.
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

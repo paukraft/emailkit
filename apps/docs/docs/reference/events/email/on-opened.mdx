@@ -1,0 +1,28 @@
+---
+title: email.onOpened
+description: A tracked message was opened — with client details and a bot verdict.
+sidebar:
+  label: onOpened
+---
+
+Fires when a tracked message is opened. Client, device, and location details come along when the provider reports them — plus emailkit's `botDetection` verdict, so security scanners don't inflate your numbers.
+
+```ts
+hooks: {
+  email: {
+    onOpened: async (event) => {
+      if (event.botDetection?.isBot) return; // e.g. reason: "known-bot-agent"
+      await markOpened(event.messageId);
+    },
+  },
+},
+```
+
+How the classifier decides — and the exported `checkOpenBot` helper — is covered in [Bots don't count](/reference/events#bots-dont-count).
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailOpenedEvent"
+/>

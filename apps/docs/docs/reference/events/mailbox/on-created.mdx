@@ -1,0 +1,27 @@
+---
+title: mailbox.onCreated
+description: A mailbox was created through the API.
+sidebar:
+  label: onCreated
+---
+
+Fires when a mailbox is created through `emailkit.mailboxes.create()`, on providers that support it. Save the mailbox so your app knows the address exists.
+
+```ts
+hooks: {
+  mailbox: {
+    onCreated: async ({ emailDriver, mailbox }) => {
+      await prisma.appMailbox.create({
+        data: { emailDriver, email: mailbox.email, mailbox },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="MailboxHookEvent"
+/>

@@ -1,0 +1,28 @@
+---
+title: domain.onVerified
+description: DNS checks passed — the domain can send.
+sidebar:
+  label: onVerified
+---
+
+Fires when an `emailkit.domains.verify()` check comes back `verified` — the provider confirmed the DNS records and the domain can send. Flip its status so your app stops showing setup instructions.
+
+```ts
+hooks: {
+  domain: {
+    onVerified: async ({ domain }) => {
+      await prisma.sendingDomain.updateMany({
+        where: { domain: domain.domain },
+        data: { status: "verified" },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="DomainHookEvent"
+/>

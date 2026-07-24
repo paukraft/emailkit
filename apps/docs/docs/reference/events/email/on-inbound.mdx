@@ -1,0 +1,36 @@
+---
+title: email.onInbound
+description: A message arrived at an address you receive on — the full email, normalized.
+sidebar:
+  label: onInbound
+---
+
+Fires when a message arrives at an address your setup receives on. The event is the full email — addresses, subject, text and HTML bodies, reply context for threading, headers, and attachments — in the same shape from every provider.
+
+```ts
+hooks: {
+  email: {
+    onInbound: async (email) => {
+      await prisma.inboundEmail.upsert({
+        where: { messageId: email.messageId },
+        create: {
+          messageId: email.messageId,
+          from: email.from.email,
+          subject: email.subject,
+          text: email.text,
+        },
+        update: {},
+      });
+    },
+  },
+},
+```
+
+Providers may deliver the same message twice — save by `messageId` and ignore repeats. For routing setup and fetching attachment content, see [Receiving & events](/guides/receiving).
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="InboundEmailEvent"
+/>

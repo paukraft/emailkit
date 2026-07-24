@@ -1,0 +1,29 @@
+---
+title: mailbox.onAuthUpdated
+description: emailkit refreshed a mailbox's tokens — overwrite what you stored.
+sidebar:
+  label: onAuthUpdated
+---
+
+Fires when emailkit refreshes a connected mailbox's tokens. Overwrite the stored `auth` — the old one is dead, and the next operation on this mailbox needs the new one.
+
+```ts
+hooks: {
+  mailbox: {
+    onAuthUpdated: async ({ mailbox, auth }) => {
+      if (!mailbox?.email) return;
+      await prisma.connectedMailbox.updateMany({
+        where: { email: mailbox.email },
+        data: { auth: encrypt(auth) },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="MailboxAuthUpdatedHookEvent"
+/>

@@ -1,0 +1,35 @@
+---
+title: webhook.onCreated
+description: emailkit registered a subscription with a provider — persist it.
+sidebar:
+  label: onCreated
+---
+
+Fires when emailkit registers a webhook with a provider — during setup, or as part of connecting a mailbox. Persist the `webhook`: mailbox subscriptions (Gmail, Outlook) expire and get renewed, and emailkit hands the state to your app instead of keeping its own database.
+
+```ts
+hooks: {
+  webhook: {
+    onCreated: async (event) => {
+      await prisma.webhook.create({
+        data: {
+          id: event.webhook.id,
+          emailDriver: event.emailDriver,
+          scope: event.scope,
+          expiresAt: event.webhook.expiresAt,
+          data: event.webhook,
+        },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+`webhook` is always set for this action.
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

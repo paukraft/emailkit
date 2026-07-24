@@ -1,0 +1,34 @@
+---
+title: domain.onCreated
+description: A domain was registered with the provider — show your user its DNS records.
+sidebar:
+  label: onCreated
+---
+
+Fires when a domain is registered with the provider via `emailkit.domains.create()`. The event's `domain.verification.records` are the DNS records your user needs to add — save the domain and show them.
+
+```ts
+hooks: {
+  domain: {
+    onCreated: async ({ emailDriver, domain }) => {
+      await prisma.sendingDomain.create({
+        data: {
+          emailDriver,
+          domain: domain.domain,
+          status: domain.status,
+          records: domain.verification?.records,
+        },
+      });
+    },
+  },
+},
+```
+
+The full setup flow is covered in [Manage domains](/guides/domains).
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="DomainHookEvent"
+/>

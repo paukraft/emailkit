@@ -1,0 +1,29 @@
+---
+title: webhook.onSyncRequired
+description: Events may have been missed — run a sync to replay the gap.
+sidebar:
+  label: onSyncRequired
+---
+
+Fires when emailkit detects that events may have been missed — notifications were dropped or the provider reports a history gap (`reason` says which). Run a [sync](/guides/sync) for the affected scope to replay what was missed through the same hooks.
+
+```ts
+hooks: {
+  webhook: {
+    onSyncRequired: async (event) => {
+      await jobs.enqueue("emailkit-sync", {
+        emailDriver: event.emailDriver,
+        scope: event.scope,
+        target: event.target,
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="WebhookLifecycleEventBase"
+/>

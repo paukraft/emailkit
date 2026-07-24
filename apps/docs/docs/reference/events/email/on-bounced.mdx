@@ -1,0 +1,30 @@
+---
+title: email.onBounced
+description: A message could not be delivered — suppress hard bounces before they hurt your sender reputation.
+sidebar:
+  label: onBounced
+---
+
+Fires when a message could not be delivered. `severity` separates hard from soft: `permanent` means the address is dead — stop sending to it; `temporary` means the recipient's server may accept it later. `reason`, `smtpResponse`, and `code` carry the provider's explanation.
+
+```ts
+hooks: {
+  email: {
+    onBounced: async (event) => {
+      if (event.severity !== "permanent") return;
+      await prisma.suppression.upsert({
+        where: { email: event.recipient },
+        create: { email: event.recipient },
+        update: {},
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailBouncedEvent"
+/>

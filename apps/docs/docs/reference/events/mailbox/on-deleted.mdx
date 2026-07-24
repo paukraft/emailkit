@@ -1,0 +1,27 @@
+---
+title: mailbox.onDeleted
+description: A mailbox was deleted or disconnected — clean up your records.
+sidebar:
+  label: onDeleted
+---
+
+Fires when a mailbox is deleted through `emailkit.mailboxes.delete()`. Remove what you stored for it — the mailbox record and its auth.
+
+```ts
+hooks: {
+  mailbox: {
+    onDeleted: async ({ mailbox }) => {
+      await prisma.connectedMailbox.deleteMany({
+        where: { email: mailbox.email },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="MailboxHookEvent"
+/>

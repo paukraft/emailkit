@@ -1,0 +1,28 @@
+---
+title: email.onRejected
+description: The provider refused to send — blocked address, policy, or suppression list.
+sidebar:
+  label: onRejected
+---
+
+Fires when the provider refuses to send at all — a blocked address, a policy violation, or a recipient already on the provider's suppression list. Unlike a [bounce](/reference/events/email/on-bounced), the message never left; `reason` and `category` say why.
+
+```ts
+hooks: {
+  email: {
+    onRejected: async (event) => {
+      await prisma.sentEmail.updateMany({
+        where: { messageId: event.messageId },
+        data: { status: "rejected", error: event.reason },
+      });
+    },
+  },
+},
+```
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailRejectedEvent"
+/>
