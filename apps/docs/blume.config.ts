@@ -145,6 +145,9 @@ export default defineConfig({
     og: {
       enabled: true,
       logo: "/emailkit-og-mark.svg",
+      // Explicit, because deriving from theme.fonts emits an unquoted
+      // `font-family: Source Sans 3`, which the card renderer can't parse.
+      fonts: ["Space Grotesk"],
       palette: {
         accent: "#2fa8ff",
         background: "#0a0a0a",

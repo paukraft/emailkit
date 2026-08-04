@@ -1,8 +1,8 @@
 diff --git a/dist/cli/index.js b/dist/cli/index.js
-index eb5fcc4ac5b1ceb255580c252d059c531881994c..6e22b3a73d4ec82976ebca9eda15ae2e9c8a21cc 100755
+index 48efee558d52679c68d8cbb1c1cf3930f7872acb..f7bb3ae9b9723c56580b7df34025f38c71a11524 100755
 --- a/dist/cli/index.js
 +++ b/dist/cli/index.js
-@@ -8263,11 +8263,13 @@ import { getIconData, iconToSVG } from "@iconify/utils";
+@@ -8758,11 +8758,13 @@ import { getIconData, iconToSVG } from "@iconify/utils";
  var requireJson = createRequire2(import.meta.url);
  var loadSet = (pkg) => requireJson(pkg);
  var SETS = {
@@ -19,7 +19,7 @@ index eb5fcc4ac5b1ceb255580c252d059c531881994c..6e22b3a73d4ec82976ebca9eda15ae2e
  };
  var ownEntry = (map, key) => Object.hasOwn(map, key) ? map[key] : undefined;
  var normalize = (name) => name.trim().toLowerCase().replaceAll(/[\s_]+/gu, "-");
-@@ -8287,7 +8289,13 @@ var resolveIcon = (name) => {
+@@ -8782,7 +8784,13 @@ var resolveIcon = (name) => {
      const setName = ownEntry(PREFIX_SETS, normalized.slice(0, colon));
      return setName ? fromSet(setName, normalized.slice(colon + 1)) : null;
    }
