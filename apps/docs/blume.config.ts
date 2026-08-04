@@ -140,6 +140,10 @@ export default defineConfig({
   },
   deployment: {
     site: "https://emailkit.paukraft.com",
+    // Server output for `Accept: text/markdown` negotiation and the agent
+    // discovery headers. HTML routes still prerender.
+    output: "server",
+    adapter: "vercel",
   },
   seo: {
     og: {
