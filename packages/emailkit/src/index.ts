@@ -137,6 +137,8 @@ export type {
   OutboundEmailOpenedHook,
   OutboundEmailRejectedEvent,
   OutboundEmailRejectedHook,
+  OutboundEmailUnsubscribedEvent,
+  OutboundEmailUnsubscribedHook,
   UnknownEmailEvent,
   AnyEmailEvent,
   Personalization,
@@ -157,6 +159,8 @@ export type {
   WebhookEventSelection,
   WebhookEventType,
   WebhookLifecycleDriverEvent,
+  MailboxLifecycleDriverEvent,
+  MailboxLifecycleEvent,
   WebhookInboundOptions,
   WebhookLifecycleAction,
   WebhookLifecycleEvent,
@@ -237,8 +241,25 @@ export type {
   MailgunDriverConfig,
 } from "./drivers/mailgun";
 
-export { AIINBX_CAPABILITIES, AIInbxDriver } from "./drivers/aiinbx";
-export type { AIInbxCapabilities, AIInbxDriverConfig } from "./drivers/aiinbx";
+export {
+  AIINBX_CAPABILITIES,
+  AIInbxDriver,
+  getAIInbxAttachment,
+  getAIInbxInbound,
+  getAIInbxOutbound,
+} from "./drivers/aiinbx";
+export type {
+  AIInbxAttachmentMetadata,
+  AIInbxAttachmentPreparation,
+  AIInbxCapabilities,
+  AIInbxDriverConfig,
+  AIInbxEmailCategory,
+  AIInbxInboundMetadata,
+  AIInbxOutboundMetadata,
+  AIInbxSegment,
+  AIInbxSendOptions,
+  AIInbxVerdicts,
+} from "./drivers/aiinbx";
 
 export { RESEND_CAPABILITIES, ResendDriver } from "./drivers/resend";
 export type { ResendCapabilities, ResendDriverConfig } from "./drivers/resend";

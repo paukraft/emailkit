@@ -696,6 +696,11 @@ export interface InboundEmailEvent {
   headers: Record<string, string>;
   /** Timestamp when the email was received */
   timestamp: Date;
+  /**
+   * Provider-specific typed extras, namespaced by provider
+   * (e.g. `provider.aiinbx` — read it with `getAIInbxInbound(event)`).
+   */
+  provider?: Record<string, unknown>;
   /** Provider-specific raw data (for debugging or advanced use cases) */
   raw?: unknown;
 }
@@ -750,7 +755,8 @@ export interface OutboundEmailEvent {
     | "clicked"
     | "bounced"
     | "complained"
-    | "rejected";
+    | "rejected"
+    | "unsubscribed";
   /** Timestamp when the event occurred */
   timestamp: Date;
 
@@ -776,6 +782,11 @@ export interface OutboundEmailEvent {
   /** Receiving server information */
   server?: string;
 
+  /**
+   * Provider-specific typed extras, namespaced by provider
+   * (e.g. `provider.aiinbx` — read it with `getAIInbxOutbound(event)`).
+   */
+  provider?: Record<string, unknown>;
   /** Provider-specific raw data (for debugging or advanced use cases) */
   raw?: unknown;
 }
@@ -871,6 +882,17 @@ export type OutboundEmailRejectedEvent = OutboundEmailEvent & {
   category?: string;
 };
 
+/** Payload for `hooks.email.onUnsubscribed`. */
+export type OutboundEmailUnsubscribedEvent = OutboundEmailEvent & {
+  /**
+   * Unsubscribe list the recipient opted out of, when the provider names one.
+   * Absent means not list-specific, which is not necessarily every email.
+   */
+  listId?: string;
+  /** How the recipient opted out */
+  source?: "link" | "one_click" | "reply" | (string & {});
+};
+
 /** Payload for `hooks.email.onUnknown` — a verified event emailkit cannot normalize. */
 export interface UnknownEmailEvent {
   /** EmailKit driver id that produced this event */
@@ -897,6 +919,7 @@ export interface AnyEmailEvent {
     | "bounced"
     | "complained"
     | "rejected"
+    | "unsubscribed"
     | "unknown";
   /** The event payload, shaped by `type` */
   data: unknown;
@@ -943,6 +966,7 @@ export type WebhookEvent =
   | { type: "bounced"; data: OutboundEmailBouncedEvent }
   | { type: "complained"; data: OutboundEmailComplainedEvent }
   | { type: "rejected"; data: OutboundEmailRejectedEvent }
+  | { type: "unsubscribed"; data: OutboundEmailUnsubscribedEvent }
   | { type: "unknown"; data: unknown };
 
 export type WebhookLifecycleDriverEvent = {
@@ -950,7 +974,28 @@ export type WebhookLifecycleDriverEvent = {
   data: WebhookLifecycleEvent;
 };
 
-export type WebhookDriverEvent = WebhookEvent | WebhookLifecycleDriverEvent;
+/**
+ * Mailbox change reported by the provider itself — for providers that
+ * complete a mailbox connection by webhook instead of an OAuth callback.
+ * Dispatched to `hooks.mailbox.onConnected` / `hooks.mailbox.onDeleted`.
+ */
+export interface MailboxLifecycleEvent {
+  action: "connected" | "deleted";
+  mailbox: Mailbox;
+  /** User round-trip data from `mailboxes.connect({ context })`. */
+  context?: unknown;
+  raw?: unknown;
+}
+
+export type MailboxLifecycleDriverEvent = {
+  type: "mailbox.lifecycle";
+  data: MailboxLifecycleEvent;
+};
+
+export type WebhookDriverEvent =
+  | WebhookEvent
+  | WebhookLifecycleDriverEvent
+  | MailboxLifecycleDriverEvent;
 
 export type WebhookEventResult = WebhookDriverEvent | WebhookDriverEvent[];
 
@@ -965,6 +1010,7 @@ export type WebhookEventType =
   | "bounced"
   | "complained"
   | "rejected"
+  | "unsubscribed"
   | "unknown"
   | (string & {});
 
@@ -1105,6 +1151,13 @@ export type OutboundEmailComplainedHook = (
  */
 export type OutboundEmailRejectedHook = (
   event: OutboundEmailRejectedEvent,
+) => HookResult;
+
+/**
+ * Hook for recipient unsubscribe events
+ */
+export type OutboundEmailUnsubscribedHook = (
+  event: OutboundEmailUnsubscribedEvent,
 ) => HookResult;
 
 /**
@@ -1270,6 +1323,7 @@ export interface EmailKitHooks {
     onBounced?: OutboundEmailBouncedHook;
     onComplained?: OutboundEmailComplainedHook;
     onRejected?: OutboundEmailRejectedHook;
+    onUnsubscribed?: OutboundEmailUnsubscribedHook;
     onUnknown?: UnknownEventHook;
     onAll?: AllEventsHook;
   };

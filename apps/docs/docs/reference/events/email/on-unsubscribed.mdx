@@ -1,0 +1,33 @@
+---
+title: email.onUnsubscribed
+description: The recipient opted out — mirror it into your own preferences.
+sidebar:
+  label: onUnsubscribed
+---
+
+Fires when the recipient opts out through an unsubscribe link, their mail client's one-click header, or a reply that reads as an opt-out. The provider already stops the next send; this hook keeps your own preference UI in sync, so someone who unsubscribed by email doesn't see themselves still subscribed in your app.
+
+```ts
+hooks: {
+  email: {
+    onUnsubscribed: async (event) => {
+      await prisma.emailPreference.upsert({
+        where: {
+          email_list: { email: event.recipient, list: event.listId ?? "*" },
+        },
+        create: { email: event.recipient, list: event.listId ?? "*", subscribed: false },
+        update: { subscribed: false },
+      });
+    },
+  },
+},
+```
+
+`listId` is set when the provider names the list they left. Without it the opt-out isn't tied to a list — usually all non-transactional mail, not necessarily every email. AIInbx says which: `getAIInbxOutbound(event)?.unsubscribeScope` is `"all"` or `"optional"`. Resend, Mailgun, and AIInbx emit this event.
+
+## Payload
+
+<AutoTypeTable
+  path="../../packages/emailkit/src/types.ts"
+  name="OutboundEmailUnsubscribedEvent"
+/>

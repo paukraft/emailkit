@@ -6,15 +6,11 @@ sidebar:
   icon: /logos/aiinbx-sidebar.svg
 ---
 
-Choose AIInbx when your app needs inboxes of its own — think AI agents with email addresses — without asking users to connect Gmail or Outlook. Conversations stay threaded, and every event flows through the same hooks as any other provider.
+Choose AIInbx when your app needs inboxes of its own — think AI agents with email addresses. It can connect your users' Gmail and Outlook inboxes too, without you running OAuth. Conversations stay threaded, and every event flows through the same hooks as any other provider.
 
 ## 1. Create the AIInbx credentials
 
-In AIInbx:
-
-1. Create an API key.
-2. Add a webhook pointing to `https://your-app.com/api/email/aiinbx` with secret signing enabled.
-3. Copy the signing secret right away — AIInbx shows it once.
+In AIInbx, create an API key with the `full` scope (sending plus webhook and domain management).
 
 ```bash title=".env"
 AIINBX_API_KEY="..."
@@ -22,10 +18,12 @@ AIINBX_WEBHOOK_SECRET="..."
 PUBLIC_BASE_URL="https://your-app.com"
 ```
 
+The webhook secret comes from step 4.
+
 ## 2. Configure emailkit
 
 ```ts title="src/emailkit.ts"
-import { AIInbxDriver, EmailKit } from "emailkit";
+import { AIInbxDriver, EmailKit, getAIInbxInbound } from "emailkit";
 
 export const emailkit = EmailKit({
   emailDrivers: [
@@ -33,7 +31,6 @@ export const emailkit = EmailKit({
       id: "aiinbx",
       apiKey: process.env.AIINBX_API_KEY!,
       webhookSecret: process.env.AIINBX_WEBHOOK_SECRET!,
-      autoFetchInboundAttachments: true,
     }),
   ],
   publicRoutes: {
@@ -42,13 +39,17 @@ export const emailkit = EmailKit({
   hooks: {
     email: {
       onInbound: async (email) => {
+        // Skip autoresponders, bounces, and bulk mail.
+        if (getAIInbxInbound(email)?.category !== "human") return;
+
         await prisma.inboundEmail.upsert({
           where: { messageId: email.messageId },
           create: {
             messageId: email.messageId,
+            threadId: email.reply.threadId,
             from: email.from.email,
             subject: email.subject,
-            text: email.text,
+            text: email.strippedText ?? email.text,
           },
           update: {},
         });
@@ -66,6 +67,10 @@ export const emailkit = EmailKit({
 
 The upsert by `messageId` makes retried webhooks harmless.
 
+:::note
+AIInbx delivery events identify an email by its AIInbx id, so `sendEmail` returns that id (`eml_…`) as `messageId` — store it and match events on `event.messageId`. Inbound `messageId` stays the RFC Message-ID.
+:::
+
 ## 3. Add the public route
 
 ```ts title="app/api/email/[emailDriver]/route.ts"
@@ -80,19 +85,30 @@ export const { GET, POST } = createNextEmailKitHandler(emailkit, {
 
 AIInbx signs the exact request body with a freshness timestamp. The adapter preserves the body; emailkit rejects invalid or stale requests.
 
-## 4. Send and reply
+## 4. Register the webhook
 
 ```ts
-await emailkit.sendEmail({
+const { webhook } = await emailkit.webhooks.setup({ emailDriver: "aiinbx" });
+
+// Shown once — store it as AIINBX_WEBHOOK_SECRET.
+console.log(webhook.provider?.signingSecret);
+```
+
+Pass `inbound: { recipients: "support@inbox.example.com" }` to route only that address to this endpoint. When you rotate the secret in AIInbx, set `webhookSecret: [newSecret, oldSecret]` for the grace period — either one verifies.
+
+## 5. Send and reply
+
+```ts
+const sent = await emailkit.sendEmail({
   from: { email: "agent@inbox.example.com" },
   to: { email: "customer@example.com" },
   subject: "How can we help?",
   text: "Reply directly to this message.",
-  track: { opens: true, clicks: true },
+  idempotencyKey: "ticket-8812-opened",
 });
 ```
 
-Reply with the details from an inbound event and the conversation stays in one thread:
+Reply with the inbound event's thread id. AIInbx derives `In-Reply-To` and `References` from the conversation itself:
 
 ```ts
 await emailkit.sendEmail({
@@ -100,17 +116,56 @@ await emailkit.sendEmail({
   to: inbound.from,
   subject: `Re: ${inbound.subject}`,
   text: "Thanks for the context.",
-  reply: {
-    messageId: inbound.messageId,
-    references: inbound.reply.references,
-    threadId: inbound.reply.threadId,
-  },
+  reply: { threadId: inbound.reply.threadId },
 });
 ```
 
-## 5. Store inbound attachments
+Recipients on a suppression list are dropped, not failed — they come back in `sent.rejected`.
 
-With `autoFetchInboundAttachments: true`, attachment content usually arrives already downloaded. Use the shared retrieval method either way:
+## 6. Read what AIInbx figured out
+
+AIInbx does work other providers leave to you. It all rides along on the normal events, typed, behind three helpers:
+
+```ts
+import { getAIInbxAttachment, getAIInbxInbound } from "emailkit";
+
+onInbound: async (email) => {
+  const aiinbx = getAIInbxInbound(email);
+
+  aiinbx?.category; // "human" | "out_of_office" | "auto_reply" | "bounce" | ...
+  aiinbx?.verdicts; // { spam, spf, dkim, dmarc } — live webhooks only
+  aiinbx?.segments; // body cut into written / quoted / signature parts
+  aiinbx?.spaceId; // which customer space the mail belongs to
+
+  for (const attachment of email.attachments ?? []) {
+    const preparation = getAIInbxAttachment(attachment)?.preparation;
+
+    // PDFs, documents, and spreadsheets arrive extracted to Markdown.
+    if (preparation?.status === "ready" || preparation?.status === "partial") {
+      await ingest(attachment.filename, preparation.text!);
+    }
+  }
+};
+```
+
+`strippedText` and `strippedHtml` — the message without quoted history or signature — are on the event itself, like for every provider. `getAIInbxOutbound(event)` exposes the thread, space, and suppression key of delivery events.
+
+Prepared text is inlined by default. With `inlineAttachmentText: false`, fetch it on demand:
+
+```ts
+const { attachmentId } = getAIInbxAttachment(attachment)!;
+const response = await emailkit.providerFetch(
+  `/attachments/${attachmentId}/content`,
+  { emailDriver: "aiinbx" },
+);
+const markdown = await response.text();
+```
+
+A large document can still be in flight when the webhook fires — `preparation` is `null` then, not an error.
+
+## 7. Store inbound attachments
+
+With `autoFetchInboundAttachments: true` (the default), attachment content arrives already downloaded. Use the shared retrieval method either way — `attachment.url` is a stable API URL, safe to persist:
 
 ```ts
 for (const attachment of inbound.attachments ?? []) {
@@ -119,7 +174,7 @@ for (const attachment of inbound.attachments ?? []) {
 }
 ```
 
-## 6. Add and verify a domain
+## 8. Add and verify a domain
 
 ```ts
 const { domain } = await emailkit.domains.ensure({
@@ -134,6 +189,63 @@ await emailkit.domains.verify({
 });
 ```
 
+Open and click tracking is a domain setting in AIInbx, not a per-send option:
+
+```ts
+await emailkit.domains.update(
+  { emailDriver: "aiinbx", domainId: domain.id },
+  { tracking: { opens: true, clicks: true } },
+);
+```
+
+## Connect Gmail and Outlook inboxes
+
+AIInbx can also connect a customer's existing Gmail or Outlook account. It hosts the OAuth flow and keeps the tokens, so there is no callback route, no `auth` to store, and no refresh to run:
+
+```ts
+const connection = await emailkit.mailboxes.connect({
+  emailDriver: "aiinbx",
+  context: { userId: user.id },
+  landingUrl: "/settings/mailboxes",
+  provider: { provider: "google", backfill_days: 7 },
+});
+
+redirect(connection.redirectUrl!);
+```
+
+The customer lands back on `landingUrl` whether or not they approved. The signed `mailbox.connected` webhook is what tells you the mailbox is live — it fires `mailbox.onConnected` with your `context`:
+
+```ts
+hooks: {
+  mailbox: {
+    onConnected: async ({ mailbox, context }) => {
+      const { userId } = context as { userId: string };
+      await prisma.mailbox.upsert({
+        where: { id: mailbox.id },
+        create: { id: mailbox.id, email: mailbox.email, userId },
+        update: { userId },
+      });
+    },
+    onDeleted: async ({ mailbox }) => {
+      await prisma.mailbox.deleteMany({ where: { id: mailbox.id } });
+    },
+  },
+  webhook: {
+    // Authorization stopped working — ask the customer to reconnect.
+    onActionRequired: async (event) => {
+      if (event.reason !== "reauthorization_required") return;
+      await promptReconnect(event.target?.mailboxEmail);
+    },
+  },
+},
+```
+
+From there it is the normal API: send with the mailbox address as `from`, and its mail arrives in `onInbound` (`getAIInbxInbound(email)?.mailboxId` says which mailbox). `emailkit.mailboxes.list`, `get`, and `delete` manage them.
+
+:::note
+`context` travels in AIInbx's 200-character `ref`, so pass an id, not a large object. Mailboxes connected through AIInbx's hosted page or connect link arrive the same way, with their plain `ref` string as `context`. `onDeleted` can fire twice for a mailbox you delete yourself — once from the call, once from the webhook — so keep it idempotent.
+:::
+
 ## Recover missed inbound email
 
 ```ts
@@ -143,8 +255,17 @@ await emailkit.sync({
 });
 ```
 
-Recovered messages run through the same `onInbound` hook as live webhooks.
+Recovered messages run through the same `onInbound` hook as live webhooks, with the same AIInbx extras except `verdicts`.
 
 ## Extras
 
-AIInbx supports native threads, open and click tracking, domain management, inbound sync, and provider-only endpoints through `providerFetch()`. It doesn't offer templates, scheduling, tags, metadata, or custom headers — TypeScript hides those fields for you.
+AIInbx supports native threads, custom headers, scheduling (`sendAt`), duplicate-send protection (`idempotencyKey`), one-click unsubscribe (`unsubscribe: { listId }` maps to an AIInbx suppression key), open and click events, domain management, inbound sync, and provider-only endpoints through `providerFetch()`. Pacing and suppression lists go through `provider`:
+
+```ts
+await emailkit.sendEmail({
+  // ...
+  provider: { pacing: { skip: true }, suppressionKey: "product-updates" },
+});
+```
+
+Opt-outs arrive on `onUnsubscribed` — `getAIInbxOutbound(event)?.unsubscribeScope` says whether they blocked everything or only optional mail. AIInbx's thread and domain events arrive on `onUnknown`. It doesn't offer templates, tags, or metadata — TypeScript hides those fields for you.

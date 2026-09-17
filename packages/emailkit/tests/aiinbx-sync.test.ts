@@ -1,7 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AIInbxDriver, EmailKit, EmailKitError } from "../src";
+import {
+  AIInbxDriver,
+  EmailKit,
+  EmailKitError,
+  getAIInbxInbound,
+} from "../src";
 import type { SyncStream, WebhookDriverEvent } from "../src";
+import {
+  emailId,
+  fullEmail,
+  jsonResponse,
+  listEmail,
+  problemResponse,
+} from "./aiinbx-fixtures";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -11,397 +23,120 @@ afterEach(() => {
 const SINCE = new Date("2026-06-01T00:00:00.000Z");
 const UNTIL = new Date("2026-06-10T00:00:00.000Z");
 
-const jsonResponse = (body: unknown) =>
-  new Response(JSON.stringify(body), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+// Newest-first, as GET /emails returns them.
+const EMAILS = [
+  listEmail(emailId(5), "2026-06-11T00:00:00Z"), // after `until`
+  listEmail(emailId(4), "2026-06-08T00:00:00Z"),
+  listEmail(emailId(3), "2026-06-05T00:00:00Z"),
+  listEmail(emailId(2), "2026-06-01T00:00:00Z"), // exactly `since`
+  listEmail(emailId(1), "2026-05-20T00:00:00Z"), // before `since`
+  listEmail(emailId(0), "2026-05-01T00:00:00Z"),
+];
+const PAGE_SIZE = 2;
 
-const inboundEmail = (
-  id: string,
-  threadId: string,
-  receivedAt: string,
-  overrides: Record<string, unknown> = {},
-) => ({
-  id,
-  createdAt: receivedAt,
-  messageId: `<${id}@example.net>`,
-  inReplyToId: null,
-  references: [],
-  subject: `Subject ${id}`,
-  text: `Body ${id}`,
-  html: null,
-  strippedText: `Body ${id}`,
-  strippedHtml: null,
-  snippet: `Body ${id}`,
-  fromName: "Buyer",
-  fromAddress: "buyer@example.net",
-  toAddresses: ["agent@example.com"],
-  ccAddresses: [],
-  bccAddresses: [],
-  replyToAddresses: [],
-  sentAt: null,
-  receivedAt,
-  direction: "INBOUND",
-  status: "RECEIVED",
-  threadId,
-  attachments: [],
-  ...overrides,
-});
-
-/**
- * Mocks POST /threads/search (offset pagination) and GET /threads/{id}.
- * Thread t1's last email is newer than t2's single email, so a correct sync
- * must interleave emails across threads when sorting ascending.
- */
-const stubThreadsApi = () => {
+/** Mocks cursor-paginated GET /emails and GET /emails/{id}. */
+const stubEmailsApi = () => {
   const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+    init?.signal?.throwIfAborted();
     const url = new URL(input.toString());
 
-    if (url.pathname === "/api/v1/threads/search") {
-      const body = JSON.parse(String(init?.body));
-      if (body.offset === 0) {
-        return jsonResponse({
-          threads: [{ id: "t1" }],
-          pagination: { total: 2, limit: 100, offset: 0, hasMore: true },
-        });
-      }
-      if (body.offset === 1) {
-        return jsonResponse({
-          threads: [{ id: "t2" }],
-          pagination: { total: 2, limit: 100, offset: 1, hasMore: false },
-        });
-      }
-      throw new Error(`Unexpected search offset: ${body.offset}`);
-    }
-
-    if (url.pathname === "/api/v1/threads/t1") {
+    if (url.pathname === "/api/v2/emails") {
+      const start = Number(url.searchParams.get("cursor") ?? 0);
+      const end = start + PAGE_SIZE;
       return jsonResponse({
-        id: "t1",
-        createdAt: "2026-05-20T10:00:00.000Z",
-        subject: "Thread t1",
-        emails: [
-          inboundEmail("e_old", "t1", "2026-05-20T10:00:00.000Z"),
-          inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z"),
-          inboundEmail("e_out", "t1", "2026-06-04T10:00:00.000Z", {
-            direction: "OUTBOUND",
-            status: "SENT",
-          }),
-          inboundEmail("e3", "t1", "2026-06-05T10:00:00.000Z"),
-          inboundEmail("e_new", "t1", "2026-06-11T10:00:00.000Z"),
-        ],
-      });
-    }
-    if (url.pathname === "/api/v1/threads/t2") {
-      return jsonResponse({
-        id: "t2",
-        createdAt: "2026-06-03T10:00:00.000Z",
-        subject: "Thread t2",
-        emails: [inboundEmail("e2", "t2", "2026-06-03T10:00:00.000Z")],
+        data: EMAILS.slice(start, end),
+        next_cursor: end < EMAILS.length ? String(end) : null,
       });
     }
 
-    throw new Error(`Unexpected request: ${url}`);
+    const email = EMAILS.find(
+      (item) => url.pathname === `/api/v2/emails/${item.id}`,
+    )!;
+    return jsonResponse(fullEmail(email.id, email.created_at));
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 };
 
-const drain = async (stream: SyncStream) => {
+const collect = async (stream: SyncStream) => {
   const events: WebhookDriverEvent[] = [];
-  while (true) {
-    const result = await stream.next();
-    if (result.done) return { events, result: result.value };
-    events.push(result.value);
+  let next = await stream.next();
+  while (!next.done) {
+    events.push(next.value);
+    next = await stream.next();
   }
+  return { events, result: next.value };
 };
 
 describe("AIInbxDriver sync", () => {
-  it("declares the account sync capability", () => {
+  it("replays windowed inbound emails oldest-first and stops paging at since", async () => {
+    const fetchMock = stubEmailsApi();
     const driver = AIInbxDriver({ apiKey: "ai_test" });
 
-    expect(driver.capabilities.sync).toEqual({ account: true });
-    expect(typeof driver.sync?.account).toBe("function");
-  });
-
-  it("replays windowed inbound emails ascending across paginated threads", async () => {
-    const fetchMock = stubThreadsApi();
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-
-    const { events, result } = await drain(
+    const { events, result } = await collect(
       driver.sync!.account!({ since: SINCE, until: UNTIL }),
     );
 
     expect(result).toEqual({ syncedFrom: SINCE });
-    expect(events.map((event) => event.type)).toEqual([
-      "inbound",
-      "inbound",
-      "inbound",
-    ]);
-    // e2 lives in thread t2 but falls between t1's e1 and e3.
-    expect(events.map((event) => (event.data as any).providerId)).toEqual([
-      "e1",
-      "e2",
-      "e3",
-    ]);
-    expect(events[0]!.data).toMatchObject({
-      schemaVersion: "1",
-      messageId: "<e1@example.net>",
-      providerId: "e1",
-      from: { name: "Buyer", email: "buyer@example.net" },
-      to: [{ email: "agent@example.com" }],
-      reply: { threadId: "t1" },
-      subject: "Subject e1",
-      text: "Body e1",
-      timestamp: new Date("2026-06-02T10:00:00.000Z"),
-    });
-
-    const searchCalls = fetchMock.mock.calls.filter((call) =>
-      call[0]!.toString().endsWith("/threads/search"),
-    );
-    expect(searchCalls).toHaveLength(2);
-    const [, searchInit] = searchCalls[0]!;
-    expect(new Headers(searchInit?.headers).get("authorization")).toBe(
-      "Bearer ai_test",
-    );
-    expect(JSON.parse(String(searchInit?.body))).toEqual({
-      // 1ms before `since` so boundary emails survive "after" semantics.
-      lastEmailAfter: "2026-05-31T23:59:59.999Z",
-      sortBy: "lastEmailAt",
-      sortOrder: "asc",
-      limit: 100,
-      offset: 0,
-    });
-    expect(JSON.parse(String(searchCalls[1]![1]?.body))).toMatchObject({
-      offset: 1,
-    });
-  });
-
-  it("replays inbound attachments with webhook-compatible shape and lazy content retrieval", async () => {
-    const signedUrl =
-      "https://signed-bucket.s3.amazonaws.com/report.txt?X-Amz-Signature=abc";
-    const fetchMock = vi.fn(async (input: string | URL, _init?: RequestInit) => {
-      const url = new URL(input.toString());
-
-      if (url.pathname === "/api/v1/threads/search") {
-        return jsonResponse({
-          threads: [{ id: "t1" }],
-          pagination: { total: 1, limit: 100, offset: 0, hasMore: false },
-        });
-      }
-
-      if (url.pathname === "/api/v1/threads/t1") {
-        return jsonResponse({
-          id: "t1",
-          createdAt: "2026-06-02T10:00:00.000Z",
-          subject: "Thread t1",
-          emails: [
-            inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z", {
-              attachments: [
-                {
-                  id: "att_1",
-                  createdAt: "2026-06-02T10:00:00.000Z",
-                  fileName: "report.txt",
-                  contentType: "text/plain",
-                  sizeInBytes: 14,
-                  cid: null,
-                  disposition: "attachment",
-                  signedUrl,
-                  expiresAt: "2026-06-02T11:00:00.000Z",
-                },
-              ],
-            }),
-          ],
-        });
-      }
-
-      if (input.toString() === signedUrl) {
-        return new Response("aiinbx content", { status: 200 });
-      }
-
-      throw new Error(`Unexpected request: ${url}`);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const onInbound = vi.fn();
-    const client = EmailKit({
-      emailDrivers: [
-        AIInbxDriver({
-          id: "support-aiinbx",
-          apiKey: "ai_test",
-          autoFetchInboundAttachments: false,
-        }),
-      ],
-      hooks: { email: { onInbound } },
-    });
-
-    await client.sync({ since: SINCE, until: UNTIL });
-
-    const inbound = onInbound.mock.calls[0]![0];
-    expect(inbound.attachments).toEqual([
-      {
-        filename: "report.txt",
-        contentType: "text/plain",
-        size: 14,
-        contentId: undefined,
-        isInline: false,
-        url: signedUrl,
-        emailDriver: "support-aiinbx",
-      },
-    ]);
-
-    const content = await client.attachments.getContent(inbound.attachments[0]);
-    expect(new TextDecoder().decode(content as Uint8Array)).toBe(
-      "aiinbx content",
-    );
-    const [, init] = fetchMock.mock.calls.at(-1)!;
-    expect(new Headers(init?.headers).get("authorization")).toBeNull();
-  });
-
-  it("auto-fetches inbound attachments in parallel during sync", async () => {
-    const signedUrl1 =
-      "https://signed-bucket.s3.amazonaws.com/first.txt?X-Amz-Signature=abc";
-    const signedUrl2 =
-      "https://signed-bucket.s3.amazonaws.com/second.txt?X-Amz-Signature=def";
-    const attachmentStarts: string[] = [];
-    const waitForSecondAttachment = async () => {
-      for (let i = 0; i < 30; i += 1) {
-        if (attachmentStarts.includes(signedUrl2)) return;
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-      throw new Error("second attachment fetch did not start");
-    };
-
-    const fetchMock = vi.fn(async (input: string | URL) => {
-      const url = new URL(input.toString());
-
-      if (url.pathname === "/api/v1/threads/search") {
-        return jsonResponse({
-          threads: [{ id: "t1" }],
-          pagination: { total: 1, limit: 100, offset: 0, hasMore: false },
-        });
-      }
-
-      if (url.pathname === "/api/v1/threads/t1") {
-        return jsonResponse({
-          id: "t1",
-          createdAt: "2026-06-02T10:00:00.000Z",
-          subject: "Thread t1",
-          emails: [
-            inboundEmail("e1", "t1", "2026-06-02T10:00:00.000Z", {
-              attachments: [
-                {
-                  id: "att_1",
-                  createdAt: "2026-06-02T10:00:00.000Z",
-                  fileName: "first.txt",
-                  contentType: "text/plain",
-                  sizeInBytes: 5,
-                  cid: null,
-                  disposition: "attachment",
-                  signedUrl: signedUrl1,
-                  expiresAt: "2026-06-02T11:00:00.000Z",
-                },
-                {
-                  id: "att_2",
-                  createdAt: "2026-06-02T10:00:00.000Z",
-                  fileName: "second.txt",
-                  contentType: "text/plain",
-                  sizeInBytes: 6,
-                  cid: null,
-                  disposition: "attachment",
-                  signedUrl: signedUrl2,
-                  expiresAt: "2026-06-02T11:00:00.000Z",
-                },
-              ],
-            }),
-          ],
-        });
-      }
-
-      if (input.toString() === signedUrl1) {
-        attachmentStarts.push(signedUrl1);
-        await waitForSecondAttachment();
-        return new Response("first", { status: 200 });
-      }
-
-      if (input.toString() === signedUrl2) {
-        attachmentStarts.push(signedUrl2);
-        return new Response("second", { status: 200 });
-      }
-
-      throw new Error(`Unexpected request: ${url}`);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const onInbound = vi.fn();
-    const client = EmailKit({
-      emailDrivers: [AIInbxDriver({ apiKey: "ai_test" })],
-      hooks: { email: { onInbound } },
-    });
-
-    await client.sync({ since: SINCE, until: UNTIL });
-
-    const inbound = onInbound.mock.calls[0]![0];
     expect(
-      inbound.attachments.map((attachment: { content: Uint8Array }) =>
-        new TextDecoder().decode(attachment.content),
-      ),
-    ).toEqual(["first", "second"]);
+      events.map((event) => (event.data as { providerId: string }).providerId),
+    ).toEqual([emailId(2), emailId(3), emailId(4)]);
+    expect(events[0]).toMatchObject({
+      type: "inbound",
+      data: {
+        eventId: `${emailId(2)}:received`,
+        messageId: `<${emailId(2)}@example.net>`,
+        timestamp: new Date("2026-06-01T00:00:00Z"),
+      },
+    });
+    expect(
+      getAIInbxInbound(events[0]!.data as never)?.verdicts,
+    ).toBeUndefined();
+
+    const listCalls = fetchMock.mock.calls
+      .map(([input]) => new URL(input.toString()))
+      .filter((url) => url.pathname === "/api/v2/emails");
+    // Pages 1–3 reach an email older than `since`; nothing is listed after.
+    expect(listCalls.map((url) => url.searchParams.get("cursor"))).toEqual([
+      null,
+      "2",
+      "4",
+    ]);
+    expect(listCalls[0]!.searchParams.get("direction")).toBe("inbound");
+    expect(listCalls[0]!.searchParams.get("limit")).toBe("100");
   });
 
   it("rejects the next request when the sync signal aborts", async () => {
+    stubEmailsApi();
     const controller = new AbortController();
-    const fetchMock = vi.fn(
-      async (_input: string | URL, init?: RequestInit) => {
-        // Real fetch rejects when called with an already-aborted signal.
-        if (init?.signal?.aborted) {
-          throw new DOMException("This operation was aborted", "AbortError");
-        }
-        controller.abort();
-        return jsonResponse({
-          threads: [{ id: "t1" }],
-          pagination: { total: 2, limit: 100, offset: 0, hasMore: true },
-        });
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const stream = driver.sync!.account!({
+    const stream = AIInbxDriver({ apiKey: "ai_test" }).sync!.account!({
       since: SINCE,
       until: UNTIL,
       signal: controller.signal,
     });
 
+    await stream.next();
+    controller.abort();
+
     await expect(stream.next()).rejects.toMatchObject({ name: "AbortError" });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("throws EmailKitError when the threads search API fails", async () => {
+  it("throws EmailKitError when listing emails fails", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValueOnce(
-        new Response(JSON.stringify({ message: "server exploded" }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        }),
-      ),
+      vi.fn(async () => problemResponse(403, "forbidden", "Key lacks scope")),
     );
-
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const stream = driver.sync!.account!({ since: SINCE });
-
-    const error = await stream.next().catch((caught) => caught);
-    expect(error).toBeInstanceOf(EmailKitError);
-    expect(error).toMatchObject({
-      provider: "aiinbx",
-      httpStatus: 500,
-      message: "server exploded",
+    const stream = AIInbxDriver({ apiKey: "ai_test" }).sync!.account!({
+      since: SINCE,
     });
+
+    const error = await stream.next().catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(EmailKitError);
+    expect(error).toMatchObject({ code: "forbidden", httpStatus: 403 });
   });
 
   it("dispatches top-level emailKit.sync replays through inbound hooks", async () => {
-    stubThreadsApi();
+    stubEmailsApi();
     const onInbound = vi.fn();
     const onAll = vi.fn();
     const client = EmailKit({
@@ -416,19 +151,11 @@ describe("AIInbxDriver sync", () => {
     });
 
     expect(result).toEqual({ dispatched: 3, syncedFrom: SINCE });
-    expect(onInbound).toHaveBeenCalledTimes(3);
-    expect(onInbound.mock.calls.map((call) => call[0].providerId)).toEqual([
-      "e1",
-      "e2",
-      "e3",
-    ]);
     expect(onInbound.mock.calls[0]![0]).toMatchObject({
       emailDriver: "support-aiinbx",
-      messageId: "<e1@example.net>",
+      providerId: emailId(2),
     });
-    expect(onAll).toHaveBeenCalledTimes(3);
     expect(onAll.mock.calls[0]![0]).toMatchObject({
-      emailDriver: "support-aiinbx",
       type: "inbound",
       context: { reason: "outage" },
     });

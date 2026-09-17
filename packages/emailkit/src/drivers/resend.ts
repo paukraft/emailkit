@@ -512,6 +512,7 @@ const RESEND_EVENT_BY_EMAILKIT_EVENT: Record<string, string[]> = {
   bounced: ["email.bounced"],
   complained: ["email.complained"],
   rejected: ["email.failed", "email.suppressed"],
+  unsubscribed: ["email.unsubscribed"],
   inbound: ["email.received"],
 };
 
@@ -526,7 +527,7 @@ const EMAILKIT_EVENT_BY_RESEND_EVENT: Record<string, WebhookEventType> = {
   "email.complained": "complained",
   "email.scheduled": "outbound",
   "email.suppressed": "rejected",
-  "email.unsubscribed": "complained",
+  "email.unsubscribed": "unsubscribed",
   "email.received": "inbound",
 };
 
@@ -831,7 +832,7 @@ const transformOutboundEvent = (
     "email.complained": "complained",
     "email.scheduled": "sent",
     "email.suppressed": "rejected",
-    "email.unsubscribed": "complained", // Map unsubscribe to complained
+    "email.unsubscribed": "unsubscribed",
   };
 
   baseEvent.status = statusMap[eventType] || "sent";
@@ -1472,6 +1473,7 @@ export const ResendDriver = <const TId extends string = "resend">(
           | "bounced"
           | "complained"
           | "rejected"
+          | "unsubscribed"
           | "outbound"
         > = {
           "email.sent": "sent",
@@ -1484,7 +1486,7 @@ export const ResendDriver = <const TId extends string = "resend">(
           "email.complained": "complained",
           "email.scheduled": "outbound",
           "email.suppressed": "rejected",
-          "email.unsubscribed": "complained",
+          "email.unsubscribed": "unsubscribed",
         };
 
         const mappedType = eventTypeMap[eventType];

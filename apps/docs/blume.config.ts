@@ -50,6 +50,7 @@ export default defineConfig({
                   "/reference/events/email/on-bounced",
                   "/reference/events/email/on-complained",
                   "/reference/events/email/on-rejected",
+                  "/reference/events/email/on-unsubscribed",
                   "/reference/events/email/on-unknown",
                   "/reference/events/email/on-all",
                 ],

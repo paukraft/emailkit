@@ -139,7 +139,13 @@ const resolveUrl = (base: string, input: string | URL): URL => {
   const normalizedBase = base.endsWith("/") ? base : `${base}/`;
   const normalizedPath = input.startsWith("/") ? input.slice(1) : input;
 
-  return new URL(normalizedPath, normalizedBase);
+  // Relative input like `///host` or `\\host` resolves off-origin; callers
+  // treat relative paths as provider API paths and attach credentials.
+  const url = new URL(normalizedPath, normalizedBase);
+  if (url.origin !== new URL(normalizedBase).origin) {
+    throw new TypeError(`Relative path resolves outside ${base}: ${input}`);
+  }
+  return url;
 };
 
 export const createProviderFetch = (

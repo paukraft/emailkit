@@ -84,7 +84,7 @@ Receiving is one hook:
 
 ### When sending goes wrong
 
-Three hooks cover the unhappy paths — in a good week, none of them fire:
+Four hooks cover the unhappy paths — in a good week, none of them fire:
 
 <div class="ev-grid">
   <div class="ev-card">
@@ -98,6 +98,10 @@ Three hooks cover the unhappy paths — in a good week, none of them fire:
   <div class="ev-card">
     <a class="ev-hook" href="/reference/events/email/on-rejected">onRejected</a>
     <p class="ev-when">The provider refused the send — blocked address, policy, suppression list. <code>reason</code> and <code>category</code> say why.</p>
+  </div>
+  <div class="ev-card">
+    <a class="ev-hook" href="/reference/events/email/on-unsubscribed">onUnsubscribed</a>
+    <p class="ev-when">The recipient opted out by link, one-click header, or reply. Mirror it into your own preferences.</p>
   </div>
 </div>
 

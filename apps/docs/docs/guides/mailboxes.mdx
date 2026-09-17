@@ -142,3 +142,7 @@ OutlookDriver({
 Outlook needs nothing else per inbox. Gmail needs one Pub/Sub topic for your whole Google Cloud project — every connected inbox shares it.
 
 The provider guides cover the platform setup and keeping subscriptions alive: [Gmail](/providers/gmail) and [Outlook](/providers/outlook).
+
+:::tip
+Don't want to run OAuth apps, token storage, and subscriptions yourself? [AIInbx](/providers/aiinbx#connect-gmail-and-outlook-inboxes) connects Gmail and Outlook inboxes through a hosted flow and keeps the tokens — same `mailboxes.connect()` call, nothing to store.
+:::

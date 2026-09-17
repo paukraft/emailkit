@@ -41,6 +41,7 @@ export async function POST(request: Request) {
           input: {
             email: str(body.email),
             callbackUrl: str(body.callbackUrl),
+            landingUrl: str(body.landingUrl),
             scopes: arr(body.scopes),
             context: body.context,
             provider: obj(body.provider),

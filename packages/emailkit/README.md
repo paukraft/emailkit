@@ -12,6 +12,33 @@ Unified email SDK with pluggable drivers (Gmail, Mailgun, Resend, AIInbx, Outloo
 npm i emailkit
 ```
 
+## Migrating from 3.x to 4.0
+
+Unsubscribes have their own hook:
+
+- Resend and Mailgun unsubscribe events now fire `hooks.email.onUnsubscribed`
+  (status `"unsubscribed"`) instead of `onComplained`. An opt-out is not a spam
+  report; handle both if you suppress on either.
+
+### AIInbx platform 2.0
+
+The AIInbx driver now targets the rewritten AIInbx platform (API v2). Driver
+config is unchanged, but:
+
+- Create a new webhook endpoint (`emailkit.webhooks.setup({ emailDriver: "aiinbx" })`)
+  and use its signing secret — v2 signs with a single `AIInbx-Signature` header.
+- Replies thread by `reply.threadId` only; `reply.messageId`/`references` are
+  gone because AIInbx derives the RFC headers from the thread.
+- `track` is gone — tracking is a domain setting (`domains.update`). Custom
+  headers, `sendAt`, `idempotencyKey`, and `unsubscribe` are new.
+- `sendEmail` and delivery events use the AIInbx email id (`eml_…`) as
+  `messageId`, so `result.messageId` matches `event.messageId`.
+- Gmail and Outlook inboxes connect through AIInbx's hosted OAuth:
+  `emailkit.mailboxes.connect({ emailDriver: "aiinbx", ... })`; completion
+  arrives by webhook on `hooks.mailbox.onConnected`. No `secret` required.
+- Category, verdicts, body segments, and prepared attachment Markdown are typed
+  under `getAIInbxInbound(event)` / `getAIInbxAttachment(attachment)`.
+
 ## Migrating from 2.x to 3.0
 
 Webhook verification is stricter:
@@ -438,9 +465,8 @@ Semantics:
   fact. Mailgun replays inbound and outbound tracking events; Outlook queries
   the mailbox message collection by default so moved or archived received mail
   can still replay, while skipping messages sent by the synced mailbox; Resend
-  and AIInbx replay inbound email only — their APIs expose no tracking-event
-  history, so `onDelivered`/`onOpened` webhooks missed during the outage are
-  not recoverable there.
+  and AIInbx replay inbound email only, so `onDelivered`/`onOpened` webhooks
+  missed during the outage are not recoverable there.
 - `result.syncedFrom` is the earliest time the provider data actually covered.
   When provider retention cuts the window short (Mailgun stores events for a
   bounded window), `syncedFrom` is later than `since` — reported, never thrown.

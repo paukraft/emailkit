@@ -24,6 +24,13 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   Table,
   TableBody,
   TableCell,
@@ -59,6 +66,11 @@ function MailboxesPanelInner({ driver }: { driver: SandboxDriverInfo }) {
   const [connectOpen, setConnectOpen] = useState(false)
   const [connectEmail, setConnectEmail] = useState("")
   const [connectCallback, setConnectCallback] = useState("")
+  const [connectProvider, setConnectProvider] = useState<
+    "google" | "microsoft"
+  >("google")
+  // Provider-hosted OAuth (AIInbx): no callback route, the user just lands back here.
+  const hostedConnect = !caps.publicRoutes?.connectCallback
   const [connecting, setConnecting] = useState(false)
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
@@ -99,7 +111,12 @@ function MailboxesPanelInner({ driver }: { driver: SandboxDriverInfo }) {
           emailDriver: driver.id,
           action: "connect",
           email: connectEmail || undefined,
-          callbackUrl: connectCallback || undefined,
+          ...(hostedConnect
+            ? {
+                landingUrl: window.location.href,
+                provider: { provider: connectProvider },
+              }
+            : { callbackUrl: connectCallback || undefined }),
         }),
       })
       const data = await response.json()
@@ -282,18 +299,40 @@ function MailboxesPanelInner({ driver }: { driver: SandboxDriverInfo }) {
           ) : (
             <>
               <div className="grid gap-2">
-                <Input
-                  value={connectEmail}
-                  onChange={(event) => setConnectEmail(event.target.value)}
-                  placeholder="user@example.com (optional)"
-                  className="text-xs"
-                />
-                <Input
-                  value={connectCallback}
-                  onChange={(event) => setConnectCallback(event.target.value)}
-                  placeholder="callback URL (optional)"
-                  className="text-xs"
-                />
+                {hostedConnect ? (
+                  <Select
+                    value={connectProvider}
+                    onValueChange={(value) =>
+                      value &&
+                      setConnectProvider(value as typeof connectProvider)
+                    }
+                  >
+                    <SelectTrigger className="h-8 text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="google">Google</SelectItem>
+                      <SelectItem value="microsoft">Microsoft</SelectItem>
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <>
+                    <Input
+                      value={connectEmail}
+                      onChange={(event) => setConnectEmail(event.target.value)}
+                      placeholder="user@example.com (optional)"
+                      className="text-xs"
+                    />
+                    <Input
+                      value={connectCallback}
+                      onChange={(event) =>
+                        setConnectCallback(event.target.value)
+                      }
+                      placeholder="callback URL (optional)"
+                      className="text-xs"
+                    />
+                  </>
+                )}
               </div>
               <DialogFooter>
                 <Button onClick={connect} disabled={connecting} size="sm">

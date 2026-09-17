@@ -740,6 +740,32 @@ describe("ResendDriver", () => {
     });
   });
 
+  it("normalizes Resend unsubscribes as unsubscribed, not complained", async () => {
+    const event = await ResendDriver({ apiKey: "re_test" }).handleWebhook({
+      method: "POST",
+      headers: {},
+      body: {
+        type: "email.unsubscribed",
+        created_at: "2026-02-22T23:41:12.126Z",
+        data: {
+          email_id: "email_unsubscribed",
+          from: "Sender <sender@example.com>",
+          to: ["recipient@example.com"],
+          subject: "Hello",
+          created_at: "2026-02-22T23:41:11.894719+00:00",
+        },
+      },
+    });
+
+    expect(event.type).toBe("unsubscribed");
+    expect(event.data).toMatchObject({
+      eventId: "email_unsubscribed:email.unsubscribed:2026-02-22T23:41:12.126Z",
+      providerId: "email_unsubscribed",
+      recipient: "recipient@example.com",
+      status: "unsubscribed",
+    });
+  });
+
   it("normalizes Resend delivery delays as outbound, not delivered", async () => {
     const driver = ResendDriver({ apiKey: "re_test" });
     const event = await driver.handleWebhook({

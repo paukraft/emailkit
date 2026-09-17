@@ -1378,6 +1378,47 @@ describe("MailgunDriver webhooks", () => {
     );
   });
 
+  it("routes unsubscribes to onUnsubscribed, not onComplained", async () => {
+    const onUnsubscribed = vi.fn();
+    const onComplained = vi.fn();
+    const client = EmailKit({
+      emailDrivers: [
+        MailgunDriver({
+          apiKey: "key-test",
+          webhookSigningKey: testWebhookSigningKey,
+        }),
+      ],
+      hooks: { email: { onUnsubscribed, onComplained } },
+    });
+
+    const response = await client.handler()({
+      method: "POST",
+      headers: {},
+      body: signedMailgunEventBody({
+        "event-data": {
+          id: "evt_unsubscribed",
+          event: "unsubscribed",
+          timestamp: 1529006854,
+          recipient: "recipient@example.com",
+          message: {
+            headers: { "message-id": "<message@example.com>" },
+          },
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(onComplained).not.toHaveBeenCalled();
+    expect(onUnsubscribed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventId: "evt_unsubscribed",
+        messageId: "<message@example.com>",
+        recipient: "recipient@example.com",
+        status: "unsubscribed",
+      }),
+    );
+  });
+
   it("reports inbound-looking Mailgun accepted events without firing inbound hooks", async () => {
     const onAll = vi.fn();
     const onInbound = vi.fn();

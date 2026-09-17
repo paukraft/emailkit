@@ -1,52 +1,78 @@
 /**
- * AIInbx email driver
+ * AIInbx email driver (API v2)
  *
- * Implements the AIInbx API for sending emails and handling webhooks.
- * Documentation: https://docs.aiinbx.com/api-reference
- * OpenAPI Spec: https://app.stainless.com/api/spec/documented/ai-inbx/openapi.documented.yml
+ * Documentation: https://docs.aiinbx.com
+ * OpenAPI Spec: https://api.aiinbx.com/api/v2/openapi.json
  */
 
 import { createHmac, timingSafeEqual } from "crypto";
 import type {
+  DriverDomainsAPI,
+  DriverMailboxesAPI,
   EmailDriver,
   EmailDriverConfig,
   ProviderFetch,
-  ProviderFetchInit,
   SendEmailOptions,
   SyncStream,
 } from "../driver";
-import type { DriverDomainsAPI } from "../driver";
 import type {
   AccountSyncInput,
+  AccountWebhookDeleteInput,
+  AccountWebhookDeleteResult,
+  AccountWebhookRefreshInput,
+  AccountWebhookRefreshResult,
+  AccountWebhookSetupInput,
+  AccountWebhookSetupResult,
   Attachment,
+  ConnectMailboxInput,
+  CreateDomainInput,
+  Domain,
+  DomainDNSRecord,
+  DomainDeleteResult,
+  DomainRecordPurpose,
+  DomainVerification,
   DriverCapabilities,
   EmailAddress,
   EmailMessage,
-  DomainDNSRecord,
-  Domain,
-  DomainVerification,
   InboundEmailEvent,
+  ListDomainsOptions,
+  ListMailboxesOptions,
+  Mailbox,
+  MailboxConnectionResult,
+  MailboxDeleteResult,
   OutboundEmailEvent,
   SendEmailResult,
+  UpdateDomainInput,
+  Webhook,
+  WebhookDriverEvent,
   WebhookEvent,
+  WebhookEventResult,
+  WebhookEventSelection,
+  WebhookEventType,
   WebhookRequest,
   WebhookResponse,
 } from "../types";
 import { EmailKitError } from "../types";
+import {
+  isAbortError,
+  retrieveAttachmentsInParallel,
+} from "../utils/attachments";
 import { bytesToBase64, stringToBase64 } from "../utils/base64";
+import { createProviderFetch } from "../utils/provider-fetch";
 import {
   buildReplyContext,
-  hasReplyData,
   replyAddressesAsArray,
   resolveMessageReplyContext,
 } from "../utils/reply";
-import { createProviderFetch } from "../utils/provider-fetch";
-import { retrieveAttachmentsInParallel } from "../utils/attachments";
 import {
   getHeader,
   isFreshWebhookTimestamp,
   requireRawBody,
 } from "../utils/webhook";
+
+const PROVIDER = "aiinbx";
+const DEFAULT_API_BASE = "https://api.aiinbx.com";
+const LIST_PAGE_SIZE = 100;
 
 /**
  * AIInbx-specific configuration
@@ -63,207 +89,343 @@ export interface AIInbxDriverConfig<TId extends string = "aiinbx">
    */
   apiBase?: string;
   /**
-   * Optional webhook signing secret for webhook verification
+   * Webhook endpoint signing secret. Pass both secrets during a rotation
+   * grace period; a request verifies when any of them matches.
    */
-  webhookSecret?: string;
+  webhookSecret?: string | string[];
   /**
-   * Automatically fetch inbound attachments from signed URLs.
-   * If false, attachments will include metadata and URL only.
+   * Automatically download inbound attachment content.
+   * If false, attachments carry metadata and a stable API URL only.
    * App code can still retrieve content later via `emailkit.attachments.getContent(...)`.
    * Default: true
    */
   autoFetchInboundAttachments?: boolean;
+  /**
+   * Inline AIInbx's prepared attachment text (PDFs, documents, and
+   * spreadsheets extracted to Markdown) on inbound events, readable via
+   * `getAIInbxAttachment(attachment)?.preparation?.text`.
+   * Default: true
+   */
+  inlineAttachmentText?: boolean;
 }
 
-// (removed unused format helpers)
+/**
+ * AIInbx classification of an inbound message.
+ */
+export type AIInbxEmailCategory =
+  | "human"
+  | "out_of_office"
+  | "auto_reply"
+  | "bounce"
+  | "verification"
+  | "transactional"
+  | "notification"
+  | "marketing"
+  | "spam";
 
 /**
- * Parse email address string into EmailAddress object
+ * Sender authentication results. Only delivered with live webhooks — the
+ * AIInbx API does not return them on stored emails, so sync replays omit them.
  */
-const parseEmailAddress = (emailStr: string, name?: string): EmailAddress => {
-  if (!emailStr) return { email: "" };
-  const match = emailStr.match(/^(.+?)\s*<(.+?)>$/i);
-  if (match) {
-    return { name: match[1].trim(), email: match[2].trim() };
-  }
-  return { email: emailStr.trim(), name: name || undefined };
+export interface AIInbxVerdicts {
+  spam?: string;
+  spf?: string;
+  dkim?: string;
+  dmarc?: string;
+}
+
+/**
+ * One part of AIInbx's cut of an inbound body, in order.
+ */
+export interface AIInbxSegment {
+  kind: "written" | "quoted" | "signature";
+  text: string;
+}
+
+/**
+ * AIInbx's extraction of an attachment into model-readable text.
+ */
+export interface AIInbxAttachmentPreparation {
+  status: "ready" | "partial" | "unsupported" | "failed";
+  format: "markdown" | "text" | null;
+  pages: number | null;
+  warnings: string[];
+  /** Extracted text. Present when `inlineAttachmentText` is enabled. */
+  text?: string | null;
+}
+
+interface AIInbxResourceMetadata {
+  emailId: string;
+  threadId?: string;
+  /** Space the email is in; null is the workspace itself. */
+  spaceId: string | null;
+  /** Domain the email went through, when the webhook reported it. */
+  domainId?: string | null;
+  /** Connected mailbox the email went through, when the webhook reported it. */
+  mailboxId?: string | null;
+}
+
+/** `provider.aiinbx` on inbound events. */
+export interface AIInbxInboundMetadata extends AIInbxResourceMetadata {
+  threadId: string;
+  category: AIInbxEmailCategory | null;
+  snippet: string;
+  segments: AIInbxSegment[];
+  verdicts?: AIInbxVerdicts;
+}
+
+/** `provider.aiinbx` on outbound events. */
+export interface AIInbxOutboundMetadata extends AIInbxResourceMetadata {
+  suppressionKey?: string | null;
+  /**
+   * On unsubscribed events: whether the recipient blocked everything or only
+   * optional mail (they still want receipts and password resets).
+   */
+  unsubscribeScope?: "all" | "optional";
+}
+
+/** `provider.aiinbx` on inbound attachments. */
+export interface AIInbxAttachmentMetadata {
+  attachmentId: string;
+  /** Null when nothing was extracted, or extraction is still in flight. */
+  preparation: AIInbxAttachmentPreparation | null;
+}
+
+/**
+ * AIInbx send options accepted on `message.provider`.
+ */
+export interface AIInbxSendOptions {
+  /** Suppression list this send is checked against. */
+  suppressionKey?: string;
+  /** Bypass (`skip`) or discount (`count: false`) pacing rules. */
+  pacing?: { skip?: boolean; count?: boolean };
+}
+
+/**
+ * AIInbx options accepted on `mailboxes.connect({ provider })`.
+ */
+export interface AIInbxConnectMailboxOptions {
+  /** Which account type the customer connects. */
+  provider: "google" | "microsoft";
+  /** Your own OAuth app, so the consent screen carries your brand. */
+  app_id?: string;
+  /** Space the mailbox — and everything synced from it — lands in. */
+  space_id?: string;
+  region?: "eu-central-1" | "us-east-1";
+  /** History to import on first sync, 0–90 days. */
+  backfill_days?: number;
+}
+
+const readAIInbxMetadata = <T>(
+  provider: Record<string, unknown> | undefined,
+): T | undefined => {
+  const metadata = provider?.[PROVIDER];
+  return metadata && typeof metadata === "object" ? (metadata as T) : undefined;
 };
 
-/**
- * AIInbx Email schema (from OpenAPI spec)
- */
+/** AIInbx extras of an inbound event: category, verdicts, segments, ids. */
+export const getAIInbxInbound = (
+  event: InboundEmailEvent,
+): AIInbxInboundMetadata | undefined => readAIInbxMetadata(event.provider);
+
+/** AIInbx extras of an outbound event: thread, space, suppression key. */
+export const getAIInbxOutbound = (
+  event: OutboundEmailEvent,
+): AIInbxOutboundMetadata | undefined => readAIInbxMetadata(event.provider);
+
+/** AIInbx extras of an inbound attachment: id and prepared Markdown/text. */
+export const getAIInbxAttachment = (
+  attachment: Attachment,
+): AIInbxAttachmentMetadata | undefined =>
+  readAIInbxMetadata(attachment.provider);
+
+interface AIInbxAttachment {
+  id: string;
+  filename: string;
+  content_type: string;
+  size: number;
+  cid: string | null;
+  /** Short-lived signed URL. */
+  download_url: string;
+  preparation:
+    | (AIInbxAttachmentPreparation & { content_url: string | null })
+    | null;
+}
+
+/** `Email` schema — list item shape. */
 interface AIInbxEmail {
   id: string;
-  createdAt: string;
-  messageId: string;
-  inReplyToId: string | null;
-  references: string[];
-  subject: string | null;
-  text: string | null;
+  thread_id: string;
+  space_id: string | null;
+  direction: "inbound" | "outbound";
+  from: { name?: string | null; address: string };
+  to: string[];
+  cc?: string[];
+  bcc?: string[];
+  reply_to?: string[];
+  subject: string;
+  snippet: string;
+  html?: string | null;
+  text?: string | null;
+  category: AIInbxEmailCategory | null;
+  message_id: string;
+  in_reply_to: string | null;
+  created_at: string;
+  attachments?: AIInbxAttachment[];
+}
+
+/** `FullEmail` schema — `GET /emails/{email_id}`. */
+interface AIInbxFullEmail extends AIInbxEmail {
+  cc: string[];
+  bcc: string[];
+  reply_to: string[];
   html: string | null;
-  strippedText: string | null;
-  strippedHtml: string | null;
-  snippet: string | null;
-  fromName: string | null;
-  fromAddress: string;
-  toAddresses: string[];
-  ccAddresses: string[];
-  bccAddresses: string[];
-  replyToAddresses: string[];
-  sentAt: string | null;
-  receivedAt: string | null;
-  direction: "INBOUND" | "OUTBOUND";
-  status:
-    | "DRAFT"
-    | "QUEUED"
-    | "ACCEPTED"
-    | "SENT"
-    | "RECEIVED"
-    | "FAILED"
-    | "BOUNCED"
-    | "COMPLAINED"
-    | "REJECTED"
-    | "READ"
-    | "ARCHIVED";
-  threadId: string;
-  attachments: Array<{
-    id: string;
-    createdAt: string;
-    fileName: string;
-    contentType: string;
-    sizeInBytes: number;
-    cid: string | null;
-    disposition: string | null;
-    signedUrl: string;
-    expiresAt: string;
-  }>;
+  text: string | null;
+  stripped_text: string | null;
+  stripped_html: string | null;
+  segments: AIInbxSegment[];
+  references: string[];
+  headers: Array<{ name: string; value: string }>;
+  attachments: AIInbxAttachment[];
 }
 
-/**
- * AIInbx POST /threads/search response (from OpenAPI spec)
- */
-interface AIInbxThreadSearchResponse {
-  threads: Array<{ id: string }>;
-  pagination: {
-    total: number;
-    limit: number;
-    offset: number;
-    hasMore: boolean;
-  };
+interface AIInbxSendResponse extends AIInbxEmail {
+  suppressed: string[];
 }
 
-/**
- * AIInbx GET /threads/{threadId} response (from OpenAPI spec)
- */
-interface AIInbxThreadResponse {
+interface AIInbxPage<T> {
+  data: T[];
+  next_cursor: string | null;
+}
+
+interface AIInbxEventData {
+  email_id: string;
+  thread_id?: string;
+  domain_id?: string | null;
+  mailbox_id?: string | null;
+  suppression_key?: string | null;
+}
+
+interface AIInbxWebhookEnvelope {
   id: string;
-  emails: AIInbxEmail[];
+  created_at: string;
+  space_id: string | null;
 }
 
-/**
- * AIInbx webhook event payload structure (from OpenAPI spec)
- */
-interface AIInbxWebhookEvent {
-  event:
-    | "inbound.email.received"
-    | "outbound.email.delivered"
-    | "outbound.email.bounced"
-    | "outbound.email.complained"
-    | "outbound.email.rejected"
-    | "outbound.email.opened"
-    | "outbound.email.clicked"
-    | "outbound.email.link_clicked";
-  data: unknown;
-  attempt: number;
-  timestamp: number;
+type AIInbxEmailWebhookPayload = AIInbxWebhookEnvelope &
+  (
+    | {
+        type: "email.received";
+        data: AIInbxEventData & {
+          thread_id: string;
+          verdicts?: AIInbxVerdicts;
+        };
+      }
+    | {
+        type: "email.sent";
+        data: AIInbxEventData & { from: string; to: string[]; subject: string };
+      }
+    | {
+        type: "email.delivered";
+        data: AIInbxEventData & { recipients: string[] };
+      }
+    | {
+        type: "email.bounced";
+        data: AIInbxEventData & {
+          recipients: string[];
+          permanent: boolean;
+          reason: string;
+        };
+      }
+    | {
+        type: "email.complained";
+        data: AIInbxEventData & { recipients: string[]; reason: string | null };
+      }
+    | { type: "email.failed"; data: AIInbxEventData & { reason: string } }
+    | {
+        type: "email.opened";
+        data: AIInbxEventData & { user_agent?: string | null };
+      }
+    | {
+        type: "email.clicked";
+        data: AIInbxEventData & { url: string; user_agent?: string | null };
+      }
+    | {
+        type: "email.unsubscribed";
+        data: AIInbxEventData & {
+          address: string;
+          /** Suppression list; `*` is the whole workspace's or space's. */
+          key: string;
+          scope: "all" | "optional";
+          source: "link" | "one_click" | "reply";
+        };
+      }
+  );
+
+interface AIInbxMailboxEventData {
+  mailbox_id: string;
+  address: string;
+  provider: "google" | "microsoft";
 }
 
-/**
- * Inbound email received event data
- */
-interface InboundEmailReceivedData {
-  email: AIInbxEmail;
-  organization: {
-    id: string;
-    slug: string;
-  };
+type AIInbxMailboxWebhookPayload = AIInbxWebhookEnvelope &
+  (
+    | {
+        type: "mailbox.connected";
+        /** `ref` is whatever the connect link or `mailboxes.connect` carried. */
+        data: AIInbxMailboxEventData & { ref?: string; reconnected: boolean };
+      }
+    | {
+        type: "mailbox.needs_reauth" | "mailbox.disconnected";
+        data: AIInbxMailboxEventData & { reason: string | null };
+      }
+  );
+
+type AIInbxWebhookPayload =
+  | AIInbxEmailWebhookPayload
+  | AIInbxMailboxWebhookPayload;
+
+interface AIInbxMailbox {
+  id: string;
+  address: string;
+  name: string | null;
+  state: "active" | "needs_reauth" | "disconnected";
+  connected_at: string;
 }
 
-/**
- * Outbound delivered event data
- */
-interface OutboundDeliveredData {
-  emailId?: string;
-  messageId: string;
-  deliveredAt: string;
-  recipients: string[];
-  remoteMtaIp?: string;
-  smtpResponse?: string;
-  processingTimeMs?: number;
-}
-
-/**
- * Outbound bounced event data
- */
-interface OutboundBouncedData {
-  emailId?: string;
-  messageId: string;
-  bouncedAt: string;
-  bounceType: "Permanent" | "Transient" | "Undetermined";
-  bounceSubType?: string;
-  recipients: Array<{
-    emailAddress: string;
-    action?: string;
-    status?: string;
-    diagnosticCode?: string;
+interface AIInbxDomain {
+  id: string;
+  name: string;
+  region: string;
+  verified_at: string | null;
+  created_at: string;
+  records?: Array<{
+    purpose: "SPF" | "DKIM" | "DMARC" | "RETURN_PATH" | "INBOUND";
+    type: "MX" | "TXT" | "CNAME";
+    name: string;
+    value: string;
+    ttl: number;
+    state: "pending" | "verified" | "missing";
+    last_checked_at: string | null;
   }>;
 }
 
-/**
- * Outbound complained event data
- */
-interface OutboundComplainedData {
-  emailId?: string;
-  messageId: string;
-  complainedAt: string;
-  complaintFeedbackType?: string;
-  recipients: string[];
-  userAgent?: string;
-  feedbackId?: string;
+interface AIInbxWebhookEndpoint {
+  id: string;
+  url: string;
+  enabled: boolean;
+  subscriptions: string[];
+  created_at: string;
+  updated_at: string;
+  /** Returned once, on creation. */
+  secret?: string;
 }
 
-/**
- * Outbound rejected event data
- */
-interface OutboundRejectedData {
-  emailId?: string;
-  messageId: string;
-  rejectedAt: string;
-  reason?: string;
-}
-
-/**
- * Outbound opened event data
- */
-interface OutboundOpenedData {
-  emailId?: string;
-  messageId: string;
-  openedAt: string;
-  ipAddress?: string;
-  userAgent?: string;
-}
-
-/**
- * Outbound clicked event data
- */
-interface OutboundClickedData {
-  emailId?: string;
-  messageId: string;
-  clickedAt: string;
-  link: string;
-  linkDomain?: string;
-  ipAddress?: string;
-  userAgent?: string;
+/** RFC 9457 problem+json error body. */
+interface AIInbxProblem {
+  detail?: string;
+  code?: string;
+  issues?: Array<{ path: string; message: string }>;
 }
 
 /**
@@ -273,37 +435,45 @@ export const AIINBX_CAPABILITIES = {
   cc: true,
   bcc: true,
   replyTo: true,
-  replyHeaders: true,
+  // v2 derives In-Reply-To/References itself when replying on a thread.
+  replyHeaders: false,
   replyThreadId: true,
   attachments: true,
-  customHeaders: false,
+  customHeaders: true,
   tags: false,
   metadata: false,
   templates: false,
   personalizations: false,
-  scheduling: false,
-  unsubscribe: false,
-  sendTracking: {
-    opens: true,
-    clicks: true,
-  },
+  scheduling: true,
+  unsubscribe: true,
+  // Tracking is a domain setting in v2 (`domains.update`), not a send option.
   eventTracking: {
     opens: true,
     clicks: true,
   },
   sandbox: false,
-  sendIdempotency: false,
+  sendIdempotency: true,
   tenantRouting: false,
   providerFetch: true,
   domains: {
     list: true,
     create: true,
     get: true,
+    update: true,
     verify: true,
     delete: true,
     identifier: "domainId" as const,
   },
+  webhooks: { account: true },
   sync: { account: true },
+  // Connect lands on `return_to`; completion arrives by webhook, so there is
+  // no OAuth callback and no signed state.
+  publicRoutes: { webhook: true, connectLanding: true },
+  requiresSecret: false,
+  mailboxConnect: true,
+  mailboxList: true,
+  mailboxGet: true,
+  mailboxDelete: true,
 } as const satisfies DriverCapabilities;
 
 /**
@@ -311,987 +481,1169 @@ export const AIINBX_CAPABILITIES = {
  */
 export type AIInbxCapabilities = typeof AIINBX_CAPABILITIES;
 
-const escapeHtmlText = (value: string): string =>
-  value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;")
-    .replace(/\r\n|\r|\n/g, "<br />");
+const AIINBX_EVENTS_BY_EMAILKIT_EVENT: Record<string, string[]> = {
+  inbound: ["email.received"],
+  outbound: ["email.sent"],
+  delivered: ["email.delivered"],
+  opened: ["email.opened"],
+  clicked: ["email.clicked"],
+  bounced: ["email.bounced"],
+  complained: ["email.complained"],
+  rejected: ["email.failed"],
+  unsubscribed: ["email.unsubscribed"],
+};
 
-const normalizeBase = (base: string): string => base.replace(/\/+$/, "");
+const EMAILKIT_EVENT_BY_AIINBX_EVENT: Record<string, WebhookEventType> =
+  Object.fromEntries(
+    Object.entries(AIINBX_EVENTS_BY_EMAILKIT_EVENT).flatMap(
+      ([emailkitEvent, aiinbxEvents]) =>
+        aiinbxEvents.map((aiinbxEvent) => [aiinbxEvent, emailkitEvent]),
+    ),
+  );
 
-const isExternalAbsoluteUrl = (
-  value: string | URL,
-  authenticatedBaseUrl: string,
-): boolean => {
-  const rawUrl = value instanceof URL ? value.toString() : value;
-  if (!/^https?:\/\//i.test(rawUrl)) return false;
+const AIINBX_DEFAULT_WEBHOOK_EVENTS = [
+  ...Object.values(AIINBX_EVENTS_BY_EMAILKIT_EVENT).flat(),
+  "mailbox.connected",
+  "mailbox.needs_reauth",
+  "mailbox.disconnected",
+];
 
-  const normalizedUrl = normalizeBase(rawUrl);
-  return (
-    normalizedUrl !== authenticatedBaseUrl &&
-    !normalizedUrl.startsWith(`${authenticatedBaseUrl}/`)
+const unique = <T>(values: T[]): T[] => Array.from(new Set(values));
+
+const toAIInbxWebhookEvents = (events?: WebhookEventSelection): string[] => {
+  if (!events || events === "all" || events.length === 0) {
+    return AIINBX_DEFAULT_WEBHOOK_EVENTS;
+  }
+  return unique(
+    events.flatMap(
+      (event) => AIINBX_EVENTS_BY_EMAILKIT_EVENT[event] || [event],
+    ),
   );
 };
 
-const createAIInbxProviderFetch = (
-  apiBase: string,
-  apiKey: string,
-): ProviderFetch => {
-  const authenticatedFetch = createProviderFetch({
-    baseUrl: apiBase,
-    defaultHeaders: {
-      Authorization: `Bearer ${apiKey}`,
+const fromAIInbxWebhookEvents = (events: string[]): WebhookEventType[] =>
+  unique(events.map((event) => EMAILKIT_EVENT_BY_AIINBX_EVENT[event] || event));
+
+const normalizeWebhookEndpoint = (raw: AIInbxWebhookEndpoint): Webhook => ({
+  id: raw.id,
+  providerId: raw.id,
+  scope: "account",
+  url: raw.url,
+  events: fromAIInbxWebhookEvents(raw.subscriptions),
+  status: raw.enabled ? "active" : "disabled",
+  createdAt: new Date(raw.created_at),
+  updatedAt: new Date(raw.updated_at),
+  ...(raw.secret ? { provider: { signingSecret: raw.secret } } : {}),
+  raw,
+});
+
+const requireWebhookId = (
+  input: AccountWebhookRefreshInput | AccountWebhookDeleteInput,
+  action: string,
+): string => {
+  const webhookId =
+    input.webhook?.providerId ||
+    input.webhook?.id ||
+    ("providerId" in input ? input.providerId : undefined) ||
+    input.webhookId;
+  if (!webhookId) {
+    throw new EmailKitError(
+      `Webhook ${action} requires a webhook id or providerId`,
+      PROVIDER,
+      "MISSING_REQUIRED_FIELD",
+    );
+  }
+  return webhookId;
+};
+
+const toRoutingRules = (
+  recipients: NonNullable<AccountWebhookSetupInput["inbound"]>["recipients"],
+): Array<{ effect: "allow"; field: "to"; pattern: string }> | undefined => {
+  if (!recipients || recipients === "all") return undefined;
+  return [recipients].flat().map((pattern) => ({
+    effect: "allow",
+    field: "to",
+    pattern,
+  }));
+};
+
+const DOMAIN_RECORD_PURPOSE: Record<
+  NonNullable<AIInbxDomain["records"]>[number]["purpose"],
+  DomainRecordPurpose
+> = {
+  SPF: "spf",
+  DKIM: "dkim",
+  DMARC: "dmarc",
+  RETURN_PATH: "returnPath",
+  INBOUND: "mx",
+};
+
+const normalizeDomainRecords = (raw: AIInbxDomain): DomainDNSRecord[] =>
+  (raw.records ?? []).map((record) => ({
+    type: record.type,
+    name: record.name,
+    value: record.value,
+    ttl: record.ttl,
+    purpose: DOMAIN_RECORD_PURPOSE[record.purpose],
+    verified: record.state === "verified",
+    ...(record.last_checked_at
+      ? { lastCheckedAt: new Date(record.last_checked_at) }
+      : {}),
+  }));
+
+const normalizeDomainVerification = (
+  raw: AIInbxDomain,
+  checkedAt?: Date,
+): DomainVerification => ({
+  status: raw.verified_at ? "verified" : "pending",
+  records: normalizeDomainRecords(raw),
+  checkedAt,
+  raw,
+});
+
+const normalizeDomain = (raw: AIInbxDomain): Domain => ({
+  id: raw.id,
+  domain: raw.name,
+  status: raw.verified_at ? "verified" : "pending",
+  region: raw.region,
+  createdAt: new Date(raw.created_at),
+  verification: normalizeDomainVerification(raw),
+  raw,
+});
+
+const MAILBOX_REF_MAX_LENGTH = 200;
+
+const normalizeMailbox = (raw: AIInbxMailbox): Mailbox => ({
+  id: raw.id,
+  email: raw.address,
+  ...(raw.name ? { displayName: raw.name } : {}),
+  status: raw.state === "active" ? "connected" : "disabled",
+  createdAt: new Date(raw.connected_at),
+  raw,
+});
+
+/**
+ * `context` round-trips through AIInbx's `ref`, echoed on the signed
+ * `mailbox.connected` webhook. Hosted connect links set a plain-string ref.
+ */
+const encodeMailboxRef = (context: unknown): string | undefined => {
+  if (context === undefined) return undefined;
+  const ref = JSON.stringify(context);
+  if (ref.length > MAILBOX_REF_MAX_LENGTH) {
+    throw new EmailKitError(
+      `AIInbx carries mailbox connect context in a ${MAILBOX_REF_MAX_LENGTH}-character ref; pass an id instead of a large object`,
+      PROVIDER,
+      "INVALID_INPUT",
+    );
+  }
+  return ref;
+};
+
+const decodeMailboxRef = (ref: string | undefined): unknown => {
+  if (ref === undefined) return undefined;
+  try {
+    return JSON.parse(ref);
+  } catch {
+    return ref;
+  }
+};
+
+const toMailboxEvent = (
+  payload: AIInbxMailboxWebhookPayload,
+  emailDriver: string,
+): WebhookDriverEvent => {
+  const { mailbox_id: id, address: email } = payload.data;
+
+  if (payload.type === "mailbox.needs_reauth") {
+    return {
+      type: "webhook.lifecycle",
+      data: {
+        id: payload.id,
+        emailDriver,
+        action: "action_required",
+        source: "provider",
+        reason: "reauthorization_required",
+        recommendedActions: ["reauthorize"],
+        scope: "mailbox",
+        target: { mailboxId: id, mailboxEmail: email },
+        severity: "critical",
+        receivedAt: new Date(payload.created_at),
+        raw: payload,
+      },
+    };
+  }
+
+  const connected = payload.type === "mailbox.connected";
+  const context = connected ? decodeMailboxRef(payload.data.ref) : undefined;
+  return {
+    type: "mailbox.lifecycle",
+    data: {
+      action: connected ? "connected" : "deleted",
+      mailbox: {
+        id,
+        email,
+        status: connected ? "connected" : "disabled",
+        raw: payload,
+      },
+      ...(context !== undefined ? { context } : {}),
+      raw: payload,
     },
-  });
-  const authenticatedBaseUrl = normalizeBase(apiBase);
-
-  return async (path: string | URL, init?: ProviderFetchInit) => {
-    if (isExternalAbsoluteUrl(path, authenticatedBaseUrl)) {
-      const {
-        searchParams: _ignoredSearchParams,
-        provider: _ignoredProvider,
-        ...fetchInit
-      } = init ?? {};
-      return fetch(path, fetchInit);
-    }
-
-    return authenticatedFetch(path, init);
   };
 };
 
+const toAddresses = (addresses: string[] | undefined): EmailAddress[] =>
+  (addresses ?? []).map((email) => ({ email }));
+
+const emailsOf = (addresses: EmailAddress | EmailAddress[]): string[] =>
+  [addresses].flat().map((address) => address.email);
+
+const resourceMetadata = (
+  payload: AIInbxEmailWebhookPayload,
+): AIInbxResourceMetadata => ({
+  emailId: payload.data.email_id,
+  threadId: payload.data.thread_id,
+  spaceId: payload.space_id,
+  domainId: payload.data.domain_id,
+  mailboxId: payload.data.mailbox_id,
+});
+
+interface AIInbxRequestInit extends Omit<RequestInit, "body"> {
+  searchParams?: Record<string, string | undefined>;
+  body?: unknown;
+}
+
+type AIInbxRequest = <T>(
+  path: string,
+  init: AIInbxRequestInit,
+  action: string,
+) => Promise<{ data: T; response: Response }>;
+
+const problemMessage = (problem: AIInbxProblem): string | undefined => {
+  if (!problem.detail) return undefined;
+  if (!problem.issues?.length) return problem.detail;
+  const issues = problem.issues
+    .map((issue) => `${issue.path}: ${issue.message}`)
+    .join("; ");
+  return `${problem.detail} (${issues})`;
+};
+
+const createAIInbxRequest =
+  (baseUrl: string, apiKey: string): AIInbxRequest =>
+  async <T>(path: string, init: AIInbxRequestInit, action: string) => {
+    const { searchParams, body, headers, ...fetchInit } = init;
+    const url = new URL(`${baseUrl}${path}`);
+    for (const [key, value] of Object.entries(searchParams ?? {})) {
+      if (value !== undefined) url.searchParams.set(key, value);
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...fetchInit,
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+          ...headers,
+        },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+    } catch (error) {
+      if (isAbortError(error, init.signal ?? undefined)) throw error;
+      throw new EmailKitError(
+        `Failed to ${action}: ${error instanceof Error ? error.message : String(error)}`,
+        PROVIDER,
+        undefined,
+        undefined,
+        error,
+      );
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    const data = contentType.includes("json")
+      ? await response.json()
+      : await response.text();
+
+    if (!response.ok) {
+      const problem: AIInbxProblem =
+        data && typeof data === "object" ? data : {};
+      throw new EmailKitError(
+        problemMessage(problem) ??
+          `HTTP ${response.status}: Failed to ${action}`,
+        PROVIDER,
+        problem.code,
+        response.status,
+        undefined,
+        data,
+      );
+    }
+
+    return { data: data as T, response };
+  };
+
+const isAIInbxApiUrl = (path: string | URL, baseUrl: string): boolean => {
+  if (typeof path === "string" && !/^https?:\/\//i.test(path)) return true;
+  const url = path.toString();
+  return url === baseUrl || url.startsWith(`${baseUrl}/`);
+};
+
 /**
- * Retrieve attachment content from AIInbx signed URLs
- * AIInbx provides signed S3 URLs that are publicly accessible
+ * Authenticated for API URLs; anonymous elsewhere, so the API key never
+ * reaches signed storage URLs.
  */
-const retrieveAIInbxAttachments = async (
-  attachmentMetadata: Attachment[],
+const createAIInbxProviderFetch = (
+  baseUrl: string,
+  apiKey: string,
+): ProviderFetch => {
+  const authedFetch = createProviderFetch({
+    baseUrl,
+    defaultHeaders: { Authorization: `Bearer ${apiKey}` },
+  });
+  const anonymousFetch = createProviderFetch({ baseUrl });
+
+  return (path, init) =>
+    isAIInbxApiUrl(path, baseUrl)
+      ? authedFetch(path, init)
+      : anonymousFetch(path, init);
+};
+
+/** Signed download URLs are self-authenticating and reject bearer auth. */
+const downloadAttachments = (
+  attachments: Attachment[],
+  downloadUrls: string[],
   signal?: AbortSignal,
-): Promise<Attachment[]> => {
-  return retrieveAttachmentsInParallel({
-    attachments: attachmentMetadata,
+): Promise<Attachment[]> =>
+  retrieveAttachmentsInParallel({
+    attachments,
     signal,
-    retrieve: async (attachmentMeta) => {
-      if (!attachmentMeta.url) return attachmentMeta;
-
-      const res = await fetch(attachmentMeta.url, { signal });
+    retrieve: async (attachment, index) => {
+      const res = await fetch(downloadUrls[index]!, { signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = new Uint8Array(await res.arrayBuffer());
-
       return {
-        filename: attachmentMeta.filename,
-        content: buf,
-        contentType: attachmentMeta.contentType,
-        url: attachmentMeta.url,
-        size: attachmentMeta.size,
-        contentId: attachmentMeta.contentId,
-        isInline: attachmentMeta.isInline,
+        ...attachment,
+        content: new Uint8Array(await res.arrayBuffer()),
       };
     },
-    onError: (attachmentMeta, error) => {
+    onError: (attachment, error) => {
       console.error(
-        `Failed to retrieve AIInbx attachment ${attachmentMeta.filename}:`,
+        `Failed to retrieve AIInbx attachment ${attachment.filename}:`,
         error,
       );
     },
   });
-};
 
-/**
- * Transform AIInbx Email schema to InboundEmailEvent
- * Automatically downloads attachment content from signed URLs
- */
-const transformInboundEmail = async (
-  email: AIInbxEmail,
-  timestamp: number,
-  rawPayload: unknown,
-  autoFetchAttachments: boolean,
-  signal?: AbortSignal,
-): Promise<InboundEmailEvent> => {
-  const parseEmailAddressList = (addresses: string[]): EmailAddress[] => {
-    return addresses.map((addr) => parseEmailAddress(addr));
-  };
+/** `providerFetch` authenticates lazy inbound attachment URLs when forwarded. */
+const toOutboundAttachment = async (
+  attachment: Attachment,
+  providerFetch: ProviderFetch,
+): Promise<Record<string, unknown>> => {
+  let content: string;
 
-  const from = parseEmailAddress(
-    email.fromAddress,
-    email.fromName || undefined,
-  );
-  const to = parseEmailAddressList(email.toAddresses);
-  const cc =
-    email.ccAddresses.length > 0
-      ? parseEmailAddressList(email.ccAddresses)
-      : undefined;
-  const bcc =
-    email.bccAddresses.length > 0
-      ? parseEmailAddressList(email.bccAddresses)
-      : undefined;
-  const replyAddresses =
-    email.replyToAddresses.length > 0
-      ? parseEmailAddressList(email.replyToAddresses)
-      : undefined;
-
-  const reply = buildReplyContext({
-    addresses: replyAddresses,
-    messageId: email.inReplyToId,
-    references: email.references,
-    threadId: email.threadId,
-  });
-
-  // Parse attachment metadata - AIInbx provides signed URLs
-  const attachmentMetadata: Attachment[] = email.attachments.map((att) => ({
-    filename: att.fileName,
-    contentType: att.contentType,
-    size: att.sizeInBytes,
-    contentId: att.cid || undefined,
-    isInline: att.disposition === "inline",
-    url: att.signedUrl, // AIInbx provides signed URLs for attachments
-  }));
-
-  // Optionally fetch attachment content from signed URLs
-  const attachments = autoFetchAttachments
-    ? await retrieveAIInbxAttachments(attachmentMetadata, signal)
-    : attachmentMetadata;
-
-  const event: InboundEmailEvent = {
-    schemaVersion: "1",
-    eventId: `${email.id}:inbound:${timestamp}`,
-    messageId: email.messageId,
-    providerId: email.id,
-    from,
-    to,
-    cc,
-    bcc,
-    reply,
-    subject: email.subject || "",
-    text: email.text || email.strippedText || undefined,
-    html: email.html || email.strippedHtml || undefined,
-    strippedText: email.strippedText || undefined,
-    strippedHtml: email.strippedHtml || undefined,
-    attachments: attachments.length > 0 ? attachments : undefined,
-    headers: {}, // Headers not provided in Email schema
-    timestamp: new Date(timestamp * 1000),
-    raw: rawPayload, // Store the full webhook payload
-  };
-
-  return event;
-};
-
-/**
- * Transform outbound event data to OutboundEmailEvent
- */
-const transformOutboundEvent = (
-  eventType: string,
-  data: unknown,
-  timestamp: number,
-  rawPayload: AIInbxWebhookEvent,
-): OutboundEmailEvent => {
-  const parseEventDate = (value: unknown): Date => {
-    if (typeof value === "string") {
-      const date = new Date(value);
-      if (!Number.isNaN(date.getTime())) {
-        return date;
-      }
+  if (attachment.content !== undefined) {
+    content =
+      typeof attachment.content === "string"
+        ? stringToBase64(attachment.content)
+        : bytesToBase64(attachment.content);
+  } else if (attachment.url) {
+    try {
+      const res = await providerFetch(attachment.url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      content = bytesToBase64(new Uint8Array(await res.arrayBuffer()));
+    } catch (error) {
+      throw new EmailKitError(
+        `Failed to fetch attachment ${attachment.filename} from URL: ${attachment.url}`,
+        PROVIDER,
+        "ATTACHMENT_FETCH_FAILED",
+        undefined,
+        error,
+      );
     }
-    return new Date(timestamp * 1000);
-  };
-
-  const providerId = (value: { emailId?: string; messageId: string }): string =>
-    value.emailId || value.messageId;
-
-  const baseEvent: OutboundEmailEvent = {
-    schemaVersion: "1",
-    messageId: "",
-    recipient: "",
-    status: "sent",
-    timestamp: new Date(timestamp * 1000),
-    raw: rawPayload, // Store the full webhook payload
-  };
-
-  // Map event types to status
-  const statusMap: Record<string, OutboundEmailEvent["status"]> = {
-    "outbound.email.delivered": "delivered",
-    "outbound.email.opened": "opened",
-    "outbound.email.clicked": "clicked",
-    "outbound.email.link_clicked": "clicked",
-    "outbound.email.bounced": "bounced",
-    "outbound.email.complained": "complained",
-    "outbound.email.rejected": "rejected",
-  };
-
-  baseEvent.status = statusMap[eventType] || "sent";
-
-  // Extract data based on event type
-  switch (eventType) {
-    case "outbound.email.delivered": {
-      const d = data as OutboundDeliveredData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = d.recipients[0] || "";
-      baseEvent.recipientDomain = d.recipients[0]?.split("@")[1];
-      baseEvent.timestamp = parseEventDate(d.deliveredAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:delivered:${timestamp}`,
-        responseTime: d.processingTimeMs,
-      } as OutboundEmailEvent & { responseTime?: number };
-    }
-
-    case "outbound.email.bounced": {
-      const d = data as OutboundBouncedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = d.recipients[0]?.emailAddress || "";
-      baseEvent.timestamp = parseEventDate(d.bouncedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:bounced:${timestamp}`,
-        severity: d.bounceType === "Permanent" ? "permanent" : "temporary",
-        reason: d.bounceSubType,
-        code: d.recipients[0]?.status,
-        smtpResponse: d.recipients[0]?.diagnosticCode,
-      } as OutboundEmailEvent & {
-        severity?: "permanent" | "temporary";
-        reason?: string;
-        code?: string | number;
-        smtpResponse?: string;
-      };
-    }
-
-    case "outbound.email.complained": {
-      const d = data as OutboundComplainedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = d.recipients[0] || "";
-      baseEvent.timestamp = parseEventDate(d.complainedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:complained:${timestamp}`,
-        feedbackType: d.complaintFeedbackType,
-        feedback: d.feedbackId,
-      } as OutboundEmailEvent & {
-        feedbackType?: string;
-        feedback?: string;
-      };
-    }
-
-    case "outbound.email.rejected": {
-      const d = data as OutboundRejectedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = ""; // Not provided in rejected event
-      baseEvent.timestamp = parseEventDate(d.rejectedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:rejected:${timestamp}`,
-        reason: d.reason,
-      } as OutboundEmailEvent & { reason?: string };
-    }
-
-    case "outbound.email.opened": {
-      const d = data as OutboundOpenedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = ""; // Not provided directly
-      baseEvent.timestamp = parseEventDate(d.openedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:opened:${timestamp}`,
-        ip: d.ipAddress,
-        userAgent: d.userAgent,
-      } as OutboundEmailEvent & {
-        ip?: string;
-        userAgent?: string;
-      };
-    }
-
-    case "outbound.email.clicked": {
-      const d = data as OutboundClickedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = ""; // Not provided directly
-      baseEvent.timestamp = parseEventDate(d.clickedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:clicked:${timestamp}`,
-        url: d.link,
-        ip: d.ipAddress,
-        userAgent: d.userAgent,
-      } as OutboundEmailEvent & {
-        url?: string;
-        ip?: string;
-        userAgent?: string;
-      };
-    }
-
-    case "outbound.email.link_clicked": {
-      const d = data as OutboundClickedData;
-      baseEvent.messageId = d.messageId;
-      baseEvent.providerId = providerId(d);
-      baseEvent.recipient = ""; // Not provided directly
-      baseEvent.timestamp = parseEventDate(d.clickedAt);
-      return {
-        ...baseEvent,
-        eventId: `${providerId(d)}:clicked:${timestamp}`,
-        url: d.link,
-        ip: d.ipAddress,
-        userAgent: d.userAgent,
-      } as OutboundEmailEvent & {
-        url?: string;
-        ip?: string;
-        userAgent?: string;
-      };
-    }
-
-    default:
-      return baseEvent;
+  } else {
+    throw new EmailKitError(
+      `Attachment ${attachment.filename} must have either content or url`,
+      PROVIDER,
+      "INVALID_ATTACHMENT",
+    );
   }
+
+  return {
+    filename: attachment.filename,
+    content_type: attachment.contentType || "application/octet-stream",
+    content,
+    ...(attachment.isInline && attachment.contentId
+      ? { cid: attachment.contentId }
+      : {}),
+  };
+};
+
+const verifySignature = (
+  secrets: string[],
+  timestamp: string,
+  signature: string,
+  rawBody: string,
+): boolean => {
+  const provided = Buffer.from(signature, "utf8");
+  return secrets.some((secret) => {
+    const expected = Buffer.from(
+      createHmac("sha256", secret)
+        .update(`${timestamp}.${rawBody}`)
+        .digest("hex"),
+      "utf8",
+    );
+    return (
+      provided.length === expected.length && timingSafeEqual(provided, expected)
+    );
+  });
 };
 
 export const AIInbxDriver = <const TId extends string = "aiinbx">(
   config: AIInbxDriverConfig<TId>,
 ): EmailDriver<typeof AIINBX_CAPABILITIES, TId> & {
-  domains: Partial<DriverDomainsAPI>;
+  domains: DriverDomainsAPI;
+  mailboxes: Omit<DriverMailboxesAPI<typeof AIINBX_CAPABILITIES>, "create">;
 } => {
-  const driverId = (config.id || "aiinbx") as TId;
-  const apiBase = config.apiBase || "https://api.aiinbx.com";
-  const baseUrl = `${apiBase}/api/v1`;
+  const driverId = (config.id || PROVIDER) as TId;
+  const baseUrl = `${(config.apiBase || DEFAULT_API_BASE).replace(/\/+$/, "")}/api/v2`;
+  const request = createAIInbxRequest(baseUrl, config.apiKey);
 
-  const mapDomainStatus = (
-    status: "VERIFIED" | "PENDING_VERIFICATION" | "NOT_REGISTERED" | string,
-  ): Domain["status"] => {
-    switch (status) {
-      case "VERIFIED":
-        return "verified";
-      case "PENDING_VERIFICATION":
-        return "pending";
-      case "NOT_REGISTERED":
-        return "unverified";
-      default:
-        return "unknown";
-    }
-  };
-
-  const mapDnsRecord = (rec: any): DomainDNSRecord => {
-    const r: any = {
-      type: rec.type,
-      name: rec.name,
-      value: rec.value,
-    };
-    if (typeof rec.priority === "number") r.priority = rec.priority;
-    if (typeof rec.isVerified === "boolean") {
-      r.verified = rec.isVerified;
-    } else if (typeof rec.verificationStatus === "string") {
-      r.verified = rec.verificationStatus === "verified";
-    }
-    if (typeof rec.lastCheckedAt === "string")
-      r.lastCheckedAt = new Date(rec.lastCheckedAt);
-    return r as DomainDNSRecord;
-  };
-
-  const extractDnsRecords = (value: any): DomainDNSRecord[] | undefined => {
-    const rawRecords = Array.isArray(value?.dnsRecords)
-      ? value.dnsRecords
-      : Array.isArray(value?.records)
-        ? value.records
-        : undefined;
-
-    return rawRecords?.map(mapDnsRecord);
-  };
-
-  const authHeader = { Authorization: `Bearer ${config.apiKey}` } as const;
-
-  const normalizeDomain = (d: any): Domain => {
-    const status = mapDomainStatus(d.status);
-    const records = extractDnsRecords(d);
-    return {
-      id: d.id,
-      domain: d.domain,
-      status,
-      createdAt: d.createdAt ? new Date(d.createdAt) : undefined,
-      updatedAt: d.updatedAt ? new Date(d.updatedAt) : undefined,
-      verification: records
-        ? { status, records, checkedAt: undefined }
-        : undefined,
-      raw: d,
-    };
-  };
-
-  const requestApi = async (
+  const listAll = async <T>(
     path: string,
-    init: RequestInit,
     action: string,
-  ): Promise<unknown> => {
-    const res = await fetch(`${baseUrl}${path}`, {
-      ...init,
-      headers: {
-        ...authHeader,
-        ...(init.body ? { "Content-Type": "application/json" } : {}),
-        ...init.headers,
-      },
-    });
-    const contentType = res.headers.get("content-type") || "";
-    const body = contentType.includes("application/json")
-      ? await res.json()
-      : await res.text();
-    if (!res.ok) {
-      throw new EmailKitError(
-        typeof (body as any)?.message === "string"
-          ? (body as any).message
-          : `HTTP ${res.status}: Failed to ${action}`,
-        "aiinbx",
-        undefined,
-        res.status,
-        undefined,
-        body,
+    limit?: number,
+  ): Promise<T[]> => {
+    const items: T[] = [];
+    let cursor: string | undefined;
+    do {
+      const { data } = await request<AIInbxPage<T>>(
+        path,
+        {
+          method: "GET",
+          searchParams: { limit: String(LIST_PAGE_SIZE), cursor },
+        },
+        action,
       );
-    }
-    return body;
-  };
-
-  const listDomainPayloads = async (): Promise<any[]> => {
-    const body = await requestApi(
-      "/domains",
-      { method: "GET" },
-      "list domains",
-    );
-    return ((body as any)?.domains || []) as any[];
+      items.push(...data.data);
+      cursor = data.next_cursor ?? undefined;
+    } while (cursor && (limit === undefined || items.length < limit));
+    return limit === undefined ? items : items.slice(0, limit);
   };
 
   const resolveDomainId = async (idOrName: string): Promise<string> => {
+    // Domain ids (`dom_…`) never contain a dot; names always do.
     if (!idOrName.includes(".")) return idOrName;
 
-    const domains = await listDomainPayloads();
+    const domains = await listAll<AIInbxDomain>("/domains", "list domains");
     const match = domains.find(
-      (d) => String(d.domain).toLowerCase() === idOrName.toLowerCase(),
+      (domain) => domain.name.toLowerCase() === idOrName.toLowerCase(),
     );
-    if (!match?.id) {
+    if (!match) {
       throw new EmailKitError(
         `Domain not found: ${idOrName}`,
-        "aiinbx",
+        PROVIDER,
         "NOT_FOUND",
         404,
       );
     }
-    return String(match.id);
+    return match.id;
   };
+
+  const resolveMailboxId = async (idOrEmail: string): Promise<string> => {
+    if (!idOrEmail.includes("@")) return idOrEmail;
+
+    const mailboxes = await listAll<AIInbxMailbox>(
+      "/mailboxes",
+      "list mailboxes",
+    );
+    const matches = mailboxes.filter(
+      (mailbox) => mailbox.address.toLowerCase() === idOrEmail.toLowerCase(),
+    );
+    // A reconnected address can leave a disconnected record behind.
+    const match =
+      matches.find((mailbox) => mailbox.state === "active") ?? matches[0];
+    if (!match) {
+      throw new EmailKitError(
+        `Mailbox not found: ${idOrEmail}`,
+        PROVIDER,
+        "NOT_FOUND",
+        404,
+      );
+    }
+    return match.id;
+  };
+
+  const mailboxPath = async (idOrEmail: string): Promise<string> =>
+    `/mailboxes/${encodeURIComponent(await resolveMailboxId(idOrEmail))}`;
+
+  const domainPath = async (idOrName: string, suffix = ""): Promise<string> =>
+    `/domains/${encodeURIComponent(await resolveDomainId(idOrName))}${suffix}`;
+
+  /**
+   * Webhooks and list items carry a snippet, not the message — load the full
+   * email (bodies, headers, segments, prepared attachment text) by id.
+   */
+  const loadInboundEvent = async (
+    emailId: string,
+    source: {
+      eventId: string;
+      raw?: unknown;
+      webhook?: Extract<AIInbxEmailWebhookPayload, { type: "email.received" }>;
+      signal?: AbortSignal;
+    },
+  ): Promise<InboundEmailEvent> => {
+    const { data: email } = await request<AIInbxFullEmail>(
+      `/emails/${encodeURIComponent(emailId)}`,
+      {
+        method: "GET",
+        signal: source.signal,
+        searchParams: {
+          include:
+            (config.inlineAttachmentText ?? true)
+              ? "attachment_content"
+              : undefined,
+        },
+      },
+      "retrieve email",
+    );
+
+    const attachmentMetadata = email.attachments.map(
+      (attachment): Attachment => {
+        const { content_url: _contentUrl, ...preparation } =
+          attachment.preparation ?? {};
+        const metadata: AIInbxAttachmentMetadata = {
+          attachmentId: attachment.id,
+          preparation: attachment.preparation
+            ? (preparation as AIInbxAttachmentPreparation)
+            : null,
+        };
+        return {
+          filename: attachment.filename,
+          contentType: attachment.content_type,
+          size: attachment.size,
+          contentId: attachment.cid || undefined,
+          isInline: Boolean(attachment.cid),
+          // Signed download URLs expire; the API URL redirects to a fresh one.
+          url: `${baseUrl}/attachments/${attachment.id}`,
+          provider: { [PROVIDER]: metadata },
+        };
+      },
+    );
+    const attachments =
+      (config.autoFetchInboundAttachments ?? true)
+        ? await downloadAttachments(
+            attachmentMetadata,
+            email.attachments.map((attachment) => attachment.download_url),
+            source.signal,
+          )
+        : attachmentMetadata;
+
+    const metadata: AIInbxInboundMetadata = {
+      emailId: email.id,
+      threadId: email.thread_id,
+      spaceId: email.space_id,
+      ...(source.webhook
+        ? {
+            domainId: source.webhook.data.domain_id,
+            mailboxId: source.webhook.data.mailbox_id,
+          }
+        : {}),
+      category: email.category,
+      snippet: email.snippet,
+      segments: email.segments,
+      ...(source.webhook?.data.verdicts
+        ? { verdicts: source.webhook.data.verdicts }
+        : {}),
+    };
+    const cc = toAddresses(email.cc);
+    const bcc = toAddresses(email.bcc);
+
+    return {
+      schemaVersion: "1",
+      eventId: source.eventId,
+      messageId: email.message_id,
+      providerId: email.id,
+      from: {
+        email: email.from.address,
+        ...(email.from.name ? { name: email.from.name } : {}),
+      },
+      to: toAddresses(email.to),
+      ...(cc.length > 0 ? { cc } : {}),
+      ...(bcc.length > 0 ? { bcc } : {}),
+      reply: buildReplyContext({
+        addresses: toAddresses(email.reply_to),
+        messageId: email.in_reply_to,
+        references: email.references,
+        threadId: email.thread_id,
+      }),
+      subject: email.subject,
+      text: email.text ?? undefined,
+      html: email.html ?? undefined,
+      strippedText: email.stripped_text ?? undefined,
+      strippedHtml: email.stripped_html ?? undefined,
+      ...(attachments.length > 0 ? { attachments } : {}),
+      headers: Object.fromEntries(
+        email.headers.map((header) => [header.name, header.value]),
+      ),
+      timestamp: new Date(email.created_at),
+      provider: { [PROVIDER]: metadata },
+      raw: source.raw ?? email,
+    };
+  };
+
+  /**
+   * Delivery outcomes are reported per recipient: one normalized event each.
+   * Webhooks identify the email by its AIInbx id only, so `messageId` and
+   * `providerId` both carry it — correlate with `SendEmailResult.providerId`.
+   */
+  const toOutboundEvents = (
+    type: WebhookEvent["type"],
+    status: OutboundEmailEvent["status"],
+    payload: AIInbxEmailWebhookPayload,
+    recipients: string[],
+    details: Record<string, unknown> = {},
+  ): WebhookEvent[] => {
+    const metadata: AIInbxOutboundMetadata = {
+      ...resourceMetadata(payload),
+      ...(payload.type === "email.unsubscribed"
+        ? {
+            suppressionKey: payload.data.key,
+            unsubscribeScope: payload.data.scope,
+          }
+        : { suppressionKey: payload.data.suppression_key }),
+    };
+    const targets = recipients.length > 0 ? recipients : [""];
+
+    return targets.map((recipient) => {
+      const data: OutboundEmailEvent = {
+        schemaVersion: "1",
+        eventId: targets.length > 1 ? `${payload.id}:${recipient}` : payload.id,
+        messageId: payload.data.email_id,
+        providerId: payload.data.email_id,
+        recipient,
+        ...(recipient ? { recipientDomain: recipient.split("@")[1] } : {}),
+        status,
+        timestamp: new Date(payload.created_at),
+        provider: { [PROVIDER]: metadata },
+        raw: payload,
+        ...details,
+      };
+      return { type, data } as WebhookEvent;
+    });
+  };
+
+  const providerFetch = createAIInbxProviderFetch(baseUrl, config.apiKey);
 
   return {
     id: driverId,
-    name: "aiinbx",
+    name: PROVIDER,
     capabilities: AIINBX_CAPABILITIES,
-    providerFetch: createAIInbxProviderFetch(baseUrl, config.apiKey),
+    providerFetch,
 
     sendEmail: async (
       message: EmailMessage<typeof AIINBX_CAPABILITIES>,
       options?: SendEmailOptions,
     ): Promise<SendEmailResult> => {
-      const messageHeaders = (message as { headers?: Record<string, string> })
-        .headers;
-      if (messageHeaders && Object.keys(messageHeaders).length > 0) {
-        throw new EmailKitError(
-          "AIInbx does not support message.headers. Use message.reply.addresses, message.reply.messageId, message.reply.references, or message.reply.threadId for reply behavior.",
-          "aiinbx",
-          "UNSUPPORTED_FEATURE",
-        );
-      }
-
-      // AIInbx API requires html, so text-only sends are converted safely.
-      const html =
-        message.html || (message.text ? escapeHtmlText(message.text) : "");
-      if (!html) {
+      if (!message.html && !message.text) {
         throw new EmailKitError(
           "Either html or text must be provided",
-          "aiinbx",
+          PROVIDER,
           "MISSING_REQUIRED_FIELD",
         );
       }
 
-      const requestBody: Record<string, unknown> = {
-        from: message.from.email,
-        to: Array.isArray(message.to)
-          ? message.to.map((addr) => addr.email)
-          : message.to.email,
+      const reply = resolveMessageReplyContext(message);
+      if (reply.isReply && !reply.threadId) {
+        throw new EmailKitError(
+          "AIInbx replies are threaded by reply.threadId. Pass the inbound event's reply.threadId.",
+          PROVIDER,
+          "INVALID_REPLY_CONTEXT",
+        );
+      }
+
+      const providerOptions = (message.provider ?? {}) as AIInbxSendOptions;
+      const suppressionKey =
+        providerOptions.suppressionKey ?? message.unsubscribe?.listId;
+      const replyTo = replyAddressesAsArray(reply);
+
+      const body = {
+        from: {
+          address: message.from.email,
+          ...(message.from.name ? { name: message.from.name } : {}),
+        },
+        to: emailsOf(message.to),
         subject: message.subject,
-        html: html,
+        ...(message.html ? { html: message.html } : {}),
+        ...(message.text ? { text: message.text } : {}),
+        ...(message.cc ? { cc: emailsOf(message.cc) } : {}),
+        ...(message.bcc ? { bcc: emailsOf(message.bcc) } : {}),
+        ...(replyTo.length > 0 ? { reply_to: emailsOf(replyTo) } : {}),
+        ...(message.headers ? { headers: message.headers } : {}),
+        ...(message.attachments?.length
+          ? {
+              attachments: await Promise.all(
+                message.attachments.map((attachment) =>
+                  toOutboundAttachment(attachment, providerFetch),
+                ),
+              ),
+            }
+          : {}),
+        ...(message.sendAt
+          ? { scheduled_at: new Date(message.sendAt).toISOString() }
+          : {}),
+        ...(message.unsubscribe ? { unsubscribe: true } : {}),
+        ...(suppressionKey ? { suppression_key: suppressionKey } : {}),
+        ...(providerOptions.pacing ? { pacing: providerOptions.pacing } : {}),
       };
 
-      // Optional from name
-      if (message.from.name) {
-        requestBody.from_name = message.from.name;
-      }
-
-      // Optional text (if both provided)
-      if (message.text) {
-        requestBody.text = message.text;
-      }
-
-      // Optional CC/BCC/Reply-To (can be string or array)
-      if (message.cc) {
-        requestBody.cc = Array.isArray(message.cc)
-          ? message.cc.map((addr) => addr.email)
-          : message.cc.email;
-      }
-      if (message.bcc) {
-        requestBody.bcc = Array.isArray(message.bcc)
-          ? message.bcc.map((addr) => addr.email)
-          : message.bcc.email;
-      }
-      const reply = resolveMessageReplyContext(message);
-      if (hasReplyData(reply)) {
-        if (
-          reply.isReply &&
-          !reply.messageId &&
-          (!reply.references || reply.references.length === 0) &&
-          !reply.threadId
-        ) {
-          throw new EmailKitError(
-            "AIInbx cannot infer a reply from reply.isReply alone. Provide message.reply.messageId, message.reply.references, or message.reply.threadId.",
-            "aiinbx",
-            "INVALID_REPLY_CONTEXT",
-          );
-        }
-
-        const replyAddresses = replyAddressesAsArray(reply);
-        if (replyAddresses.length === 1) {
-          requestBody.reply_to = replyAddresses[0].email;
-        } else if (replyAddresses.length > 1) {
-          requestBody.reply_to = replyAddresses.map((addr) => addr.email);
-        }
-        if (reply.messageId) {
-          requestBody.in_reply_to = reply.messageId;
-        }
-        if (reply.references && reply.references.length > 0) {
-          requestBody.references = reply.references;
-        }
-        if (reply.threadId) {
-          requestBody.threadId = reply.threadId;
-        }
-      }
-
-      // Handle attachments
-      if (message.attachments && message.attachments.length > 0) {
-        requestBody.attachments = await Promise.all(
-          message.attachments.map(async (att) => {
-            // AIInbx requires content as base64 string
-            let content: string;
-
-            if (att.content) {
-              // Content is available - encode as base64
-              content =
-                typeof att.content === "string"
-                  ? stringToBase64(att.content)
-                  : bytesToBase64(att.content);
-            } else if (att.url) {
-              // URL is provided - fetch content first
-              try {
-                const res = await fetch(att.url);
-                if (!res.ok) throw new Error(`HTTP ${res.status}`);
-                const buf = new Uint8Array(await res.arrayBuffer());
-                content = bytesToBase64(buf);
-              } catch (error) {
-                throw new EmailKitError(
-                  `Failed to fetch attachment ${att.filename} from URL: ${att.url}`,
-                  "aiinbx",
-                  "ATTACHMENT_FETCH_FAILED",
-                  undefined,
-                  error,
-                );
-              }
-            } else {
-              throw new EmailKitError(
-                `Attachment ${att.filename} must have either content or url`,
-                "aiinbx",
-                "INVALID_ATTACHMENT",
-              );
-            }
-
-            const attachment: Record<string, unknown> = {
-              file_name: att.filename,
-              content,
-            };
-
-            // Optional content type
-            if (att.contentType) {
-              attachment.content_type = att.contentType;
-            }
-
-            // Set disposition: "inline" for inline attachments, "attachment" for regular attachments
-            if (att.isInline) {
-              attachment.disposition = "inline";
-              // Add CID for inline attachments if provided
-              if (att.contentId) {
-                attachment.cid = att.contentId;
-              }
-            } else {
-              attachment.disposition = "attachment";
-            }
-
-            return attachment;
-          }),
-        );
-      }
-
-      // Tracking configuration - AIInbx exposes per-send overrides.
-      if ("track" in message && message.track !== undefined) {
-        if (typeof message.track.opens === "boolean") {
-          requestBody.track_opens = message.track.opens;
-        }
-        if (typeof message.track.clicks === "boolean") {
-          requestBody.track_clicks = message.track.clicks;
-        }
-      }
-
-      const url = `${baseUrl}/emails/send`;
-      try {
-        const res = await fetch(url, {
+      // Replying on the thread lets AIInbx derive In-Reply-To and References.
+      const { data, response } = await request<AIInbxSendResponse>(
+        reply.threadId
+          ? `/threads/${encodeURIComponent(reply.threadId)}/reply`
+          : "/emails",
+        {
           method: "POST",
-          headers: {
-            Authorization: `Bearer ${config.apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(requestBody),
           signal: options?.signal,
-        });
+          headers: message.idempotencyKey
+            ? { "Idempotency-Key": message.idempotencyKey }
+            : undefined,
+          body,
+        },
+        "send email",
+      );
 
-        const contentType = res.headers.get("content-type") || "";
-        const body = contentType.includes("application/json")
-          ? await res.json()
-          : await res.text();
-
-        if (!res.ok) {
-          const bodyObj =
-            typeof body === "object" && body !== null
-              ? (body as Record<string, unknown>)
-              : undefined;
-          const providerCode =
-            typeof bodyObj?.code === "string" ||
-            typeof bodyObj?.code === "number"
-              ? bodyObj.code
-              : typeof bodyObj?.error === "string" ||
-                  typeof bodyObj?.error === "number"
-                ? bodyObj.error
-                : undefined;
-          let errorMessage =
-            (bodyObj?.message as string | undefined) ||
-            (typeof body === "string" ? body : "Failed to send email");
-          if (res.status === 404) {
-            errorMessage = `Endpoint not found: POST ${url}. Please check the AIInbx API documentation for the correct endpoint.`;
-          } else if (res.status === 401) {
-            errorMessage = `Unauthorized: Invalid API key. Please check your AI_INBX_API_KEY.`;
-          } else if (res.status === 400) {
-            errorMessage = `Bad Request: ${errorMessage}. Request body: ${JSON.stringify(requestBody, null, 2)}`;
-          } else if (res.status === 403) {
-            errorMessage = `Forbidden: ${errorMessage}. You may not have permission to send emails from this address.`;
-          } else if (res.status) {
-            errorMessage = `HTTP ${res.status}: ${errorMessage} (POST ${url})`;
-          }
-
-          throw new EmailKitError(
-            errorMessage,
-            "aiinbx",
-            providerCode,
-            res.status,
-            undefined,
-            body,
-          );
-        }
-
-        const emailId = (body as any)?.emailId;
-        const messageId = (body as any)?.messageId;
-        const threadId = (body as any)?.threadId;
-
-        if (!emailId || !messageId) {
-          throw new EmailKitError(
-            `Invalid response from AIInbx API. Expected emailId and messageId. Response: ${typeof body === "string" ? body : JSON.stringify(body)}`,
-            "aiinbx",
-            undefined,
-            res.status,
-            undefined,
-            body,
-          );
-        }
-
-        return {
-          messageId,
-          provider: driverId,
-          ...(threadId ? { threadId } : {}),
-          providerId: emailId,
-        };
-      } catch (error) {
-        if (error instanceof EmailKitError) {
-          throw error;
-        }
-        const raw =
-          typeof error === "object" && error !== null && "raw" in error
-            ? (error as { raw?: unknown }).raw
-            : undefined;
-        throw new EmailKitError(
-          `Failed to send email: ${error instanceof Error ? error.message : String(error)}`,
-          "aiinbx",
-          undefined,
-          undefined,
-          error,
-          raw,
-        );
-      }
+      const requestId = response.headers.get("x-request-id");
+      return {
+        // Outbound webhooks identify the email by AIInbx id, not RFC Message-ID.
+        messageId: data.id,
+        provider: driverId,
+        providerId: data.id,
+        threadId: data.thread_id,
+        ...(requestId ? { requestId } : {}),
+        // Suppressed recipients are dropped before sending, not an error.
+        ...(data.suppressed.length > 0 ? { rejected: data.suppressed } : {}),
+      };
     },
 
-    handleWebhook: async (request: WebhookRequest): Promise<WebhookEvent> => {
-      const payload = request.body as AIInbxWebhookEvent;
+    handleWebhook: async (
+      request: WebhookRequest,
+    ): Promise<WebhookEventResult> => {
+      const payload = request.body as AIInbxWebhookPayload;
 
-      // Determine event type from payload
-      const eventType = payload.event;
-
-      // Handle inbound email event
-      if (eventType === "inbound.email.received") {
-        const data = payload.data as InboundEmailReceivedData;
-        const inboundEvent = await transformInboundEmail(
-          data.email,
-          payload.timestamp,
-          payload, // Pass full webhook payload
-          config.autoFetchInboundAttachments ?? true,
-        );
-        return { type: "inbound", data: inboundEvent };
+      switch (payload.type) {
+        case "email.received":
+          return {
+            type: "inbound",
+            data: await loadInboundEvent(payload.data.email_id, {
+              eventId: payload.id,
+              raw: payload,
+              webhook: payload,
+            }),
+          };
+        case "email.sent":
+          return toOutboundEvents(
+            "outbound",
+            "sent",
+            payload,
+            payload.data.to.slice(0, 1),
+            {
+              from: { email: payload.data.from },
+              to: toAddresses(payload.data.to),
+              subject: payload.data.subject,
+            },
+          );
+        case "email.delivered":
+          return toOutboundEvents(
+            "delivered",
+            "delivered",
+            payload,
+            payload.data.recipients,
+          );
+        case "email.bounced":
+          return toOutboundEvents(
+            "bounced",
+            "bounced",
+            payload,
+            payload.data.recipients,
+            {
+              severity: payload.data.permanent ? "permanent" : "temporary",
+              reason: payload.data.reason,
+            },
+          );
+        case "email.complained":
+          return toOutboundEvents(
+            "complained",
+            "complained",
+            payload,
+            payload.data.recipients,
+            payload.data.reason ? { feedback: payload.data.reason } : {},
+          );
+        case "email.failed":
+          return toOutboundEvents("rejected", "rejected", payload, [], {
+            reason: payload.data.reason,
+          });
+        case "email.opened":
+          return toOutboundEvents(
+            "opened",
+            "opened",
+            payload,
+            [],
+            payload.data.user_agent
+              ? { userAgent: payload.data.user_agent }
+              : {},
+          );
+        case "email.clicked":
+          return toOutboundEvents("clicked", "clicked", payload, [], {
+            url: payload.data.url,
+            ...(payload.data.user_agent
+              ? { userAgent: payload.data.user_agent }
+              : {}),
+          });
+        case "email.unsubscribed":
+          return toOutboundEvents(
+            "unsubscribed",
+            "unsubscribed",
+            payload,
+            [payload.data.address],
+            {
+              ...(payload.data.key !== "*" ? { listId: payload.data.key } : {}),
+              source: payload.data.source,
+            },
+          );
+        case "mailbox.connected":
+        case "mailbox.needs_reauth":
+        case "mailbox.disconnected":
+          return toMailboxEvent(payload, driverId);
+        default:
+          return { type: "unknown", data: payload };
       }
-
-      // Handle outbound events
-      const outboundEventTypes = [
-        "outbound.email.delivered",
-        "outbound.email.bounced",
-        "outbound.email.complained",
-        "outbound.email.rejected",
-        "outbound.email.opened",
-        "outbound.email.clicked",
-        "outbound.email.link_clicked",
-      ] as const;
-
-      if (outboundEventTypes.includes(eventType as any)) {
-        const outboundEvent = transformOutboundEvent(
-          eventType,
-          payload.data,
-          payload.timestamp,
-          payload, // Pass full webhook payload
-        );
-
-        // Map to specific event type
-        const eventTypeMap: Record<
-          (typeof outboundEventTypes)[number],
-          | "delivered"
-          | "opened"
-          | "clicked"
-          | "bounced"
-          | "complained"
-          | "rejected"
-        > = {
-          "outbound.email.delivered": "delivered",
-          "outbound.email.opened": "opened",
-          "outbound.email.clicked": "clicked",
-          "outbound.email.link_clicked": "clicked",
-          "outbound.email.bounced": "bounced",
-          "outbound.email.complained": "complained",
-          "outbound.email.rejected": "rejected",
-        };
-
-        return {
-          type: eventTypeMap[eventType],
-          data: outboundEvent,
-        } as WebhookEvent;
-      }
-
-      return { type: "unknown", data: payload };
     },
 
     verifyWebhook: async (request: WebhookRequest): Promise<boolean> => {
-      if (!config.webhookSecret) {
-        return false;
-      }
+      // An empty secret is an unset env var, not a key anyone can sign with.
+      const secrets = [config.webhookSecret ?? []].flat().filter(Boolean);
+      if (secrets.length === 0) return false;
 
-      // AIInbx uses HMAC SHA-256 signature verification.
-      const signatureHeader = getHeader(request.headers, "x-aiinbx-signature");
-      const timestampHeader = getHeader(request.headers, "x-aiinbx-timestamp");
-
+      // AIInbx-Signature: t=<unix seconds>,v1=<hex hmac-sha256 of "<t>.<raw body>">
+      const header = getHeader(request.headers, "aiinbx-signature");
+      if (!header) return false;
+      const parts = new Map(
+        header.split(",").map((part) => {
+          const [key = "", ...value] = part.trim().split("=");
+          return [key, value.join("=")] as const;
+        }),
+      );
+      const timestamp = parts.get("t");
+      const signature = parts.get("v1");
       if (
-        !signatureHeader ||
-        !timestampHeader ||
-        !isFreshWebhookTimestamp(timestampHeader, "aiinbx")
+        !timestamp ||
+        !signature ||
+        !isFreshWebhookTimestamp(timestamp, PROVIDER)
       ) {
         return false;
       }
 
-      const bodyString = requireRawBody(request, "aiinbx");
-
-      try {
-        const payload = `${timestampHeader}.${bodyString}`;
-        const expectedSignature =
-          "sha256=" +
-          createHmac("sha256", config.webhookSecret)
-            .update(payload)
-            .digest("hex");
-
-        if (signatureHeader.length !== expectedSignature.length) {
-          return false;
-        }
-
-        return timingSafeEqual(
-          Buffer.from(signatureHeader, "utf8"),
-          Buffer.from(expectedSignature, "utf8"),
-        );
-      } catch {
-        return false;
-      }
+      return verifySignature(
+        secrets,
+        timestamp,
+        signature,
+        requireRawBody(request, PROVIDER),
+      );
     },
 
-    webhookResponse: async (
-      _request: WebhookRequest,
-      _handled: boolean,
-    ): Promise<WebhookResponse> => {
-      return {
-        status: 200,
-        body: { success: true },
-      };
+    webhookResponse: async (): Promise<WebhookResponse> => ({ status: 204 }),
+
+    mailboxes: {
+      /**
+       * AIInbx hosts the OAuth flow and keeps the tokens. The customer lands
+       * on `landingUrl` whether or not they approved — `mailbox.connected`
+       * (→ `hooks.mailbox.onConnected`) is the signal that the mailbox is live.
+       */
+      connect: async (
+        input: ConnectMailboxInput,
+      ): Promise<MailboxConnectionResult> => {
+        if (!input.landingUrl) {
+          throw new EmailKitError(
+            "Mailbox connect requires landingUrl or publicRoutes.connectLandingRoutes.success",
+            PROVIDER,
+            "MISSING_REQUIRED_FIELD",
+          );
+        }
+        const ref = encodeMailboxRef(input.context);
+
+        const { data } = await request<{ url: string }>(
+          "/mailboxes/connect",
+          {
+            method: "POST",
+            body: {
+              ...input.provider,
+              return_to: input.landingUrl,
+              ...(ref ? { ref } : {}),
+            },
+          },
+          "connect mailbox",
+        );
+        return {
+          redirectUrl: data.url,
+          landingUrl: input.landingUrl,
+          context: input.context,
+          raw: data,
+        };
+      },
+
+      list: async (opts?: ListMailboxesOptions): Promise<Mailbox[]> => {
+        const mailboxes = (
+          await listAll<AIInbxMailbox>(
+            "/mailboxes",
+            "list mailboxes",
+            opts?.status ? undefined : opts?.limit,
+          )
+        ).map(normalizeMailbox);
+        if (!opts?.status) return mailboxes;
+
+        return mailboxes
+          .filter((mailbox) => mailbox.status === opts.status)
+          .slice(0, opts.limit);
+      },
+
+      get: async (idOrEmail: string): Promise<Mailbox> => {
+        const { data } = await request<AIInbxMailbox>(
+          await mailboxPath(idOrEmail),
+          { method: "GET" },
+          "get mailbox",
+        );
+        return normalizeMailbox(data);
+      },
+
+      delete: async (idOrEmail: string): Promise<MailboxDeleteResult> => {
+        await request(
+          await mailboxPath(idOrEmail),
+          { method: "DELETE" },
+          "disconnect mailbox",
+        );
+        return { deleted: true };
+      },
+    },
+
+    webhooks: {
+      account: {
+        setup: async (
+          input: AccountWebhookSetupInput,
+        ): Promise<AccountWebhookSetupResult> => {
+          if (!input.url?.trim()) {
+            throw new EmailKitError(
+              "Webhook setup requires input.url",
+              PROVIDER,
+              "MISSING_REQUIRED_FIELD",
+            );
+          }
+
+          const routing = toRoutingRules(input.inbound?.recipients);
+          const { data: raw } = await request<AIInbxWebhookEndpoint>(
+            "/webhook-endpoints",
+            {
+              method: "POST",
+              body: {
+                url: input.url,
+                subscriptions: toAIInbxWebhookEvents(input.events),
+                ...(routing ? { routing } : {}),
+                ...input.provider,
+              },
+            },
+            "create webhook",
+          );
+          return { webhook: normalizeWebhookEndpoint(raw), raw };
+        },
+
+        refresh: async (
+          input: AccountWebhookRefreshInput,
+        ): Promise<AccountWebhookRefreshResult> => {
+          const webhookId = requireWebhookId(input, "refresh");
+          const { data: raw } = await request<AIInbxWebhookEndpoint>(
+            `/webhook-endpoints/${encodeURIComponent(webhookId)}`,
+            { method: "GET" },
+            "refresh webhook",
+          );
+          return {
+            webhook: {
+              ...normalizeWebhookEndpoint(raw),
+              // The signing secret is only returned on creation.
+              ...(input.webhook?.provider
+                ? { provider: input.webhook.provider }
+                : {}),
+            },
+            raw,
+          };
+        },
+
+        delete: async (
+          input: AccountWebhookDeleteInput,
+        ): Promise<AccountWebhookDeleteResult> => {
+          const webhookId = requireWebhookId(input, "delete");
+          await request(
+            `/webhook-endpoints/${encodeURIComponent(webhookId)}`,
+            { method: "DELETE" },
+            "delete webhook",
+          );
+          return {
+            deleted: true,
+            webhook: {
+              id: input.webhook?.id || webhookId,
+              providerId: webhookId,
+              scope: "account",
+              url: input.webhook?.url || "",
+              events: input.webhook?.events,
+              status: "deleted",
+            },
+          };
+        },
+      },
     },
 
     sync: {
       /**
-       * Replay missed inbound emails from the threads API.
+       * Replay missed inbound emails.
        *
-       * AIInbx has no flat list-emails endpoint; `POST /threads/search`
-       * filters by `lastEmailAfter` (ascending by lastEmailAt, offset
-       * pagination) and `GET /threads/{id}` returns each thread's full
-       * emails. Threads order by their latest email, so emails interleave
-       * across threads; the windowed inbound emails are buffered and sorted
-       * ascending before replay, with attachment fetching deferred to yield
-       * time. Outbound tracking events are not listable via the AIInbx API,
-       * so sync is inbound-only.
+       * `GET /emails` lists newest-first with cursor pagination and no time
+       * filter, so the lightweight list items for the window are buffered
+       * while paging back to `since`, then replayed oldest-first. The heavy
+       * work (full email + attachments per id) streams lazily at yield time.
+       * Replayed events carry no webhook event id or verdicts; dedupe against
+       * live webhooks by `messageId`. Outbound delivery events are not
+       * replayed.
        */
       account: async function* (input: AccountSyncInput): SyncStream {
-        const since = input.since;
-        const until = input.until ?? new Date();
+        const since = input.since.getTime();
+        const until = (input.until ?? new Date()).getTime();
 
-        const threadIds: string[] = [];
-        let offset = 0;
-        while (true) {
-          const page = (await requestApi(
-            "/threads/search",
+        const windowed: AIInbxEmail[] = [];
+        let cursor: string | undefined;
+
+        pagination: do {
+          const { data: page } = await request<AIInbxPage<AIInbxEmail>>(
+            "/emails",
             {
-              method: "POST",
+              method: "GET",
               signal: input.signal,
-              body: JSON.stringify({
-                // 1ms earlier so boundary emails survive either
-                // inclusive/exclusive "after" semantics.
-                lastEmailAfter: new Date(since.getTime() - 1).toISOString(),
-                sortBy: "lastEmailAt",
-                sortOrder: "asc",
-                limit: 100,
-                offset,
-              }),
+              searchParams: {
+                direction: "inbound",
+                limit: String(LIST_PAGE_SIZE),
+                cursor,
+              },
             },
-            "search threads",
-          )) as AIInbxThreadSearchResponse;
-
-          const threads = page.threads || [];
-          threadIds.push(...threads.map((thread) => thread.id));
-          if (!page.pagination?.hasMore || threads.length === 0) break;
-          offset += threads.length;
-        }
-
-        const windowed: Array<{ email: AIInbxEmail; receivedAt: number }> = [];
-        for (const threadId of threadIds) {
-          const thread = (await requestApi(
-            `/threads/${encodeURIComponent(threadId)}`,
-            { method: "GET", signal: input.signal },
-            "get thread",
-          )) as AIInbxThreadResponse;
-
-          for (const email of thread.emails || []) {
-            if (email.direction !== "INBOUND") continue;
-            const receivedAt = new Date(
-              email.receivedAt || email.createdAt,
-            ).getTime();
-            if (Number.isNaN(receivedAt)) continue;
-            if (receivedAt < since.getTime() || receivedAt >= until.getTime())
-              continue;
-            windowed.push({ email, receivedAt });
-          }
-        }
-        windowed.sort((a, b) => a.receivedAt - b.receivedAt);
-
-        for (const { email, receivedAt } of windowed) {
-          const event = await transformInboundEmail(
-            email,
-            receivedAt / 1000,
-            email,
-            config.autoFetchInboundAttachments ?? true,
-            input.signal,
+            "list emails",
           );
-          yield { type: "inbound", data: event };
+
+          for (const email of page.data) {
+            const createdAt = new Date(email.created_at).getTime();
+            if (Number.isNaN(createdAt)) continue;
+            // Newest-first: everything after this item is older than `since`.
+            if (createdAt < since) break pagination;
+            if (createdAt >= until) continue;
+            windowed.push(email);
+          }
+
+          cursor = page.next_cursor ?? undefined;
+        } while (cursor);
+
+        for (const email of windowed.reverse()) {
+          yield {
+            type: "inbound",
+            data: await loadInboundEvent(email.id, {
+              eventId: `${email.id}:received`,
+              signal: input.signal,
+            }),
+          };
         }
 
-        return { syncedFrom: since };
+        return { syncedFrom: input.since };
       },
     },
 
-    // Domains API (partial)
     domains: {
-      list: async (): Promise<Domain[]> => {
-        return (await listDomainPayloads()).map(normalizeDomain);
+      list: async (opts?: ListDomainsOptions): Promise<Domain[]> => {
+        const domains = (
+          await listAll<AIInbxDomain>(
+            "/domains",
+            "list domains",
+            opts?.status ? undefined : opts?.limit,
+          )
+        ).map(normalizeDomain);
+        if (!opts?.status) return domains;
+
+        // v2 domains are either verified or pending; nothing is "unverified".
+        return domains
+          .filter((domain) => domain.status === opts.status)
+          .slice(0, opts.limit);
       },
 
-      create: async (input): Promise<Domain> => {
-        const body = await requestApi(
+      create: async (input: CreateDomainInput): Promise<Domain> => {
+        const { data: created } = await request<AIInbxDomain>(
           "/domains",
-          { method: "POST", body: JSON.stringify({ domain: input.domain }) },
+          {
+            method: "POST",
+            body: {
+              name: input.domain,
+              ...(input.region ? { region: input.region } : {}),
+              ...input.provider,
+            },
+          },
           "create domain",
         );
-        const domainId = (body as any)?.domainId as string;
-        const recs = ((body as any)?.records || []) as any[];
-        const records = recs.map(mapDnsRecord);
-        const status: Domain["status"] = "pending";
-        const domain: Domain = {
-          id: domainId,
-          domain: input.domain,
-          status,
-          verification: { status, records },
-          raw: body,
-        };
-        return domain;
+        if (!input.tracking) return normalizeDomain(created);
+
+        // Tracking is not part of the create request.
+        const { data: updated } = await request<AIInbxDomain>(
+          `/domains/${created.id}`,
+          {
+            method: "PATCH",
+            body: {
+              track_opens: input.tracking.opens,
+              track_clicks: input.tracking.clicks,
+            },
+          },
+          "update domain",
+        );
+        return normalizeDomain(updated);
       },
 
       get: async (idOrName: string): Promise<Domain> => {
-        const id = await resolveDomainId(idOrName);
-        const body = await requestApi(
-          `/domains/${id}`,
+        const { data } = await request<AIInbxDomain>(
+          await domainPath(idOrName),
           { method: "GET" },
           "get domain",
         );
-        return normalizeDomain(body);
+        return normalizeDomain(data);
+      },
+
+      update: async (
+        idOrName: string,
+        patch: UpdateDomainInput,
+      ): Promise<Domain> => {
+        const { data } = await request<AIInbxDomain>(
+          await domainPath(idOrName),
+          {
+            method: "PATCH",
+            body: {
+              track_opens: patch.tracking?.opens,
+              track_clicks: patch.tracking?.clicks,
+              ...patch.provider,
+            },
+          },
+          "update domain",
+        );
+        return normalizeDomain(data);
       },
 
       verify: async (idOrName: string): Promise<DomainVerification> => {
-        const id = await resolveDomainId(idOrName);
-        const body = await requestApi(
-          `/domains/${id}/verify`,
-          { method: "POST", body: JSON.stringify({}) },
+        const { data } = await request<AIInbxDomain>(
+          await domainPath(idOrName, "/verify"),
+          { method: "POST" },
           "verify domain",
         );
-        const domainObj = ((body as any)?.domain ?? body) as any;
-        const status = mapDomainStatus(domainObj?.status);
-        const recs = extractDnsRecords(domainObj) ?? [];
-        const verification: DomainVerification = {
-          status,
-          records: recs,
-          checkedAt: new Date(),
-          raw: body,
-        };
-        return verification;
+        return normalizeDomainVerification(data, new Date());
       },
 
-      delete: async (idOrName: string): Promise<{ deleted: boolean }> => {
-        const id = await resolveDomainId(idOrName);
-        await requestApi(
-          `/domains/${id}`,
+      delete: async (idOrName: string): Promise<DomainDeleteResult> => {
+        await request(
+          await domainPath(idOrName),
           { method: "DELETE" },
           "delete domain",
         );

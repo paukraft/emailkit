@@ -1198,7 +1198,7 @@ const transformMailgunEvent = async ({
     temporary_fail: "bounced",
     complained: "complained",
     rejected: "rejected",
-    unsubscribed: "complained",
+    unsubscribed: "unsubscribed",
   };
 
   // Extract recipient (always available in Mailgun events)
@@ -1329,7 +1329,9 @@ const retrieveStoredAttachments = async ({
     mailgunAttachmentProviderMetadata(att.provider)?.attachmentUrl ||
     (isDirectMailgunAttachmentUrl(att.url, storageUrl) ? att.url : undefined);
 
-  if (attachmentMetadata.some((att) => directAttachmentUrl(att) !== undefined)) {
+  if (
+    attachmentMetadata.some((att) => directAttachmentUrl(att) !== undefined)
+  ) {
     const basic = `Basic ${stringToBase64(`api:${apiKey}`)}`;
     const attachments = await retrieveAttachmentsInParallel({
       attachments: attachmentMetadata,
@@ -3016,9 +3018,14 @@ export const MailgunDriver = <const TId extends string = "mailgun">(
           } as WebhookEvent;
 
         case "complained":
-        case "unsubscribed":
           return {
             type: "complained",
+            data: transformedEvent as OutboundEmailEvent,
+          };
+
+        case "unsubscribed":
+          return {
+            type: "unsubscribed",
             data: transformedEvent as OutboundEmailEvent,
           };
 

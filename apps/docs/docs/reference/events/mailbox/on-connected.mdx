@@ -5,7 +5,7 @@ sidebar:
   label: onConnected
 ---
 
-Fires when a mailbox is connected — a user finishing the OAuth flow, or your app calling `emailkit.mailboxes.connect()`. The event carries the `mailbox` and, when the driver hands one back, its `auth` — encrypt and store both, so [`resolveEmailDriver`](/guides/multiple-providers) can load them when the mailbox sends or receives.
+Fires when a mailbox is connected — a user finishing the OAuth flow, your app calling `emailkit.mailboxes.connect()`, or a provider that hosts the flow itself (AIInbx) reporting it by webhook. The event carries the `mailbox` and, when the driver hands one back, its `auth` — encrypt and store both, so [`resolveEmailDriver`](/guides/multiple-providers) can load them when the mailbox sends or receives.
 
 ```ts
 hooks: {

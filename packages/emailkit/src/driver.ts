@@ -341,8 +341,9 @@ export interface DriverDomainsAPI {
 export interface DriverMailboxesAPI<
   TCapabilities extends DriverCapabilities = DriverCapabilities,
 > {
+  /** Route restrictions are enforced by the client; drivers get the broad input. */
   connect: (
-    input: ConnectMailboxInput<TCapabilities>,
+    input: ConnectMailboxInput,
     options?: EmailDriverOperationOptions<TCapabilities>,
   ) => Promise<MailboxConnectionResult>;
   create: (

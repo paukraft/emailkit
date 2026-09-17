@@ -1,272 +1,224 @@
-import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AIInbxDriver, EmailKit } from "../src";
+import { AIInbxDriver } from "../src";
+import { API, jsonResponse } from "./aiinbx-fixtures";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
-const recordResponse = {
-  type: "TXT",
-  name: "_dmarc",
-  value: "v=DMARC1; p=none",
-  priority: null,
-  isVerified: true,
-  lastCheckedAt: "2026-04-02T10:00:00.000Z",
-};
+const domain = (
+  id: string,
+  name: string,
+  overrides: Record<string, unknown> = {},
+) => ({
+  id,
+  name,
+  region: "eu-central-1",
+  space_id: null,
+  parent_id: null,
+  provided: false,
+  verified_at: null,
+  created_at: "2026-09-01T10:00:00Z",
+  tracking: { opens: false, clicks: false },
+  records: [
+    {
+      purpose: "DKIM",
+      type: "CNAME",
+      name: `aiinbx._domainkey.${name}`,
+      value: "dkim.aiinbx.com",
+      ttl: 300,
+      state: "verified",
+      last_checked_at: "2026-09-01T10:05:00Z",
+    },
+    {
+      purpose: "INBOUND",
+      type: "MX",
+      name,
+      value: "inbound.aiinbx.com",
+      ttl: 300,
+      state: "missing",
+      last_checked_at: null,
+    },
+  ],
+  ...overrides,
+});
+
+const calls = (fetchMock: ReturnType<typeof vi.fn>) =>
+  fetchMock.mock.calls.map(([input, init]) => ({
+    method: (init as RequestInit).method,
+    url: input.toString(),
+    body: (init as RequestInit).body
+      ? JSON.parse((init as RequestInit).body as string)
+      : undefined,
+  }));
 
 describe("AIInbxDriver domains", () => {
   it("defaults to the aiinbx id and preserves custom literal ids", () => {
-    const defaultDriver = AIInbxDriver({ apiKey: "ai_test" });
-    const customDriver = AIInbxDriver({
-      id: "tenant-aiinbx",
-      apiKey: "ai_test",
-    });
-    const client = EmailKit({ emailDrivers: [customDriver] });
-
-    expect(defaultDriver.id).toBe("aiinbx");
-    expect(customDriver.id).toBe("tenant-aiinbx");
-    expect(client.getDriver("tenant-aiinbx")).toBe(customDriver);
-    expectTypeOf(customDriver.id).toEqualTypeOf<"tenant-aiinbx">();
+    expect(AIInbxDriver({ apiKey: "ai_test" }).id).toBe("aiinbx");
+    expect(AIInbxDriver({ id: "support", apiKey: "ai_test" }).id).toBe(
+      "support",
+    );
   });
 
-  it("advertises only AIInbx-supported core capabilities", () => {
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-
-    expect(driver.capabilities.domains).toMatchObject({
-      list: true,
-      create: true,
-      get: true,
-      verify: true,
-      delete: true,
-      identifier: "domainId",
-    });
-    expect(driver.capabilities.requiresSecret).toBeUndefined();
-    expect(driver.capabilities.mailboxConnect).toBeUndefined();
-    expect(driver.capabilities.mailboxCreate).toBeUndefined();
-    expect(driver.capabilities.mailboxList).toBeUndefined();
-    expect(driver.capabilities.mailboxGet).toBeUndefined();
-    expect(driver.capabilities.mailboxDelete).toBeUndefined();
-    expect(driver.mailboxes).toBeUndefined();
-  });
-
-  it("scopes providerFetch to the versioned AIINBX API base", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response(null, { status: 204 }));
+  it("scopes providerFetch auth to the versioned API base", async () => {
+    const fetchMock = vi.fn(async () => new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchMock);
-
     const driver = AIInbxDriver({
       apiKey: "ai_test",
-      apiBase: "https://api.example.com",
+      apiBase: "https://api.example.com/",
     });
 
-    await driver.providerFetch!("/domains");
-    await driver.providerFetch!("https://api.example.com/api/v1/domains");
+    await driver.providerFetch!("/attachments/att_1/content");
+    await driver.providerFetch!("https://api.example.com/api/v2/domains");
     await driver.providerFetch!("https://files.example.com/report.txt");
 
-    const [relativeUrl, relativeInit] = fetchMock.mock.calls[0] as [
-      URL,
-      RequestInit,
-    ];
-    const [absoluteApiUrl, absoluteApiInit] = fetchMock.mock.calls[1] as [
-      URL,
-      RequestInit,
-    ];
-    const [externalUrl, externalInit] = fetchMock.mock.calls[2] as [
-      string | URL,
-      RequestInit,
-    ];
-
-    expect(relativeUrl.toString()).toBe("https://api.example.com/api/v1/domains");
-    expect(absoluteApiUrl.toString()).toBe(
-      "https://api.example.com/api/v1/domains",
-    );
-    expect(new Headers(relativeInit.headers).get("authorization")).toBe(
-      "Bearer ai_test",
-    );
-    expect(new Headers(absoluteApiInit.headers).get("authorization")).toBe(
-      "Bearer ai_test",
-    );
-    expect(externalUrl.toString()).toBe("https://files.example.com/report.txt");
-    expect(new Headers(externalInit.headers).get("authorization")).toBeNull();
+    const requests = (
+      fetchMock.mock.calls as unknown as Array<[URL, RequestInit]>
+    ).map(([url, init]) => ({
+      url: url.toString(),
+      authorization: new Headers(init.headers).get("authorization"),
+    }));
+    expect(requests).toEqual([
+      {
+        url: "https://api.example.com/api/v2/attachments/att_1/content",
+        authorization: "Bearer ai_test",
+      },
+      {
+        url: "https://api.example.com/api/v2/domains",
+        authorization: "Bearer ai_test",
+      },
+      { url: "https://files.example.com/report.txt", authorization: null },
+    ]);
   });
 
-  it("maps list responses that expose DNS records as records", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            domains: [
-              {
-                id: "dom_123",
-                domain: "example.com",
-                status: "PENDING_VERIFICATION",
-                records: [recordResponse],
-              },
+  it("lists every page and normalizes status and DNS records", async () => {
+    const fetchMock = vi.fn(async (input: string | URL) =>
+      new URL(input.toString()).searchParams.get("cursor")
+        ? jsonResponse({
+            data: [
+              domain("dom_2", "two.example.com", {
+                verified_at: "2026-09-01T11:00:00Z",
+              }),
             ],
+            next_cursor: null,
+          })
+        : jsonResponse({
+            data: [domain("dom_1", "one.example.com")],
+            next_cursor: "dom_1",
           }),
-          {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          },
-        ),
-      ),
     );
-
+    vi.stubGlobal("fetch", fetchMock);
     const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const domains = await driver.domains!.list!();
 
-    expect(domains).toHaveLength(1);
-    expect(domains[0]).toMatchObject({
-      id: "dom_123",
-      domain: "example.com",
-      status: "pending",
-    });
-    expect(domains[0]).not.toHaveProperty("name");
-    expect(domains[0]?.verification?.records).toHaveLength(1);
-    expect(domains[0]?.verification?.records[0]).toMatchObject({
-      type: "TXT",
-      name: "_dmarc",
-      value: "v=DMARC1; p=none",
-      verified: true,
-    });
+    const domains = await driver.domains.list();
+
+    expect(domains).toMatchObject([
+      { id: "dom_1", domain: "one.example.com", status: "pending" },
+      { id: "dom_2", domain: "two.example.com", status: "verified" },
+    ]);
+    expect(domains[0]!.region).toBe("eu-central-1");
+    expect(domains[0]!.verification!.records).toEqual([
+      {
+        type: "CNAME",
+        name: "aiinbx._domainkey.one.example.com",
+        value: "dkim.aiinbx.com",
+        ttl: 300,
+        purpose: "dkim",
+        verified: true,
+        lastCheckedAt: new Date("2026-09-01T10:05:00Z"),
+      },
+      {
+        type: "MX",
+        name: "one.example.com",
+        value: "inbound.aiinbx.com",
+        ttl: 300,
+        purpose: "mx",
+        verified: false,
+      },
+    ]);
+
+    expect(await driver.domains.list({ status: "verified" })).toMatchObject([
+      { id: "dom_2" },
+    ]);
   });
 
-  it("maps OpenAPI dnsRecords to normalized verification records", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            domains: [
-              {
-                id: "dom_123",
-                createdAt: "2026-04-02T10:00:00.000Z",
-                updatedAt: "2026-04-02T10:30:00.000Z",
-                domain: "example.com",
-                verifiedAt: null,
-                status: "PENDING_VERIFICATION",
-                isManagedDefault: false,
-                dnsRecords: [
-                  {
-                    type: "MX",
-                    name: "example.com",
-                    value: "feedback-smtp.us-east-1.amazonses.com",
-                    priority: 10,
-                    verificationStatus: "verified",
-                  },
-                ],
-              },
-            ],
-          }),
-          {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          },
-        ),
-      ),
-    );
-
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const domains = await driver.domains!.list!();
-
-    expect(domains[0]?.domain).toBe("example.com");
-    expect(domains[0]).not.toHaveProperty("name");
-    expect(domains[0]?.verification?.records[0]).toMatchObject({
-      type: "MX",
-      name: "example.com",
-      value: "feedback-smtp.us-east-1.amazonses.com",
-      priority: 10,
-      verified: true,
-    });
-  });
-
-  it("creates domains with the public domain field only", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          domainId: "dom_123",
-          records: [recordResponse],
-        }),
-        {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        },
-      ),
+  it("creates a domain and applies tracking with a follow-up update", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(domain("dom_1", "one.example.com"), { status: 201 }),
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const domain = await driver.domains!.create!({ domain: "example.com" });
-
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({ domain: "example.com" });
-    expect(domain).toMatchObject({
-      id: "dom_123",
-      domain: "example.com",
-      status: "pending",
+    const created = await AIInbxDriver({ apiKey: "ai_test" }).domains.create({
+      domain: "one.example.com",
+      region: "us-east-1",
+      tracking: { opens: true },
+      provider: { space_id: "spc_1" },
     });
-    expect(domain).not.toHaveProperty("name");
+
+    expect(created).toMatchObject({ id: "dom_1", status: "pending" });
+    expect(calls(fetchMock)).toEqual([
+      {
+        method: "POST",
+        url: `${API}/domains`,
+        body: {
+          name: "one.example.com",
+          region: "us-east-1",
+          space_id: "spc_1",
+        },
+      },
+      {
+        method: "PATCH",
+        url: `${API}/domains/dom_1`,
+        body: { track_opens: true },
+      },
+    ]);
   });
 
-  it("maps get responses that expose DNS records as records", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            id: "dom_123",
-            domain: "example.com",
-            status: "VERIFIED",
-            records: [recordResponse],
-          }),
-          {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          },
-        ),
-      ),
-    );
+  it("resolves domain names to ids for get, update, verify, and delete", async () => {
+    const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+      const url = new URL(input.toString());
+      if (init?.method === "DELETE") return new Response(null, { status: 204 });
+      if (url.pathname === "/api/v2/domains") {
+        return jsonResponse({
+          data: [domain("dom_1", "one.example.com")],
+          next_cursor: null,
+        });
+      }
+      return jsonResponse(
+        domain("dom_1", "one.example.com", {
+          verified_at: "2026-09-01T11:00:00Z",
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { domains } = AIInbxDriver({ apiKey: "ai_test" });
 
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const domain = await driver.domains!.get!("dom_123");
-
-    expect(domain.status).toBe("verified");
-    expect(domain.verification?.records).toHaveLength(1);
-  });
-
-  it("maps verify responses that expose DNS records as records", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            domain: {
-              id: "dom_123",
-              domain: "example.com",
-              status: "VERIFIED",
-              records: [recordResponse],
-            },
-            verification: {
-              verification: "Success",
-            },
-          }),
-          {
-            status: 200,
-            headers: { "content-type": "application/json" },
-          },
-        ),
-      ),
-    );
-
-    const driver = AIInbxDriver({ apiKey: "ai_test" });
-    const verification = await driver.domains!.verify!("dom_123");
-
+    expect(await domains.get("One.Example.com")).toMatchObject({
+      id: "dom_1",
+      status: "verified",
+    });
+    await domains.update("dom_1", { tracking: { clicks: true } });
+    const verification = await domains.verify("dom_1");
     expect(verification.status).toBe("verified");
-    expect(verification.records).toHaveLength(1);
-    expect(verification.records[0]?.verified).toBe(true);
+    expect(verification.checkedAt).toBeInstanceOf(Date);
+    expect(await domains.delete("dom_1")).toEqual({ deleted: true });
+
+    expect(calls(fetchMock).slice(1)).toEqual([
+      { method: "GET", url: `${API}/domains/dom_1`, body: undefined },
+      {
+        method: "PATCH",
+        url: `${API}/domains/dom_1`,
+        body: { track_clicks: true },
+      },
+      { method: "POST", url: `${API}/domains/dom_1/verify`, body: undefined },
+      { method: "DELETE", url: `${API}/domains/dom_1`, body: undefined },
+    ]);
+
+    await expect(domains.get("missing.example.com")).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      httpStatus: 404,
+    });
   });
 });

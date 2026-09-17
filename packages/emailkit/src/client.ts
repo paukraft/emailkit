@@ -77,7 +77,6 @@ import type {
   Webhook,
   WebhookDriverEvent,
   WebhookLifecycleAction,
-  WebhookLifecycleDriverEvent,
   WebhookLifecycleHookEvent,
   WebhookLifecycleReason,
   WebhookLifecycleSource,
@@ -1749,17 +1748,6 @@ const validatePublicRouteCapabilities = (driver: EmailDriver): void => {
     );
   }
 
-  if (
-    publicRoutes.connectLanding === true &&
-    publicRoutes.connectCallback !== true
-  ) {
-    throw new EmailKitError(
-      "Public route capability publicRoutes.connectLanding requires publicRoutes.connectCallback",
-      driverLabel(driver),
-      "INVALID_CONFIG",
-    );
-  }
-
   if (publicRoutes.connectCallback === true && !driver.handleCallback) {
     throw new EmailKitError(
       "Public route capability publicRoutes.connectCallback is declared but driver.handleCallback is not implemented",
@@ -2224,13 +2212,9 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     );
   }
 
-  const secretRequired = emailDrivers.some((driver) => {
-    const capabilities = driver.capabilities;
-    return (
-      capabilities.requiresSecret === true ||
-      capabilities.mailboxConnect === true
-    );
-  });
+  const secretRequired = emailDrivers.some(
+    (driver) => driver.capabilities.requiresSecret === true,
+  );
   const secret = resolveEmailKitSecret(config.secret);
   if (secretRequired && !secret) {
     throw new EmailKitError(
@@ -2786,6 +2770,9 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
       case "rejected":
         await hooks.email?.onRejected?.(dataWithDriver as any);
         break;
+      case "unsubscribed":
+        await hooks.email?.onUnsubscribed?.(dataWithDriver as any);
+        break;
       case "unknown":
         await hooks.email?.onUnknown?.({
           emailDriver,
@@ -2805,10 +2792,39 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
     }
   };
 
-  const isWebhookLifecycleDriverEvent = (
+  /**
+   * Dispatches webhook and mailbox lifecycle driver events to their hooks.
+   * Returns false for email events, which carry their own dispatch source.
+   */
+  const dispatchLifecycleDriverEvent = async (
+    driver: EmailDriver,
     event: WebhookDriverEvent,
-  ): event is WebhookLifecycleDriverEvent => {
-    return event.type === "webhook.lifecycle";
+  ): Promise<boolean> => {
+    if (event.type === "webhook.lifecycle") {
+      const { data } = event;
+      await dispatchWebhookLifecycle(driver, data.scope, data.action, {
+        ...data,
+        ...(data.action === "deleted" ? { deleted: true } : {}),
+      });
+      return true;
+    }
+
+    if (event.type === "mailbox.lifecycle") {
+      const { action, mailbox, context } = event.data;
+      const hookEvent = {
+        emailDriver: driver.id,
+        mailbox: stripMailboxAuth(mailbox),
+        ...(context !== undefined ? { context } : {}),
+      };
+      if (action === "connected") {
+        await hooks.mailbox?.onConnected?.(hookEvent);
+      } else {
+        await hooks.mailbox?.onDeleted?.(hookEvent);
+      }
+      return true;
+    }
+
+    return false;
   };
 
   const runSync = async (
@@ -2853,17 +2869,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
         }
 
         const event = result.value;
-        if (isWebhookLifecycleDriverEvent(event)) {
-          await dispatchWebhookLifecycle(
-            driver,
-            event.data.scope,
-            event.data.action,
-            {
-              ...event.data,
-              ...(event.data.action === "deleted" ? { deleted: true } : {}),
-            },
-          );
-        } else {
+        if (!(await dispatchLifecycleDriverEvent(driver, event))) {
           await dispatchEmailHooks(
             driver,
             {
@@ -3025,18 +3031,7 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
         ? eventResult
         : [eventResult];
       for (const event of events) {
-        if (isWebhookLifecycleDriverEvent(event)) {
-          await dispatchWebhookLifecycle(
-            driver,
-            event.data.scope,
-            event.data.action,
-            {
-              ...event.data,
-              ...(event.data.action === "deleted" ? { deleted: true } : {}),
-            },
-          );
-          continue;
-        }
+        if (await dispatchLifecycleDriverEvent(driver, event)) continue;
 
         await dispatchEmailHooks(
           driver,
