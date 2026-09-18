@@ -116,8 +116,10 @@ export const checkOpenBot = (input: {
   )
     return { isBot: false, reason: OPEN_REASONS.EMAIL_IMAGE_PROXY };
 
-  if (userAgent.trim().toLowerCase() === "mozilla/5.0")
-    return { isBot: false, reason: OPEN_REASONS.BARE_MOZILLA };
+  // Apple Mail Privacy Protection sends the bare token and nothing else, and
+  // fetches every image as the message lands — whether anyone reads it or not.
+  if (ua.toLowerCase() === "mozilla/5.0")
+    return { isBot: true, reason: OPEN_REASONS.BARE_MOZILLA };
 
   // 3) Timing (fast-after-send ⇒ likely bot)
   if (typeof input.timeSinceSendMs === "number" && input.timeSinceSendMs < 1000)

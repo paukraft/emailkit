@@ -555,8 +555,26 @@ describe("AIInbxDriver webhooks", () => {
         { ...base, recipients: ["a@example.net"], reason: "abuse" },
       ],
       ["email.failed", { ...base, reason: "virus" }],
-      ["email.opened", { ...base, user_agent: "Mozilla/5.0" }],
-      ["email.clicked", { ...base, url: "https://example.com/i/42" }],
+      [
+        "email.opened",
+        {
+          ...base,
+          user_agent: "Mozilla/5.0",
+          bot: true,
+          bot_reason: "privacy_proxy",
+        },
+      ],
+      [
+        "email.clicked",
+        {
+          ...base,
+          url: "https://example.com/i/42",
+          user_agent:
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+          bot: true,
+          bot_reason: "too_fast",
+        },
+      ],
       [
         "email.unsubscribed",
         {
@@ -595,11 +613,15 @@ describe("AIInbxDriver webhooks", () => {
       recipient: "",
       reason: "virus",
     });
+    // AIInbx's verdict stands: it timed the click against the delivery, where
+    // emailkit's own reading of that user-agent says a person.
     expect(hooks.onOpened.mock.calls[0]![0]).toMatchObject({
       userAgent: "Mozilla/5.0",
+      botDetection: { isBot: true, reason: "privacy_proxy" },
     });
     expect(hooks.onClicked.mock.calls[0]![0]).toMatchObject({
       url: "https://example.com/i/42",
+      botDetection: { isBot: true, reason: "too_fast" },
     });
     const unsubscribed = hooks.onUnsubscribed.mock.calls[0]![0];
     expect(unsubscribed).toMatchObject({

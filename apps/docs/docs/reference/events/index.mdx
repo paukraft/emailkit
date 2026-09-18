@@ -129,7 +129,7 @@ onOpened: async (event) => {
 },
 ```
 
-The classifier checks known scanner user agents (Barracuda, Outlook safe-link crawlers, HTTP libraries), opens arriving impossibly fast after send, HEAD requests on tracked links, and malformed browser signatures. It also knows the Gmail, Yahoo, and Outlook image proxies are real humans opening mail, so those still count. `reason` tells you which rule decided.
+The classifier checks known scanner user agents (Barracuda, Outlook safe-link crawlers, HTTP libraries), opens arriving impossibly fast after send, HEAD requests on tracked links, and malformed browser signatures. A bare `Mozilla/5.0` is Apple Mail Privacy Protection prefetching, so it counts as a bot too. It also knows the Gmail, Yahoo, and Outlook image proxies are real humans opening mail, so those still count. `reason` tells you which rule decided. On AIInbx the platform has already decided — it sees delivery timing emailkit cannot — and its verdict is passed through as is, with AIInbx's own `reason` (`privacy_proxy`, `too_fast`, …).
 
 Need the same logic elsewhere? `checkOpenBot` and `checkClickBot` are exported from `emailkit`.
 

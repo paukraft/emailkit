@@ -306,6 +306,29 @@ interface AIInbxEventData {
   suppression_key?: string | null;
 }
 
+/**
+ * What an open or a click carries. AIInbx classifies the hit itself — it
+ * knows when the message was delivered, which a user-agent alone does not
+ * say. `bot` is absent on events sent before it did.
+ */
+interface AIInbxEngagementData {
+  user_agent?: string | null;
+  bot?: boolean;
+  bot_reason?: string | null;
+}
+
+const engagementDetails = (data: AIInbxEngagementData) => ({
+  ...(data.user_agent ? { userAgent: data.user_agent } : {}),
+  ...(data.bot === undefined
+    ? {}
+    : {
+        botDetection: {
+          isBot: data.bot,
+          reason: data.bot_reason ?? "default-allow",
+        },
+      }),
+});
+
 interface AIInbxWebhookEnvelope {
   id: string;
   created_at: string;
@@ -344,11 +367,11 @@ type AIInbxEmailWebhookPayload = AIInbxWebhookEnvelope &
     | { type: "email.failed"; data: AIInbxEventData & { reason: string } }
     | {
         type: "email.opened";
-        data: AIInbxEventData & { user_agent?: string | null };
+        data: AIInbxEventData & AIInbxEngagementData;
       }
     | {
         type: "email.clicked";
-        data: AIInbxEventData & { url: string; user_agent?: string | null };
+        data: AIInbxEventData & AIInbxEngagementData & { url: string };
       }
     | {
         type: "email.unsubscribed";
@@ -1285,16 +1308,12 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
             "opened",
             payload,
             [],
-            payload.data.user_agent
-              ? { userAgent: payload.data.user_agent }
-              : {},
+            engagementDetails(payload.data),
           );
         case "email.clicked":
           return toOutboundEvents("clicked", "clicked", payload, [], {
             url: payload.data.url,
-            ...(payload.data.user_agent
-              ? { userAgent: payload.data.user_agent }
-              : {}),
+            ...engagementDetails(payload.data),
           });
         case "email.unsubscribed":
           return toOutboundEvents(

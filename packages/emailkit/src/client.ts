@@ -2708,10 +2708,14 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
 
     if (type === "opened") {
       const openedData = dataWithDriver as any;
-      const botDetection = checkOpenBot({
-        userAgent: openedData.userAgent || "",
-        timeSinceSendMs: openedData.timeSinceSendMs,
-      });
+      // A provider that classifies its own engagement knows more than the
+      // user-agent says; its verdict stands.
+      const botDetection =
+        openedData.botDetection ??
+        checkOpenBot({
+          userAgent: openedData.userAgent || "",
+          timeSinceSendMs: openedData.timeSinceSendMs,
+        });
       dataForHooks = {
         ...openedData,
         botDetection: {
@@ -2721,11 +2725,13 @@ export const createEmailKitClient = <const TDrivers extends EmailDriverTuple>(
       };
     } else if (type === "clicked") {
       const clickedData = dataWithDriver as any;
-      const botDetection = checkClickBot({
-        userAgent: clickedData.userAgent,
-        method: source.method ?? "POST",
-        url: clickedData.url,
-      });
+      const botDetection =
+        clickedData.botDetection ??
+        checkClickBot({
+          userAgent: clickedData.userAgent,
+          method: source.method ?? "POST",
+          url: clickedData.url,
+        });
       dataForHooks = {
         ...clickedData,
         botDetection: {
