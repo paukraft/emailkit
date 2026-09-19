@@ -32,7 +32,7 @@ const sendResponse = (overrides: Record<string, unknown> = {}) =>
       ...listEmail(emailId(1), "2026-09-01T10:00:00Z", {
         direction: "outbound",
         status: "queued",
-        message_id: "<sent-1@example.com>",
+        message_id: "sent-1@example.com",
       }),
       suppressed: [],
       pacing: null,
@@ -133,7 +133,7 @@ describe("AIInbxDriver sendEmail", () => {
       pacing: { skip: true },
     });
     expect(result).toEqual({
-      messageId: emailId(1),
+      messageId: "sent-1@example.com",
       provider: "aiinbx",
       providerId: emailId(1),
       threadId: THREAD_ID,
@@ -175,7 +175,7 @@ describe("AIInbxDriver sendEmail", () => {
     const fetchMock = vi.fn(async () => sendResponse());
     vi.stubGlobal("fetch", fetchMock);
 
-    await AIInbxDriver({ apiKey: "ai_test" }).sendEmail({
+    const result = await AIInbxDriver({ apiKey: "ai_test" }).sendEmail({
       from: { email: "agent@example.com" },
       to: { email: "buyer@example.net" },
       subject: "Re: Hello",
@@ -190,6 +190,11 @@ describe("AIInbxDriver sendEmail", () => {
       to: ["buyer@example.net"],
       subject: "Re: Hello",
       html: "<p>Thanks</p>",
+    });
+    expect(result).toMatchObject({
+      messageId: "sent-1@example.com",
+      providerId: emailId(1),
+      threadId: THREAD_ID,
     });
   });
 
@@ -490,6 +495,7 @@ describe("AIInbxDriver webhooks", () => {
       "email.bounced",
       {
         email_id: emailId(1),
+        message_id: "sent-1@example.com",
         thread_id: THREAD_ID,
         domain_id: "dom_1",
         mailbox_id: null,
@@ -506,7 +512,7 @@ describe("AIInbxDriver webhooks", () => {
     expect(onBounced).toHaveBeenCalledTimes(2);
     expect(onBounced.mock.calls[1]![0]).toMatchObject({
       eventId: `${body.id}:b@example.org`,
-      messageId: emailId(1),
+      messageId: "sent-1@example.com",
       providerId: emailId(1),
       recipient: "b@example.org",
       recipientDomain: "example.org",
@@ -537,7 +543,11 @@ describe("AIInbxDriver webhooks", () => {
       onUnknown: vi.fn(),
     };
     const handler = createClient(hooks).handler();
-    const base = { email_id: emailId(1), thread_id: THREAD_ID };
+    const base = {
+      email_id: emailId(1),
+      message_id: "sent-1@example.com",
+      thread_id: THREAD_ID,
+    };
 
     const events: Array<[string, Record<string, unknown>]> = [
       [
@@ -579,6 +589,7 @@ describe("AIInbxDriver webhooks", () => {
         "email.unsubscribed",
         {
           email_id: emailId(1),
+          message_id: null,
           address: "a@example.net",
           key: "product-updates",
           scope: "optional",
@@ -603,6 +614,8 @@ describe("AIInbxDriver webhooks", () => {
     });
     expect(hooks.onDelivered.mock.calls[0]![0]).toMatchObject({
       eventId: `evt_${"a".repeat(32)}`,
+      messageId: "sent-1@example.com",
+      providerId: emailId(1),
       recipient: "a@example.net",
     });
     expect(hooks.onComplained.mock.calls[0]![0]).toMatchObject({

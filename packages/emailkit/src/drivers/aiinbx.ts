@@ -300,6 +300,7 @@ interface AIInbxPage<T> {
 
 interface AIInbxEventData {
   email_id: string;
+  message_id: string;
   thread_id?: string;
   domain_id?: string | null;
   mailbox_id?: string | null;
@@ -375,7 +376,9 @@ type AIInbxEmailWebhookPayload = AIInbxWebhookEnvelope &
       }
     | {
         type: "email.unsubscribed";
-        data: AIInbxEventData & {
+        data: Omit<AIInbxEventData, "message_id"> & {
+          /** Null once the message is gone. */
+          message_id: string | null;
           address: string;
           /** Suppression list; `*` is the whole workspace's or space's. */
           key: string;
@@ -1113,8 +1116,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
   /**
    * Delivery outcomes are reported per recipient: one normalized event each.
-   * Webhooks identify the email by its AIInbx id only, so `messageId` and
-   * `providerId` both carry it — correlate with `SendEmailResult.providerId`.
+   * `messageId` and `providerId` match what `sendEmail` returned.
    */
   const toOutboundEvents = (
     type: WebhookEvent["type"],
@@ -1138,7 +1140,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       const data: OutboundEmailEvent = {
         schemaVersion: "1",
         eventId: targets.length > 1 ? `${payload.id}:${recipient}` : payload.id,
-        messageId: payload.data.email_id,
+        messageId: payload.data.message_id ?? "",
         providerId: payload.data.email_id,
         recipient,
         ...(recipient ? { recipientDomain: recipient.split("@")[1] } : {}),
@@ -1234,8 +1236,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
       const requestId = response.headers.get("x-request-id");
       return {
-        // Outbound webhooks identify the email by AIInbx id, not RFC Message-ID.
-        messageId: data.id,
+        messageId: data.message_id,
         provider: driverId,
         providerId: data.id,
         threadId: data.thread_id,

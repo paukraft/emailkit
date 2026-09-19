@@ -31,8 +31,11 @@ config is unchanged, but:
   gone because AIInbx derives the RFC headers from the thread.
 - `track` is gone — tracking is a domain setting (`domains.update`). Custom
   headers, `sendAt`, `idempotencyKey`, and `unsubscribe` are new.
-- `sendEmail` and delivery events use the AIInbx email id (`eml_…`) as
-  `messageId`, so `result.messageId` matches `event.messageId`.
+- `sendEmail` returns the RFC Message-ID as `messageId` and the AIInbx email id
+  (`eml_…`) as `providerId`; delivery events carry both, so
+  `result.messageId === event.messageId` like every other driver.
+- Since 4.2.0: `result.messageId` and outbound `event.messageId` are the
+  RFC Message-ID again; use `providerId` for the `eml_` id.
 - Gmail and Outlook inboxes connect through AIInbx's hosted OAuth:
   `emailkit.mailboxes.connect({ emailDriver: "aiinbx", ... })`; completion
   arrives by webhook on `hooks.mailbox.onConnected`. No `secret` required.

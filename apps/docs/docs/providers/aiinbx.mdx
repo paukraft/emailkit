@@ -68,7 +68,7 @@ export const emailkit = EmailKit({
 The upsert by `messageId` makes retried webhooks harmless.
 
 :::note
-AIInbx delivery events identify an email by its AIInbx id, so `sendEmail` returns that id (`eml_…`) as `messageId` — store it and match events on `event.messageId`. Inbound `messageId` stays the RFC Message-ID.
+`messageId` is the RFC Message-ID everywhere — on `sendEmail` results, delivery events, and inbound mail — so stored `result.messageId` matches both `event.messageId` and a reply's `inReplyTo`. The AIInbx id (`eml_…`) is `providerId`.
 :::
 
 ## 3. Add the public route
