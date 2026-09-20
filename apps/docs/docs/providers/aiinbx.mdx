@@ -94,7 +94,7 @@ const { webhook } = await emailkit.webhooks.setup({ emailDriver: "aiinbx" });
 console.log(webhook.provider?.signingSecret);
 ```
 
-Pass `inbound: { recipients: "support@inbox.example.com" }` to route only that address to this endpoint. When you rotate the secret in AIInbx, set `webhookSecret: [newSecret, oldSecret]` for the grace period — either one verifies.
+Pass `inbound: { recipients: "support@inbox.example.com" }` to route only that address to this endpoint. The endpoint is created with AIInbx's full payload, so `email.received` carries the whole email and inbound needs no second API call; endpoints created before emailkit 4.3 keep working and load the email by id instead. When you rotate the secret in AIInbx, set `webhookSecret: [newSecret, oldSecret]` for the grace period — either one verifies.
 
 ## 5. Send and reply
 

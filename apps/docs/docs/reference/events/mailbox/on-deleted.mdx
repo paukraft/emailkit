@@ -5,7 +5,7 @@ sidebar:
   label: onDeleted
 ---
 
-Fires when a mailbox is deleted through `emailkit.mailboxes.delete()`. Remove what you stored for it — the mailbox record and its auth.
+Fires when a mailbox is deleted through `emailkit.mailboxes.delete()`, or when a provider that hosts the connection (AIInbx) reports a disconnect by webhook — there it also carries the `context` you passed to `mailboxes.connect()`. Remove what you stored for it — the mailbox record and its auth.
 
 ```ts
 hooks: {
