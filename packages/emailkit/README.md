@@ -36,6 +36,14 @@ config is unchanged, but:
   `result.messageId === event.messageId` like every other driver.
 - Since 4.2.0: `result.messageId` and outbound `event.messageId` are the
   RFC Message-ID again; use `providerId` for the `eml_` id.
+- Since 4.3.0 (AIInbx 2.1): `reply.messageId`/`references` and per-send `track`
+  are back; `reply.threadId` still replies on the thread. `sync` replays
+  delivery, tracking, and mailbox events too, under their webhook `eventId` —
+  replayed inbound no longer uses `${emailId}:received`. Verdict fields are
+  `string | null` and `verdicts` is always set (null for connected mailboxes).
+  `webhooks.setup` creates full-payload endpoints, so inbound needs no second
+  API call; recreate older endpoints to get that. Connect `context` travels in
+  mailbox metadata (500 characters) and reaches `onDeleted` as well.
 - Gmail and Outlook inboxes connect through AIInbx's hosted OAuth:
   `emailkit.mailboxes.connect({ emailDriver: "aiinbx", ... })`; completion
   arrives by webhook on `hooks.mailbox.onConnected`. No `secret` required.
@@ -452,7 +460,8 @@ const result = await emailkit.mailboxes.sync({
 // Domain-scoped (Mailgun): replays inbound and outbound tracking events
 await emailkit.domains.sync({ emailDriver: "mailgun", domain: "mg.example.com", since });
 
-// Account-scoped (Resend, AIInbx): replays inbound email only
+// Account-scoped: Resend replays inbound email only; AIInbx replays inbound,
+// delivery, tracking, and mailbox events
 await emailkit.sync({ emailDriver: "resend", since });
 await emailkit.sync({ emailDriver: "aiinbx", since });
 
@@ -465,10 +474,10 @@ Semantics:
   events. Sync is at-least-once: handle inbound idempotently (upsert by
   `messageId`) and replays cost nothing.
 - Event coverage is bounded by what the provider's API can list after the
-  fact. Mailgun replays inbound and outbound tracking events; Outlook queries
+  fact. Mailgun and AIInbx replay inbound and outbound tracking events; Outlook queries
   the mailbox message collection by default so moved or archived received mail
   can still replay, while skipping messages sent by the synced mailbox; Resend
-  and AIInbx replay inbound email only, so `onDelivered`/`onOpened` webhooks
+  replays inbound email only, so `onDelivered`/`onOpened` webhooks
   missed during the outage are not recoverable there.
 - `result.syncedFrom` is the earliest time the provider data actually covered.
   When provider retention cuts the window short (Mailgun stores events for a

@@ -120,6 +120,8 @@ await emailkit.sendEmail({
 });
 ```
 
+Replying to a message AIInbx never saw — mail from before a migration, or from another provider — works with `reply: { messageId, references }` instead, like every other driver. It joins the thread when AIInbx knows the parent and opens a new one otherwise.
+
 Recipients on a suppression list are dropped, not failed — they come back in `sent.rejected`.
 
 ## 6. Read what AIInbx figured out
@@ -133,7 +135,7 @@ onInbound: async (email) => {
   const aiinbx = getAIInbxInbound(email);
 
   aiinbx?.category; // "human" | "out_of_office" | "auto_reply" | "bounce" | ...
-  aiinbx?.verdicts; // { spam, spf, dkim, dmarc } — live webhooks only
+  aiinbx?.verdicts; // { spam, spf, dkim, dmarc } — null for connected mailboxes
   aiinbx?.segments; // body cut into written / quoted / signature parts
   aiinbx?.spaceId; // which customer space the mail belongs to
 
@@ -189,7 +191,7 @@ await emailkit.domains.verify({
 });
 ```
 
-Open and click tracking is a domain setting in AIInbx, not a per-send option:
+Open and click tracking follows the domain setting:
 
 ```ts
 await emailkit.domains.update(
@@ -197,6 +199,8 @@ await emailkit.domains.update(
   { tracking: { opens: true, clicks: true } },
 );
 ```
+
+`track: { opens, clicks }` on a send overrides it for that email. Mail sent through a connected Gmail or Outlook mailbox can't be tracked — AIInbx refuses `true` there with `tracking_unavailable`.
 
 ## Connect Gmail and Outlook inboxes
 
@@ -243,10 +247,10 @@ hooks: {
 From there it is the normal API: send with the mailbox address as `from`, and its mail arrives in `onInbound` (`getAIInbxInbound(email)?.mailboxId` says which mailbox). `emailkit.mailboxes.list`, `get`, and `delete` manage them.
 
 :::note
-`context` travels in AIInbx's 200-character `ref`, so pass an id, not a large object. Mailboxes connected through AIInbx's hosted page or connect link arrive the same way, with their plain `ref` string as `context`. `onDeleted` can fire twice for a mailbox you delete yourself — once from the call, once from the webhook — so keep it idempotent.
+`context` travels as JSON in the mailbox's AIInbx metadata — 500 characters, so pass ids, not a large object — and comes back on `onConnected` and `onDeleted`. `ref` and your own `metadata` stay free to set through `provider`. Mailboxes connected through AIInbx's hosted page or connect link arrive with their plain `ref` string as `context`. A connect URL is single-use once the customer consents. `onDeleted` can fire twice for a mailbox you delete yourself — once from the call, once from the webhook — so keep it idempotent.
 :::
 
-## Recover missed inbound email
+## Recover missed events
 
 ```ts
 await emailkit.sync({
@@ -255,11 +259,11 @@ await emailkit.sync({
 });
 ```
 
-Recovered messages run through the same `onInbound` hook as live webhooks, with the same AIInbx extras except `verdicts`.
+AIInbx keeps every event whether or not a webhook was listening, so sync replays inbound mail, delivery outcomes, opens, clicks, unsubscribes, and mailbox events through the same hooks as live webhooks — under the same `eventId`, so skip the ones you already handled.
 
 ## Extras
 
-AIInbx supports native threads, custom headers, scheduling (`sendAt`), duplicate-send protection (`idempotencyKey`), one-click unsubscribe (`unsubscribe: { listId }` maps to an AIInbx suppression key), open and click events, domain management, inbound sync, and provider-only endpoints through `providerFetch()`. Pacing and suppression lists go through `provider`:
+AIInbx supports native threads, custom headers, scheduling (`sendAt`), duplicate-send protection (`idempotencyKey`), one-click unsubscribe (`unsubscribe: { listId }` maps to an AIInbx suppression key), open and click events, per-send tracking, domain management, event sync, and provider-only endpoints through `providerFetch()`. Pacing and suppression lists go through `provider`:
 
 ```ts
 await emailkit.sendEmail({

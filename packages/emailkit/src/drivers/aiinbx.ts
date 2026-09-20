@@ -124,14 +124,14 @@ export type AIInbxEmailCategory =
   | "spam";
 
 /**
- * Sender authentication results. Only delivered with live webhooks — the
- * AIInbx API does not return them on stored emails, so sync replays omit them.
+ * What the receiving side thought of the message: `PASS`, `FAIL`, `GRAY` or
+ * `PROCESSING_FAILED` per check, null when the check was not reported.
  */
 export interface AIInbxVerdicts {
-  spam?: string;
-  spf?: string;
-  dkim?: string;
-  dmarc?: string;
+  spam: string | null;
+  spf: string | null;
+  dkim: string | null;
+  dmarc: string | null;
 }
 
 /**
@@ -171,7 +171,8 @@ export interface AIInbxInboundMetadata extends AIInbxResourceMetadata {
   category: AIInbxEmailCategory | null;
   snippet: string;
   segments: AIInbxSegment[];
-  verdicts?: AIInbxVerdicts;
+  /** Null for mail that arrived through a connected mailbox. */
+  verdicts: AIInbxVerdicts | null;
 }
 
 /** `provider.aiinbx` on outbound events. */
@@ -214,6 +215,10 @@ export interface AIInbxConnectMailboxOptions {
   region?: "eu-central-1" | "us-east-1";
   /** History to import on first sync, 0–90 days. */
   backfill_days?: number;
+  /** Your own label, up to 200 characters, echoed on mailbox events. */
+  ref?: string;
+  /** Your own key-value pairs, stored on the mailbox. */
+  metadata?: Record<string, string>;
 }
 
 const readAIInbxMetadata = <T>(
@@ -270,6 +275,7 @@ interface AIInbxEmail {
   category: AIInbxEmailCategory | null;
   message_id: string;
   in_reply_to: string | null;
+  verdicts: AIInbxVerdicts | null;
   created_at: string;
   attachments?: AIInbxAttachment[];
 }
@@ -342,7 +348,11 @@ type AIInbxEmailWebhookPayload = AIInbxWebhookEnvelope &
         type: "email.received";
         data: AIInbxEventData & {
           thread_id: string;
-          verdicts?: AIInbxVerdicts;
+          /**
+           * Set on `payload: "full"` endpoints; null when the message is gone
+           * or too large to carry.
+           */
+          email?: AIInbxFullEmail | null;
         };
       }
     | {
@@ -392,14 +402,16 @@ interface AIInbxMailboxEventData {
   mailbox_id: string;
   address: string;
   provider: "google" | "microsoft";
+  /** Whatever the connect link or `mailboxes.connect` carried. */
+  ref?: string | null;
+  metadata?: Record<string, string> | null;
 }
 
 type AIInbxMailboxWebhookPayload = AIInbxWebhookEnvelope &
   (
     | {
         type: "mailbox.connected";
-        /** `ref` is whatever the connect link or `mailboxes.connect` carried. */
-        data: AIInbxMailboxEventData & { ref?: string; reconnected: boolean };
+        data: AIInbxMailboxEventData & { reconnected: boolean };
       }
     | {
         type: "mailbox.needs_reauth" | "mailbox.disconnected";
@@ -461,8 +473,7 @@ export const AIINBX_CAPABILITIES = {
   cc: true,
   bcc: true,
   replyTo: true,
-  // v2 derives In-Reply-To/References itself when replying on a thread.
-  replyHeaders: false,
+  replyHeaders: true,
   replyThreadId: true,
   attachments: true,
   customHeaders: true,
@@ -472,7 +483,7 @@ export const AIINBX_CAPABILITIES = {
   personalizations: false,
   scheduling: true,
   unsubscribe: true,
-  // Tracking is a domain setting in v2 (`domains.update`), not a send option.
+  sendTracking: { opens: true, clicks: true },
   eventTracking: {
     opens: true,
     clicks: true,
@@ -637,7 +648,8 @@ const normalizeDomain = (raw: AIInbxDomain): Domain => ({
   raw,
 });
 
-const MAILBOX_REF_MAX_LENGTH = 200;
+const MAILBOX_CONTEXT_KEY = "emailkit_context";
+const MAILBOX_METADATA_VALUE_MAX_LENGTH = 500;
 
 const normalizeMailbox = (raw: AIInbxMailbox): Mailbox => ({
   id: raw.id,
@@ -649,28 +661,32 @@ const normalizeMailbox = (raw: AIInbxMailbox): Mailbox => ({
 });
 
 /**
- * `context` round-trips through AIInbx's `ref`, echoed on the signed
- * `mailbox.connected` webhook. Hosted connect links set a plain-string ref.
+ * `context` round-trips as JSON in the mailbox's metadata, echoed on every
+ * signed `mailbox.*` webhook.
  */
-const encodeMailboxRef = (context: unknown): string | undefined => {
+const encodeMailboxContext = (
+  context: unknown,
+): Record<string, string> | undefined => {
   if (context === undefined) return undefined;
-  const ref = JSON.stringify(context);
-  if (ref.length > MAILBOX_REF_MAX_LENGTH) {
+  const value = JSON.stringify(context);
+  if (value.length > MAILBOX_METADATA_VALUE_MAX_LENGTH) {
     throw new EmailKitError(
-      `AIInbx carries mailbox connect context in a ${MAILBOX_REF_MAX_LENGTH}-character ref; pass an id instead of a large object`,
+      `AIInbx carries mailbox connect context in a ${MAILBOX_METADATA_VALUE_MAX_LENGTH}-character metadata value; pass an id instead of a large object`,
       PROVIDER,
       "INVALID_INPUT",
     );
   }
-  return ref;
+  return { [MAILBOX_CONTEXT_KEY]: value };
 };
 
-const decodeMailboxRef = (ref: string | undefined): unknown => {
-  if (ref === undefined) return undefined;
+/** Mailboxes connected without emailkit carry their plain `ref` as context. */
+const decodeMailboxContext = (data: AIInbxMailboxEventData): unknown => {
+  const value = data.metadata?.[MAILBOX_CONTEXT_KEY] ?? data.ref ?? undefined;
+  if (value === undefined) return undefined;
   try {
-    return JSON.parse(ref);
+    return JSON.parse(value);
   } catch {
-    return ref;
+    return value;
   }
 };
 
@@ -700,7 +716,7 @@ const toMailboxEvent = (
   }
 
   const connected = payload.type === "mailbox.connected";
-  const context = connected ? decodeMailboxRef(payload.data.ref) : undefined;
+  const context = decodeMailboxContext(payload.data);
   return {
     type: "mailbox.lifecycle",
     data: {
@@ -734,7 +750,8 @@ const resourceMetadata = (
 });
 
 interface AIInbxRequestInit extends Omit<RequestInit, "body"> {
-  searchParams?: Record<string, string | undefined>;
+  /** An array repeats the parameter. */
+  searchParams?: Record<string, string | string[] | undefined>;
   body?: unknown;
 }
 
@@ -759,7 +776,9 @@ const createAIInbxRequest =
     const { searchParams, body, headers, ...fetchInit } = init;
     const url = new URL(`${baseUrl}${path}`);
     for (const [key, value] of Object.entries(searchParams ?? {})) {
-      if (value !== undefined) url.searchParams.set(key, value);
+      for (const item of [value ?? []].flat()) {
+        url.searchParams.append(key, item);
+      }
     }
 
     let response: Response;
@@ -1002,42 +1021,52 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
   const domainPath = async (idOrName: string, suffix = ""): Promise<string> =>
     `/domains/${encodeURIComponent(await resolveDomainId(idOrName))}${suffix}`;
 
-  /**
-   * Webhooks and list items carry a snippet, not the message — load the full
-   * email (bodies, headers, segments, prepared attachment text) by id.
-   */
-  const loadInboundEvent = async (
+  const inlineAttachmentText = config.inlineAttachmentText ?? true;
+
+  const retrieveEmail = async (
     emailId: string,
-    source: {
-      eventId: string;
-      raw?: unknown;
-      webhook?: Extract<AIInbxEmailWebhookPayload, { type: "email.received" }>;
-      signal?: AbortSignal;
-    },
-  ): Promise<InboundEmailEvent> => {
-    const { data: email } = await request<AIInbxFullEmail>(
+    signal?: AbortSignal,
+  ): Promise<AIInbxFullEmail> => {
+    const { data } = await request<AIInbxFullEmail>(
       `/emails/${encodeURIComponent(emailId)}`,
       {
         method: "GET",
-        signal: source.signal,
+        signal,
         searchParams: {
-          include:
-            (config.inlineAttachmentText ?? true)
-              ? "attachment_content"
-              : undefined,
+          include: inlineAttachmentText ? "attachment_content" : undefined,
         },
       },
       "retrieve email",
     );
+    return data;
+  };
+
+  /**
+   * `payload: "full"` endpoints deliver the email with the event; summary
+   * events and replays carry a snippet, so the email is loaded by id.
+   */
+  const toInboundEvent = async (
+    payload: Extract<AIInbxEmailWebhookPayload, { type: "email.received" }>,
+    signal?: AbortSignal,
+  ): Promise<InboundEmailEvent> => {
+    const email =
+      payload.data.email ??
+      (await retrieveEmail(payload.data.email_id, signal));
 
     const attachmentMetadata = email.attachments.map(
       (attachment): Attachment => {
-        const { content_url: _contentUrl, ...preparation } =
-          attachment.preparation ?? {};
+        const {
+          content_url: _contentUrl,
+          text,
+          ...preparation
+        } = attachment.preparation ?? {};
         const metadata: AIInbxAttachmentMetadata = {
           attachmentId: attachment.id,
           preparation: attachment.preparation
-            ? (preparation as AIInbxAttachmentPreparation)
+            ? ({
+                ...preparation,
+                ...(inlineAttachmentText ? { text } : {}),
+              } as AIInbxAttachmentPreparation)
             : null,
         };
         return {
@@ -1057,7 +1086,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
         ? await downloadAttachments(
             attachmentMetadata,
             email.attachments.map((attachment) => attachment.download_url),
-            source.signal,
+            signal,
           )
         : attachmentMetadata;
 
@@ -1065,25 +1094,19 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       emailId: email.id,
       threadId: email.thread_id,
       spaceId: email.space_id,
-      ...(source.webhook
-        ? {
-            domainId: source.webhook.data.domain_id,
-            mailboxId: source.webhook.data.mailbox_id,
-          }
-        : {}),
+      domainId: payload.data.domain_id,
+      mailboxId: payload.data.mailbox_id,
       category: email.category,
       snippet: email.snippet,
       segments: email.segments,
-      ...(source.webhook?.data.verdicts
-        ? { verdicts: source.webhook.data.verdicts }
-        : {}),
+      verdicts: email.verdicts,
     };
     const cc = toAddresses(email.cc);
     const bcc = toAddresses(email.bcc);
 
     return {
       schemaVersion: "1",
-      eventId: source.eventId,
+      eventId: payload.id,
       messageId: email.message_id,
       providerId: email.id,
       from: {
@@ -1110,7 +1133,7 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       ),
       timestamp: new Date(email.created_at),
       provider: { [PROVIDER]: metadata },
-      raw: source.raw ?? email,
+      raw: payload,
     };
   };
 
@@ -1154,6 +1177,92 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
     });
   };
 
+  /** Webhook deliveries and `GET /events` replays share one envelope. */
+  const toDriverEvents = async (
+    payload: AIInbxWebhookPayload,
+    signal?: AbortSignal,
+  ): Promise<WebhookEventResult> => {
+    switch (payload.type) {
+      case "email.received":
+        return {
+          type: "inbound",
+          data: await toInboundEvent(payload, signal),
+        };
+      case "email.sent":
+        return toOutboundEvents(
+          "outbound",
+          "sent",
+          payload,
+          payload.data.to.slice(0, 1),
+          {
+            from: { email: payload.data.from },
+            to: toAddresses(payload.data.to),
+            subject: payload.data.subject,
+          },
+        );
+      case "email.delivered":
+        return toOutboundEvents(
+          "delivered",
+          "delivered",
+          payload,
+          payload.data.recipients,
+        );
+      case "email.bounced":
+        return toOutboundEvents(
+          "bounced",
+          "bounced",
+          payload,
+          payload.data.recipients,
+          {
+            severity: payload.data.permanent ? "permanent" : "temporary",
+            reason: payload.data.reason,
+          },
+        );
+      case "email.complained":
+        return toOutboundEvents(
+          "complained",
+          "complained",
+          payload,
+          payload.data.recipients,
+          payload.data.reason ? { feedback: payload.data.reason } : {},
+        );
+      case "email.failed":
+        return toOutboundEvents("rejected", "rejected", payload, [], {
+          reason: payload.data.reason,
+        });
+      case "email.opened":
+        return toOutboundEvents(
+          "opened",
+          "opened",
+          payload,
+          [],
+          engagementDetails(payload.data),
+        );
+      case "email.clicked":
+        return toOutboundEvents("clicked", "clicked", payload, [], {
+          url: payload.data.url,
+          ...engagementDetails(payload.data),
+        });
+      case "email.unsubscribed":
+        return toOutboundEvents(
+          "unsubscribed",
+          "unsubscribed",
+          payload,
+          [payload.data.address],
+          {
+            ...(payload.data.key !== "*" ? { listId: payload.data.key } : {}),
+            source: payload.data.source,
+          },
+        );
+      case "mailbox.connected":
+      case "mailbox.needs_reauth":
+      case "mailbox.disconnected":
+        return toMailboxEvent(payload, driverId);
+      default:
+        return { type: "unknown", data: payload };
+    }
+  };
+
   const providerFetch = createAIInbxProviderFetch(baseUrl, config.apiKey);
 
   return {
@@ -1175,9 +1284,14 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       }
 
       const reply = resolveMessageReplyContext(message);
-      if (reply.isReply && !reply.threadId) {
+      if (
+        reply.isReply &&
+        !reply.threadId &&
+        !reply.messageId &&
+        !reply.references?.length
+      ) {
         throw new EmailKitError(
-          "AIInbx replies are threaded by reply.threadId. Pass the inbound event's reply.threadId.",
+          "AIInbx does not support reply.isReply by itself. Pass reply.threadId, or reply.messageId and reply.references.",
           PROVIDER,
           "INVALID_REPLY_CONTEXT",
         );
@@ -1216,9 +1330,24 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
         ...(message.unsubscribe ? { unsubscribe: true } : {}),
         ...(suppressionKey ? { suppression_key: suppressionKey } : {}),
         ...(providerOptions.pacing ? { pacing: providerOptions.pacing } : {}),
+        ...(message.track
+          ? {
+              tracking: {
+                opens: message.track.opens,
+                clicks: message.track.clicks,
+              },
+            }
+          : {}),
+        // A thread reply has its headers written from the thread; without a
+        // thread id the Message-IDs join a known thread or open a new one.
+        ...(reply.threadId
+          ? {}
+          : {
+              in_reply_to: reply.messageId,
+              references: reply.references,
+            }),
       };
 
-      // Replying on the thread lets AIInbx derive In-Reply-To and References.
       const { data, response } = await request<AIInbxSendResponse>(
         reply.threadId
           ? `/threads/${encodeURIComponent(reply.threadId)}/reply`
@@ -1246,95 +1375,8 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
       };
     },
 
-    handleWebhook: async (
-      request: WebhookRequest,
-    ): Promise<WebhookEventResult> => {
-      const payload = request.body as AIInbxWebhookPayload;
-
-      switch (payload.type) {
-        case "email.received":
-          return {
-            type: "inbound",
-            data: await loadInboundEvent(payload.data.email_id, {
-              eventId: payload.id,
-              raw: payload,
-              webhook: payload,
-            }),
-          };
-        case "email.sent":
-          return toOutboundEvents(
-            "outbound",
-            "sent",
-            payload,
-            payload.data.to.slice(0, 1),
-            {
-              from: { email: payload.data.from },
-              to: toAddresses(payload.data.to),
-              subject: payload.data.subject,
-            },
-          );
-        case "email.delivered":
-          return toOutboundEvents(
-            "delivered",
-            "delivered",
-            payload,
-            payload.data.recipients,
-          );
-        case "email.bounced":
-          return toOutboundEvents(
-            "bounced",
-            "bounced",
-            payload,
-            payload.data.recipients,
-            {
-              severity: payload.data.permanent ? "permanent" : "temporary",
-              reason: payload.data.reason,
-            },
-          );
-        case "email.complained":
-          return toOutboundEvents(
-            "complained",
-            "complained",
-            payload,
-            payload.data.recipients,
-            payload.data.reason ? { feedback: payload.data.reason } : {},
-          );
-        case "email.failed":
-          return toOutboundEvents("rejected", "rejected", payload, [], {
-            reason: payload.data.reason,
-          });
-        case "email.opened":
-          return toOutboundEvents(
-            "opened",
-            "opened",
-            payload,
-            [],
-            engagementDetails(payload.data),
-          );
-        case "email.clicked":
-          return toOutboundEvents("clicked", "clicked", payload, [], {
-            url: payload.data.url,
-            ...engagementDetails(payload.data),
-          });
-        case "email.unsubscribed":
-          return toOutboundEvents(
-            "unsubscribed",
-            "unsubscribed",
-            payload,
-            [payload.data.address],
-            {
-              ...(payload.data.key !== "*" ? { listId: payload.data.key } : {}),
-              source: payload.data.source,
-            },
-          );
-        case "mailbox.connected":
-        case "mailbox.needs_reauth":
-        case "mailbox.disconnected":
-          return toMailboxEvent(payload, driverId);
-        default:
-          return { type: "unknown", data: payload };
-      }
-    },
+    handleWebhook: (request: WebhookRequest): Promise<WebhookEventResult> =>
+      toDriverEvents(request.body as AIInbxWebhookPayload),
 
     verifyWebhook: async (request: WebhookRequest): Promise<boolean> => {
       // An empty secret is an unset env var, not a key anyone can sign with.
@@ -1386,16 +1428,21 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
             "MISSING_REQUIRED_FIELD",
           );
         }
-        const ref = encodeMailboxRef(input.context);
+        const context = encodeMailboxContext(input.context);
+        const provider = input.provider as
+          | AIInbxConnectMailboxOptions
+          | undefined;
 
         const { data } = await request<{ url: string }>(
           "/mailboxes/connect",
           {
             method: "POST",
             body: {
-              ...input.provider,
+              ...provider,
               return_to: input.landingUrl,
-              ...(ref ? { ref } : {}),
+              ...(context
+                ? { metadata: { ...provider?.metadata, ...context } }
+                : {}),
             },
           },
           "connect mailbox",
@@ -1463,6 +1510,8 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
               body: {
                 url: input.url,
                 subscriptions: toAIInbxWebhookEvents(input.events),
+                // `email.received` carries the email: no second call per message.
+                payload: "full",
                 ...(routing ? { routing } : {}),
                 ...input.provider,
               },
@@ -1519,59 +1568,43 @@ export const AIInbxDriver = <const TId extends string = "aiinbx">(
 
     sync: {
       /**
-       * Replay missed inbound emails.
-       *
-       * `GET /emails` lists newest-first with cursor pagination and no time
-       * filter, so the lightweight list items for the window are buffered
-       * while paging back to `since`, then replayed oldest-first. The heavy
-       * work (full email + attachments per id) streams lazily at yield time.
-       * Replayed events carry no webhook event id or verdicts; dedupe against
-       * live webhooks by `messageId`. Outbound delivery events are not
-       * replayed.
+       * Replay missed events from `GET /events`, which keeps every webhook
+       * envelope — delivered or not — under the id the webhook carried, so
+       * replays dedupe against live deliveries by `eventId`.
        */
       account: async function* (input: AccountSyncInput): SyncStream {
-        const since = input.since.getTime();
-        const until = (input.until ?? new Date()).getTime();
-
-        const windowed: AIInbxEmail[] = [];
+        // `after` is exclusive; `since` is not.
+        const after = new Date(input.since.getTime() - 1).toISOString();
+        const before = (input.until ?? new Date()).toISOString();
         let cursor: string | undefined;
 
-        pagination: do {
-          const { data: page } = await request<AIInbxPage<AIInbxEmail>>(
-            "/emails",
+        do {
+          const { data: page } = await request<
+            AIInbxPage<AIInbxWebhookPayload>
+          >(
+            "/events",
             {
               method: "GET",
               signal: input.signal,
               searchParams: {
-                direction: "inbound",
+                type: AIINBX_DEFAULT_WEBHOOK_EVENTS,
+                order: "asc",
+                after,
+                before,
                 limit: String(LIST_PAGE_SIZE),
                 cursor,
               },
             },
-            "list emails",
+            "list events",
           );
 
-          for (const email of page.data) {
-            const createdAt = new Date(email.created_at).getTime();
-            if (Number.isNaN(createdAt)) continue;
-            // Newest-first: everything after this item is older than `since`.
-            if (createdAt < since) break pagination;
-            if (createdAt >= until) continue;
-            windowed.push(email);
+          for (const payload of page.data) {
+            const result = await toDriverEvents(payload, input.signal);
+            yield* Array.isArray(result) ? result : [result];
           }
 
           cursor = page.next_cursor ?? undefined;
         } while (cursor);
-
-        for (const email of windowed.reverse()) {
-          yield {
-            type: "inbound",
-            data: await loadInboundEvent(email.id, {
-              eventId: `${email.id}:received`,
-              signal: input.signal,
-            }),
-          };
-        }
 
         return { syncedFrom: input.since };
       },

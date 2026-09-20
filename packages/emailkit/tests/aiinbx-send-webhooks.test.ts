@@ -56,18 +56,18 @@ describe("AIInbxDriver sendEmail", () => {
 
     expect(driver.capabilities).toMatchObject({
       replyTo: true,
-      replyHeaders: false,
+      replyHeaders: true,
       replyThreadId: true,
       customHeaders: true,
       scheduling: true,
       unsubscribe: true,
       sendIdempotency: true,
+      sendTracking: { opens: true, clicks: true },
       eventTracking: { opens: true, clicks: true },
       providerFetch: true,
       webhooks: { account: true },
       sync: { account: true },
     });
-    expect(driver.capabilities).not.toHaveProperty("sendTracking");
   });
 
   it("maps a message to POST /emails", async () => {
@@ -198,7 +198,36 @@ describe("AIInbxDriver sendEmail", () => {
     });
   });
 
-  it("rejects reply.isReply without a thread id", async () => {
+  it("sends reply headers and per-send tracking when there is no thread id", async () => {
+    const fetchMock = vi.fn(async () => sendResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await AIInbxDriver({ apiKey: "ai_test" }).sendEmail({
+      from: { email: "agent@example.com" },
+      to: { email: "buyer@example.net" },
+      subject: "Re: Hello",
+      text: "Thanks",
+      reply: {
+        messageId: "<parent@example.net>",
+        references: ["<root@example.net>", "<parent@example.net>"],
+      },
+      track: { opens: false },
+    });
+
+    const { url, body } = sentRequest(fetchMock);
+    expect(url).toBe(`${API}/emails`);
+    expect(body).toEqual({
+      from: { address: "agent@example.com" },
+      to: ["buyer@example.net"],
+      subject: "Re: Hello",
+      text: "Thanks",
+      tracking: { opens: false },
+      in_reply_to: "<parent@example.net>",
+      references: ["<root@example.net>", "<parent@example.net>"],
+    });
+  });
+
+  it("rejects reply.isReply without a thread or message id", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -325,8 +354,9 @@ describe("AIInbxDriver webhooks", () => {
     });
   });
 
-  it("loads the full email for email.received and exposes AIInbx extras", async () => {
+  it("loads the full email for a summary email.received and exposes AIInbx extras", async () => {
     const downloadUrl = "https://signed.example.com/report.pdf?sig=abc";
+    const verdicts = { spam: "PASS", spf: "PASS", dkim: "PASS", dmarc: "FAIL" };
     const fetchMock = vi.fn(async (input: string | URL) => {
       if (input.toString() === downloadUrl) return new Response("pdf-bytes");
       return jsonResponse(
@@ -336,6 +366,7 @@ describe("AIInbxDriver webhooks", () => {
           in_reply_to: "<previous@example.com>",
           references: ["<first@example.com>", "<previous@example.com>"],
           category: "out_of_office",
+          verdicts,
           attachments: [
             {
               id: "att_1",
@@ -361,13 +392,11 @@ describe("AIInbxDriver webhooks", () => {
 
     const onInbound = vi.fn();
     const client = createClient({ onInbound });
-    const verdicts = { spam: "PASS", spf: "PASS", dkim: "PASS", dmarc: "FAIL" };
     const body = webhookEnvelope("email.received", {
       email_id: emailId(7),
       thread_id: THREAD_ID,
       domain_id: "dom_1",
       mailbox_id: null,
-      verdicts,
     });
 
     const response = await client.handler()(signedWebhookRequest(body));
@@ -435,6 +464,29 @@ describe("AIInbxDriver webhooks", () => {
       ([input]) => input.toString() === downloadUrl,
     ) as unknown as [string, RequestInit];
     expect(new Headers(download[1].headers).get("authorization")).toBeNull();
+  });
+
+  it("reads the email off a full email.received without a second call", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const onInbound = vi.fn();
+
+    const response = await createClient({ onInbound }).handler()(
+      signedWebhookRequest(
+        webhookEnvelope("email.received", {
+          email_id: emailId(8),
+          thread_id: THREAD_ID,
+          email: fullEmail(emailId(8), "2026-09-01T10:31:00Z"),
+        }),
+      ),
+    );
+
+    expect(response.status).toBe(204);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onInbound.mock.calls[0]![0]).toMatchObject({
+      providerId: emailId(8),
+      text: `Body ${emailId(8)}`,
+    });
   });
 
   it("serves lazy attachment content through the stable API URL", async () => {
@@ -687,6 +739,7 @@ describe("AIInbxDriver webhook management", () => {
       body: {
         url: "https://app.example.com/api/email/aiinbx",
         subscriptions: ["email.received", "email.bounced"],
+        payload: "full",
         routing: [
           { effect: "allow", field: "to", pattern: "support@example.com" },
         ],

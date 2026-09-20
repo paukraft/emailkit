@@ -53,6 +53,7 @@ export const listEmail = (
   suppression_key: null,
   message_id: `<${id}@example.net>`,
   in_reply_to: null,
+  verdicts: { spam: "PASS", spf: "PASS", dkim: "PASS", dmarc: null },
   idempotency_key: null,
   created_at: createdAt,
   scheduled_at: null,

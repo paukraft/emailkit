@@ -51,7 +51,7 @@ const createClient = (hooks: Parameters<typeof EmailKit>[0]["hooks"] = {}) =>
   });
 
 describe("AIInbxDriver mailboxes", () => {
-  it("creates a hosted connect URL carrying context as the ref", async () => {
+  it("creates a hosted connect URL carrying context in the metadata", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse({ url: "https://aiinbx.com/connect/session_1" }),
     );
@@ -63,7 +63,12 @@ describe("AIInbxDriver mailboxes", () => {
     }).mailboxes.connect({
       emailDriver: "aiinbx",
       context: { userId: "user_8812" },
-      provider: { provider: "google", backfill_days: 7 },
+      provider: {
+        provider: "google",
+        backfill_days: 7,
+        ref: "acme",
+        metadata: { plan: "pro" },
+      },
     });
 
     const [url, init] = fetchMock.mock.calls[0] as unknown as [
@@ -75,7 +80,8 @@ describe("AIInbxDriver mailboxes", () => {
       provider: "google",
       backfill_days: 7,
       return_to: "https://app.example.com/settings/mailboxes",
-      ref: '{"userId":"user_8812"}',
+      ref: "acme",
+      metadata: { plan: "pro", emailkit_context: '{"userId":"user_8812"}' },
     });
     expect(connection).toMatchObject({
       redirectUrl: "https://aiinbx.com/connect/session_1",
@@ -85,13 +91,13 @@ describe("AIInbxDriver mailboxes", () => {
     expect(onConnected).not.toHaveBeenCalled();
   });
 
-  it("rejects a context that does not fit the ref", async () => {
+  it("rejects a context that does not fit a metadata value", async () => {
     vi.stubGlobal("fetch", vi.fn());
 
     await expect(
       createClient().mailboxes.connect({
         emailDriver: "aiinbx",
-        context: { blob: "x".repeat(200) },
+        context: { blob: "x".repeat(500) },
         provider: { provider: "google" },
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
@@ -117,14 +123,22 @@ describe("AIInbxDriver mailboxes", () => {
         {
           ...data,
           app_id: null,
-          ref: '{"userId":"user_8812"}',
+          ref: "acme",
+          metadata: { emailkit_context: '{"userId":"user_8812"}' },
           reconnected: false,
         },
       ],
       // Hosted connect links carry a plain-string ref.
       ["mailbox.connected", { ...data, ref: "user_8812", reconnected: true }],
       ["mailbox.needs_reauth", { ...data, reason: "invalid_grant" }],
-      ["mailbox.disconnected", { ...data, reason: null }],
+      [
+        "mailbox.disconnected",
+        {
+          ...data,
+          metadata: { emailkit_context: '{"userId":"user_8812"}' },
+          reason: null,
+        },
+      ],
     ];
     for (const [type, payload] of events) {
       const response = await handler(
@@ -153,6 +167,7 @@ describe("AIInbxDriver mailboxes", () => {
     });
     expect(onDeleted.mock.calls[0]![0]).toMatchObject({
       mailbox: { id: "mbx_1", status: "disabled" },
+      context: { userId: "user_8812" },
     });
   });
 
