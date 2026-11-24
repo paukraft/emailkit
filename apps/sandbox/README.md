@@ -48,4 +48,4 @@ OUTLOOK_APP_TENANT="contoso.onmicrosoft.com" # a tenant id or domain, not "commo
 OUTLOOK_APP_MAILBOXES="support@contoso.com,sales@contoso.com"
 ```
 
-These mailboxes appear in the sync and webhook pickers, and a send from one of them goes through `outlook-app`. Inbound webhooks arrive on `${PUBLIC_BASE_URL}/api/email/outlook-app`; no redirect URI is needed.
+These mailboxes appear in the sync and webhook pickers, and a send from one of them goes through `outlook-app`. Inbound webhooks arrive on `${PUBLIC_BASE_URL}/api/email/outlook-app`; no redirect URI is needed. Sync and webhooks use `OUTLOOK_APP_TENANT`. To send from a mailbox in another tenant, enter that tenant in the Compose panel's Tenant field.
